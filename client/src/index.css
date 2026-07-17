@@ -1,0 +1,409 @@
+:root {
+  --wall: #d8eef2;
+  --wall-deep: #b7dde6;
+  --paper: #fff8e8;
+  --paper-edge: #f0e0c0;
+  --ink: #2b241c;
+  --muted: #6e6256;
+  --paint-coral: #ff6b4a;
+  --paint-yellow: #ffc93c;
+  --paint-teal: #2cb1a1;
+  --paint-blue: #4d8fd9;
+  --paint-pink: #ff7eb6;
+  --wood: #c48a4a;
+  --wood-dark: #8b5a2b;
+  --danger: #e85d5d;
+  --shadow: rgba(43, 36, 28, 0.18);
+  font-family: "M PLUS Rounded 1c", "Hiragino Maru Gothic ProN", sans-serif;
+  color: var(--ink);
+  background: var(--wall);
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100%;
+  height: 100%;
+}
+
+body {
+  background-color: var(--wall);
+  background-image:
+    radial-gradient(circle at 12% 18%, rgba(255, 126, 182, 0.35) 0 42px, transparent 43px),
+    radial-gradient(circle at 88% 12%, rgba(255, 201, 60, 0.45) 0 34px, transparent 35px),
+    radial-gradient(circle at 78% 78%, rgba(44, 177, 161, 0.3) 0 50px, transparent 51px),
+    radial-gradient(circle at 18% 82%, rgba(77, 143, 217, 0.28) 0 38px, transparent 39px),
+    radial-gradient(circle at 52% 40%, rgba(255, 107, 74, 0.16) 0 70px, transparent 71px),
+    repeating-linear-gradient(
+      90deg,
+      transparent,
+      transparent 47px,
+      rgba(255, 255, 255, 0.18) 47px,
+      rgba(255, 255, 255, 0.18) 48px
+    ),
+    linear-gradient(160deg, #e7f6f8 0%, #d3ebf0 45%, #cfe6cf 100%);
+  background-attachment: fixed;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+  border: 3px solid var(--ink);
+  border-radius: 999px;
+  padding: 0.95rem 1.25rem;
+  font-weight: 800;
+  color: #fff;
+  background: var(--paint-coral);
+  box-shadow: 3px 4px 0 var(--ink);
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+
+button:active:not(:disabled) {
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0 var(--ink);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.secondary {
+  background: var(--paint-teal);
+}
+
+button.danger {
+  background: var(--danger);
+}
+
+input {
+  width: 100%;
+  border: 3px solid var(--ink);
+  border-radius: 16px;
+  padding: 0.95rem 1rem;
+  background: #fffef8;
+  color: var(--ink);
+  outline: none;
+  box-shadow: inset 0 2px 0 rgba(255, 255, 255, 0.7);
+}
+
+input::placeholder {
+  color: #a99a88;
+}
+
+input:focus {
+  border-color: var(--paint-blue);
+}
+
+.app {
+  position: relative;
+  min-height: 100%;
+  max-width: 520px;
+  margin: 0 auto;
+  padding: 1rem 1rem 1.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.brand {
+  text-align: center;
+  padding: 0.6rem 0.4rem 0.2rem;
+  animation: pop-in 0.45s ease both;
+}
+
+.brand-badge {
+  display: inline-block;
+  margin-bottom: 0.45rem;
+  padding: 0.25rem 0.75rem;
+  border-radius: 999px;
+  border: 2px solid var(--ink);
+  background: var(--paint-yellow);
+  font-size: 0.75rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  transform: rotate(-3deg);
+}
+
+.brand h1 {
+  margin: 0;
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: clamp(2rem, 8vw, 2.6rem);
+  letter-spacing: 0.06em;
+  line-height: 1.15;
+  color: var(--ink);
+  text-shadow:
+    3px 3px 0 #fff,
+    5px 5px 0 rgba(255, 107, 74, 0.35);
+}
+
+.brand p {
+  margin: 0.45rem 0 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.card {
+  position: relative;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.35), transparent 30%),
+    repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 27px,
+      rgba(77, 143, 217, 0.08) 27px,
+      rgba(77, 143, 217, 0.08) 28px
+    ),
+    var(--paper);
+  border: 3px solid var(--ink);
+  border-radius: 8px;
+  padding: 1.2rem 1.1rem 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  box-shadow:
+    0 1px 0 var(--paper-edge) inset,
+    6px 8px 0 rgba(43, 36, 28, 0.12);
+  animation: slide-up 0.4s ease both;
+}
+
+.card::before {
+  content: "";
+  position: absolute;
+  top: -12px;
+  left: 22px;
+  width: 72px;
+  height: 22px;
+  background: rgba(255, 126, 182, 0.75);
+  border: 2px solid rgba(43, 36, 28, 0.25);
+  transform: rotate(-4deg);
+  box-shadow: 0 2px 0 rgba(43, 36, 28, 0.08);
+}
+
+.card.tape-teal::before {
+  left: auto;
+  right: 28px;
+  background: rgba(44, 177, 161, 0.75);
+  transform: rotate(5deg);
+}
+
+.card.tape-yellow::before {
+  left: 40%;
+  background: rgba(255, 201, 60, 0.85);
+  transform: rotate(-2deg);
+}
+
+.label {
+  font-size: 0.82rem;
+  color: var(--muted);
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+
+.error {
+  color: var(--danger);
+  font-size: 0.9rem;
+  margin: 0;
+  font-weight: 700;
+}
+
+.code-big {
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: 2.8rem;
+  font-weight: 400;
+  letter-spacing: 0.35em;
+  text-align: center;
+  padding: 0.55rem 0.2rem 0.35rem 0.35em;
+  color: var(--paint-coral);
+  background:
+    linear-gradient(transparent 60%, rgba(255, 201, 60, 0.55) 60%);
+  border-radius: 8px;
+}
+
+.players {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.players li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.75rem 0.9rem;
+  border-radius: 14px;
+  border: 2px dashed rgba(43, 36, 28, 0.25);
+  background: rgba(255, 255, 255, 0.55);
+  font-weight: 700;
+}
+
+.badge {
+  font-size: 0.72rem;
+  padding: 0.22rem 0.55rem;
+  border-radius: 999px;
+  border: 2px solid var(--ink);
+  background: var(--paint-yellow);
+  color: var(--ink);
+  font-weight: 800;
+}
+
+.play-header {
+  gap: 0.4rem;
+}
+
+.play-header .meta {
+  color: var(--muted);
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+
+.word {
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: 1.7rem;
+  color: var(--paint-coral);
+  line-height: 1.25;
+}
+
+.easel {
+  position: relative;
+  padding: 0.85rem 0.85rem 1.05rem;
+  background: linear-gradient(180deg, #e2b178 0%, var(--wood) 55%, #b6793d 100%);
+  border: 3px solid var(--wood-dark);
+  border-radius: 14px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.35),
+    6px 10px 0 rgba(43, 36, 28, 0.14);
+  animation: slide-up 0.45s ease both;
+}
+
+.easel-clip {
+  position: absolute;
+  top: -10px;
+  left: 50%;
+  width: 54px;
+  height: 18px;
+  transform: translateX(-50%);
+  background: #6d6d6d;
+  border: 2px solid #3f3f3f;
+  border-radius: 4px;
+  z-index: 2;
+}
+
+.easel-clip::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 14px;
+  width: 10px;
+  height: 14px;
+  transform: translateX(-50%);
+  background: #8a8a8a;
+  border: 2px solid #3f3f3f;
+  border-top: none;
+}
+
+.canvas-wrap {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  border-radius: 4px;
+  overflow: hidden;
+  border: 3px solid var(--ink);
+  background:
+    radial-gradient(circle at 20% 15%, rgba(255, 255, 255, 0.55), transparent 35%),
+    repeating-linear-gradient(
+      0deg,
+      #fbf4e4,
+      #fbf4e4 2px,
+      #f7efd8 2px,
+      #f7efd8 4px
+    );
+  touch-action: none;
+  box-shadow: inset 0 0 0 8px #fffaf0;
+}
+
+.canvas-wrap canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+}
+
+.hint {
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.92rem;
+  margin: 0;
+  font-weight: 700;
+}
+
+.actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.divider-or {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 800;
+}
+
+.divider-or::before,
+.divider-or::after {
+  content: "";
+  flex: 1;
+  height: 2px;
+  background: repeating-linear-gradient(
+    90deg,
+    rgba(43, 36, 28, 0.35) 0 8px,
+    transparent 8px 14px
+  );
+}
+
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .brand,
+  .card,
+  .easel {
+    animation: none;
+  }
+}
