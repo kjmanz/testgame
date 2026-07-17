@@ -58,10 +58,29 @@ export default function DrawingCanvas({ enabled, clearToken, onStroke }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // iOS: React の preventDefault が効かないため native でスクロールを止める
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const opts = { passive: false };
+    const preventScroll = (e) => {
+      e.preventDefault();
+    };
+    canvas.addEventListener("touchstart", preventScroll, opts);
+    canvas.addEventListener("touchmove", preventScroll, opts);
+    canvas.addEventListener("touchend", preventScroll, opts);
+    return () => {
+      canvas.removeEventListener("touchstart", preventScroll, opts);
+      canvas.removeEventListener("touchmove", preventScroll, opts);
+      canvas.removeEventListener("touchend", preventScroll, opts);
+    };
+  }, []);
+
   function getNormPos(e) {
     const canvas = canvasRef.current;
     const rect = canvas.getBoundingClientRect();
-    const point = "clientX" in e ? e : e.touches[0];
+    const point = "clientX" in e ? e : e.touches?.[0];
+    if (!point) return null;
     return {
       x: (point.clientX - rect.left) / rect.width,
       y: (point.clientY - rect.top) / rect.height,
@@ -105,8 +124,16 @@ export default function DrawingCanvas({ enabled, clearToken, onStroke }) {
   function handleStart(e) {
     if (!enabled) return;
     e.preventDefault();
+    if (e.currentTarget?.setPointerCapture && e.pointerId != null) {
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+    }
     drawingRef.current = true;
     const pos = getNormPos(e);
+    if (!pos) return;
     lastRef.current = pos;
     onStroke?.({
       type: "start",
@@ -121,6 +148,7 @@ export default function DrawingCanvas({ enabled, clearToken, onStroke }) {
     if (!enabled || !drawingRef.current) return;
     e.preventDefault();
     const pos = getNormPos(e);
+    if (!pos) return;
     const last = lastRef.current;
     if (last) {
       strokeSegment(last, pos);

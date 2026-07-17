@@ -30,9 +30,12 @@ body,
   margin: 0;
   min-height: 100%;
   height: 100%;
+  overscroll-behavior: none;
 }
 
 body {
+  overscroll-behavior: none;
+  -webkit-overflow-scrolling: touch;
   background-color: var(--wall);
   background-image:
     radial-gradient(circle at 12% 18%, rgba(255, 126, 182, 0.35) 0 42px, transparent 43px),
@@ -275,6 +278,7 @@ input:focus {
     inset 0 1px 0 rgba(255, 255, 255, 0.35),
     6px 10px 0 rgba(43, 36, 28, 0.14);
   animation: slide-up 0.45s ease both;
+  touch-action: none;
 }
 
 .easel-clip {
@@ -320,6 +324,8 @@ input:focus {
       #f7efd8 4px
     );
   touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
   box-shadow: inset 0 0 0 8px #fffaf0;
 }
 
@@ -328,6 +334,44 @@ input:focus {
   height: 100%;
   display: block;
   touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.app.is-playing {
+  overscroll-behavior: none;
+  touch-action: manipulation;
+}
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: max(1.25rem, env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  z-index: 50;
+  max-width: min(90vw, 22rem);
+  padding: 0.55rem 1rem;
+  border-radius: 999px;
+  border: 2px solid var(--ink);
+  background: var(--paint-yellow);
+  color: var(--ink);
+  font-size: 0.9rem;
+  font-weight: 800;
+  box-shadow: 0 6px 0 rgba(43, 36, 28, 0.12);
+  pointer-events: none;
+  animation: toast-in 0.25s ease both;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
 }
 
 .hint {

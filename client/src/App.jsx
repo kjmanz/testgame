@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import DrawingCanvas from "./DrawingCanvas.jsx";
 
+const SESSION_KEY = "oekaki-session";
+
 function createSocket() {
   const url = import.meta.env.VITE_SOCKET_URL || undefined;
   return io(url, {
@@ -10,10 +12,31 @@ function createSocket() {
   });
 }
 
+function loadSession() {
+  try {
+    const raw = sessionStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (!data?.playerId || !data?.roomCode || !data?.name) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+function saveSession(data) {
+  sessionStorage.setItem(SESSION_KEY, JSON.stringify(data));
+}
+
+function clearSession() {
+  sessionStorage.removeItem(SESSION_KEY);
+}
+
 export default function App() {
   const socketRef = useRef(null);
+  const wakeLockRef = useRef(null);
   const [screen, setScreen] = useState("home"); // home | lobby | play
-  const [name, setName] = useState("");
+  const [name, setName] = useState(() => loadSession()?.name || "");
   const [joinCode, setJoinCode] = useState("");
   const [error, setError] = useState("");
   const [roomCode, setRoomCode] = useState("");
@@ -24,9 +47,53 @@ export default function App() {
   const [drawerName, setDrawerName] = useState("");
   const [word, setWord] = useState(null);
   const [clearToken, setClearToken] = useState(0);
+  const [toast, setToast] = useState("");
+  const [restoring, setRestoring] = useState(() => !!loadSession());
 
   const isHost = playerId && playerId === hostId;
   const isDrawer = playerId && playerId === drawerId;
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(""), 2800);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  useEffect(() => {
+    let released = false;
+
+    async function requestWakeLock() {
+      if (!("wakeLock" in navigator) || document.visibilityState !== "visible") {
+        return;
+      }
+      try {
+        const lock = await navigator.wakeLock.request("screen");
+        if (released) {
+          await lock.release();
+          return;
+        }
+        wakeLockRef.current = lock;
+        lock.addEventListener("release", () => {
+          if (wakeLockRef.current === lock) wakeLockRef.current = null;
+        });
+      } catch {
+        // 対応端末以外・権限拒否は無視
+      }
+    }
+
+    function onVisibility() {
+      if (document.visibilityState === "visible") requestWakeLock();
+    }
+
+    requestWakeLock();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      released = true;
+      document.removeEventListener("visibilitychange", onVisibility);
+      wakeLockRef.current?.release().catch(() => {});
+      wakeLockRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     const socket = createSocket();
@@ -69,7 +136,53 @@ export default function App() {
       window.dispatchEvent(new CustomEvent("remote-stroke", { detail: data }));
     });
 
+    socket.on("playerJoined", (data) => {
+      if (data?.name) setToast(`${data.name}が遊びに来たよ！`);
+    });
+
+    function tryRejoin() {
+      const session = loadSession();
+      if (!session) {
+        setRestoring(false);
+        return;
+      }
+      setName(session.name);
+      socket.emit(
+        "rejoinRoom",
+        {
+          code: session.roomCode,
+          playerId: session.playerId,
+          name: session.name,
+        },
+        (res) => {
+          setRestoring(false);
+          if (!res?.ok) {
+            clearSession();
+            setScreen("home");
+            setPlayerId("");
+            setRoomCode("");
+            return;
+          }
+          setPlayerId(res.playerId);
+          setRoomCode(res.code);
+          setPlayers(res.players || []);
+          setHostId(res.hostId || "");
+          saveSession({
+            playerId: res.playerId,
+            roomCode: res.code,
+            name: session.name,
+          });
+          if (res.phase === "lobby") setScreen("lobby");
+          // playing は roundStart で play へ
+        }
+      );
+    }
+
+    if (socket.connected) tryRejoin();
+    socket.on("connect", tryRejoin);
+
     return () => {
+      socket.off("connect", tryRejoin);
       socket.disconnect();
     };
   }, []);
@@ -83,7 +196,8 @@ export default function App() {
 
   function createRoom() {
     setError("");
-    socketRef.current?.emit("createRoom", { name }, (res) => {
+    const trimmed = name.trim();
+    socketRef.current?.emit("createRoom", { name: trimmed }, (res) => {
       if (!res?.ok) {
         setError(res?.error || "作成に失敗しました");
         return;
@@ -92,15 +206,21 @@ export default function App() {
       setRoomCode(res.code);
       setPlayers(res.players || []);
       setHostId(res.hostId || res.playerId);
+      saveSession({
+        playerId: res.playerId,
+        roomCode: res.code,
+        name: trimmed,
+      });
       setScreen("lobby");
     });
   }
 
   function joinRoom() {
     setError("");
+    const trimmed = name.trim();
     socketRef.current?.emit(
       "joinRoom",
-      { code: joinCode, name },
+      { code: joinCode, name: trimmed },
       (res) => {
         if (!res?.ok) {
           setError(res?.error || "入室に失敗しました");
@@ -110,9 +230,33 @@ export default function App() {
         setRoomCode(res.code);
         setPlayers(res.players || []);
         setHostId(res.hostId || "");
-        setScreen("lobby");
+        saveSession({
+          playerId: res.playerId,
+          roomCode: res.code,
+          name: trimmed,
+        });
+        if (res.phase === "playing") {
+          setScreen("play");
+        } else {
+          setScreen("lobby");
+        }
       }
     );
+  }
+
+  function leaveRoom() {
+    setError("");
+    socketRef.current?.emit("leaveRoom", () => {
+      clearSession();
+      setScreen("home");
+      setRoomCode("");
+      setPlayerId("");
+      setPlayers([]);
+      setHostId("");
+      setDrawerId("");
+      setDrawerName("");
+      setWord(null);
+    });
   }
 
   function startGame() {
@@ -137,13 +281,25 @@ export default function App() {
   }
 
   return (
-    <div className="app">
+    <div className={`app${screen === "play" ? " is-playing" : ""}`}>
+      {toast && (
+        <div className="toast" role="status">
+          {toast}
+        </div>
+      )}
+
       <header className="brand">
         <h1>おえかきあて</h1>
         <p>キャンバスに描いて、みんなで当てよう</p>
       </header>
 
-      {screen === "home" && (
+      {restoring && (
+        <div className="card">
+          <p className="hint">部屋に戻っています…</p>
+        </div>
+      )}
+
+      {!restoring && screen === "home" && (
         <div className="card">
           <div>
             <div className="label">なまえ</div>
@@ -189,7 +345,7 @@ export default function App() {
         </div>
       )}
 
-      {screen === "lobby" && (
+      {!restoring && screen === "lobby" && (
         <div className="card tape-teal">
           <div className="label">部屋コード</div>
           <div className="code-big">{roomCode}</div>
@@ -219,13 +375,16 @@ export default function App() {
               </>
             )}
             {!isHost && <p className="hint">ホストの開始待ち…</p>}
+            <button type="button" className="secondary" onClick={leaveRoom}>
+              部屋をでる
+            </button>
           </div>
 
           {error && <p className="error">{error}</p>}
         </div>
       )}
 
-      {screen === "play" && (
+      {!restoring && screen === "play" && (
         <>
           <div className="card play-header tape-yellow">
             <div className="meta">部屋 {roomCode}</div>

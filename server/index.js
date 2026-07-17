@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import cors from "cors";
 import express from "express";
 import { existsSync } from "fs";
@@ -9,6 +10,8 @@ import { randomWord } from "./words.js";
 
 const PORT = process.env.PORT || 3001;
 const MAX_PLAYERS = 10;
+const DISCONNECT_GRACE_MS = 45_000;
+const MAX_CONSECUTIVE_DRAWS = 2;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const clientDist = path.join(__dirname, "../client/dist");
 
@@ -21,20 +24,33 @@ const io = new Server(httpServer, {
   cors: { origin: true, methods: ["GET", "POST"] },
 });
 
-/** @typedef {{ id: string, name: string, isHost: boolean }} Player */
-/** @typedef {{
+/**
+ * @typedef {{
+ *  id: string,
+ *  name: string,
+ *  isHost: boolean,
+ *  socketId: string | null,
+ *  disconnectTimer?: ReturnType<typeof setTimeout>,
+ * }} Player
+ */
+/**
+ * @typedef {{
  *  code: string,
  *  hostId: string,
  *  players: Map<string, Player>,
  *  phase: 'lobby' | 'playing',
  *  drawerId: string | null,
  *  word: string | null,
- * }} Room */
+ *  drawerStreak: { id: string, count: number } | null,
+ * }} Room
+ */
 
 /** @type {Map<string, Room>} */
 const rooms = new Map();
 /** socketId -> roomCode */
 const socketRoom = new Map();
+/** socketId -> playerId */
+const socketPlayer = new Map();
 
 function generateCode() {
   for (let i = 0; i < 50; i++) {
@@ -61,46 +77,117 @@ function emitLobby(room) {
   });
 }
 
-function startRound(room) {
-  const players = [...room.players.values()];
-  if (players.length === 0) return;
+function bindSocket(socket, room, player) {
+  if (player.disconnectTimer) {
+    clearTimeout(player.disconnectTimer);
+    player.disconnectTimer = undefined;
+  }
+  if (player.socketId && player.socketId !== socket.id) {
+    socketRoom.delete(player.socketId);
+    socketPlayer.delete(player.socketId);
+  }
+  player.socketId = socket.id;
+  socketRoom.set(socket.id, room.code);
+  socketPlayer.set(socket.id, player.id);
+  socket.join(room.code);
+}
 
-  const drawer = players[Math.floor(Math.random() * players.length)];
+function getContext(socket) {
+  const code = socketRoom.get(socket.id);
+  const playerId = socketPlayer.get(socket.id);
+  const room = code ? rooms.get(code) : null;
+  if (!room || !playerId) return null;
+  const player = room.players.get(playerId);
+  if (!player) return null;
+  return { code, room, playerId, player };
+}
+
+function pickDrawer(room) {
+  const players = [...room.players.values()];
+  if (players.length === 0) return null;
+
+  let candidates = players;
+  const streak = room.drawerStreak;
+  if (streak && streak.count >= MAX_CONSECUTIVE_DRAWS && players.length > 1) {
+    const filtered = players.filter((p) => p.id !== streak.id);
+    if (filtered.length > 0) candidates = filtered;
+  }
+
+  const drawer = candidates[Math.floor(Math.random() * candidates.length)];
+  if (streak && streak.id === drawer.id) {
+    room.drawerStreak = { id: drawer.id, count: streak.count + 1 };
+  } else {
+    room.drawerStreak = { id: drawer.id, count: 1 };
+  }
+  return drawer;
+}
+
+function emitRoundStart(room) {
+  const players = [...room.players.values()];
+  const drawer = room.drawerId ? room.players.get(room.drawerId) : null;
+  if (!drawer) return;
+
+  for (const player of players) {
+    if (!player.socketId) continue;
+    const payload = {
+      drawerId: drawer.id,
+      drawerName: drawer.name,
+      players: publicPlayers(room),
+      word: player.id === drawer.id ? room.word : null,
+    };
+    io.to(player.socketId).emit("roundStart", payload);
+  }
+}
+
+function startRound(room) {
+  const drawer = pickDrawer(room);
+  if (!drawer) return;
+
   const word = randomWord();
   room.phase = "playing";
   room.drawerId = drawer.id;
   room.word = word;
 
   io.to(room.code).emit("clearCanvas");
+  emitRoundStart(room);
+}
 
-  for (const player of players) {
-    const payload = {
-      drawerId: drawer.id,
-      drawerName: drawer.name,
-      players: publicPlayers(room),
-    };
-    if (player.id === drawer.id) {
-      io.to(player.id).emit("roundStart", { ...payload, word });
-    } else {
-      io.to(player.id).emit("roundStart", { ...payload, word: null });
-    }
+function syncPlayerState(socket, room, playerId) {
+  const players = publicPlayers(room);
+  if (room.phase === "playing" && room.drawerId) {
+    const drawer = room.players.get(room.drawerId);
+    io.to(socket.id).emit("roundStart", {
+      drawerId: room.drawerId,
+      drawerName: drawer?.name || "",
+      players,
+      word: room.drawerId === playerId ? room.word : null,
+    });
+  } else {
+    emitLobby(room);
   }
 }
 
-function leaveRoom(socket) {
-  const code = socketRoom.get(socket.id);
-  if (!code) return;
-  const room = rooms.get(code);
-  socketRoom.delete(socket.id);
-  if (!room) return;
+function removePlayer(room, playerId) {
+  const player = room.players.get(playerId);
+  if (!player) return;
 
-  const wasDrawer = room.drawerId === socket.id;
-  const wasHost = room.hostId === socket.id;
-  room.players.delete(socket.id);
-  socket.leave(code);
+  if (player.disconnectTimer) {
+    clearTimeout(player.disconnectTimer);
+    player.disconnectTimer = undefined;
+  }
+  if (player.socketId) {
+    socketRoom.delete(player.socketId);
+    socketPlayer.delete(player.socketId);
+    const sock = io.sockets.sockets.get(player.socketId);
+    sock?.leave(room.code);
+  }
+
+  const wasDrawer = room.drawerId === playerId;
+  const wasHost = room.hostId === playerId;
+  room.players.delete(playerId);
 
   if (room.players.size === 0) {
-    rooms.delete(code);
+    rooms.delete(room.code);
     return;
   }
 
@@ -111,10 +198,27 @@ function leaveRoom(socket) {
   }
 
   if (room.phase === "playing" && wasDrawer) {
+    if (room.drawerStreak?.id === playerId) {
+      room.drawerStreak = null;
+    }
     startRound(room);
   } else {
     emitLobby(room);
   }
+}
+
+function scheduleDisconnect(room, player) {
+  if (player.disconnectTimer) {
+    clearTimeout(player.disconnectTimer);
+  }
+  player.socketId = null;
+  player.disconnectTimer = setTimeout(() => {
+    const current = rooms.get(room.code);
+    if (!current) return;
+    const still = current.players.get(player.id);
+    if (!still || still.socketId) return;
+    removePlayer(current, player.id);
+  }, DISCONNECT_GRACE_MS);
 }
 
 io.on("connection", (socket) => {
@@ -124,30 +228,34 @@ io.on("connection", (socket) => {
       if (!trimmed) return cb?.({ ok: false, error: "名前を入力してください" });
 
       const code = generateCode();
+      const playerId = randomUUID();
       /** @type {Room} */
       const room = {
         code,
-        hostId: socket.id,
+        hostId: playerId,
         players: new Map(),
         phase: "lobby",
         drawerId: null,
         word: null,
+        drawerStreak: null,
       };
-      room.players.set(socket.id, {
-        id: socket.id,
+      const player = {
+        id: playerId,
         name: trimmed,
         isHost: true,
-      });
+        socketId: null,
+      };
+      room.players.set(playerId, player);
       rooms.set(code, room);
-      socketRoom.set(socket.id, code);
-      socket.join(code);
+      bindSocket(socket, room, player);
 
       cb?.({
         ok: true,
         code,
-        playerId: socket.id,
+        playerId,
         hostId: room.hostId,
         players: publicPlayers(room),
+        phase: room.phase,
       });
       emitLobby(room);
     } catch (e) {
@@ -165,61 +273,116 @@ io.on("connection", (socket) => {
 
     const room = rooms.get(roomCode);
     if (!room) return cb?.({ ok: false, error: "部屋が見つかりません" });
-    if (room.phase !== "lobby") {
-      return cb?.({ ok: false, error: "ゲーム中のため入れません" });
-    }
     if (room.players.size >= MAX_PLAYERS) {
       return cb?.({ ok: false, error: "部屋が満員です（最大10人）" });
     }
 
-    room.players.set(socket.id, {
-      id: socket.id,
+    const playerId = randomUUID();
+    const player = {
+      id: playerId,
       name: trimmed,
       isHost: false,
-    });
-    socketRoom.set(socket.id, roomCode);
-    socket.join(roomCode);
+      socketId: null,
+    };
+    room.players.set(playerId, player);
+    bindSocket(socket, room, player);
 
     cb?.({
       ok: true,
       code: roomCode,
-      playerId: socket.id,
+      playerId,
       hostId: room.hostId,
       players: publicPlayers(room),
+      phase: room.phase,
     });
-    emitLobby(room);
+
+    socket.to(roomCode).emit("playerJoined", { name: trimmed });
+
+    if (room.phase === "playing") {
+      syncPlayerState(socket, room, playerId);
+      emitLobby(room);
+    } else {
+      emitLobby(room);
+    }
+  });
+
+  socket.on("rejoinRoom", ({ code, playerId, name }, cb) => {
+    const roomCode = String(code || "").trim();
+    const id = String(playerId || "").trim();
+    const trimmed = String(name || "").trim().slice(0, 12);
+
+    if (!/^\d{4}$/.test(roomCode) || !id) {
+      return cb?.({ ok: false, error: "再入室できません", expired: true });
+    }
+
+    const room = rooms.get(roomCode);
+    if (!room) {
+      return cb?.({ ok: false, error: "部屋が見つかりません", expired: true });
+    }
+
+    const player = room.players.get(id);
+    if (!player) {
+      return cb?.({
+        ok: false,
+        error: "セッションが切れました。もう一度入室してください",
+        expired: true,
+      });
+    }
+
+    if (trimmed) player.name = trimmed;
+    bindSocket(socket, room, player);
+
+    cb?.({
+      ok: true,
+      code: roomCode,
+      playerId: player.id,
+      hostId: room.hostId,
+      players: publicPlayers(room),
+      phase: room.phase,
+    });
+
+    syncPlayerState(socket, room, player.id);
+  });
+
+  socket.on("leaveRoom", (cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return cb?.({ ok: true });
+    removePlayer(ctx.room, ctx.playerId);
+    cb?.({ ok: true });
   });
 
   socket.on("startGame", (cb) => {
-    const code = socketRoom.get(socket.id);
-    const room = code && rooms.get(code);
-    if (!room) return cb?.({ ok: false, error: "部屋がありません" });
-    if (room.hostId !== socket.id) {
+    const ctx = getContext(socket);
+    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
+    const { room, playerId } = ctx;
+    if (room.hostId !== playerId) {
       return cb?.({ ok: false, error: "ホストだけが開始できます" });
     }
     if (room.players.size < 2) {
       return cb?.({ ok: false, error: "2人以上必要です" });
     }
+    room.drawerStreak = null;
     startRound(room);
     cb?.({ ok: true });
   });
 
   socket.on("stroke", (data) => {
-    const code = socketRoom.get(socket.id);
-    const room = code && rooms.get(code);
-    if (!room || room.phase !== "playing") return;
-    if (room.drawerId !== socket.id) return;
+    const ctx = getContext(socket);
+    if (!ctx) return;
+    const { code, room, playerId } = ctx;
+    if (room.phase !== "playing") return;
+    if (room.drawerId !== playerId) return;
     socket.to(code).emit("stroke", data);
   });
 
   socket.on("nextRound", (cb) => {
-    const code = socketRoom.get(socket.id);
-    const room = code && rooms.get(code);
-    if (!room) return cb?.({ ok: false, error: "部屋がありません" });
+    const ctx = getContext(socket);
+    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
+    const { room, playerId } = ctx;
     if (room.phase !== "playing") {
       return cb?.({ ok: false, error: "プレイ中ではありません" });
     }
-    if (room.drawerId !== socket.id) {
+    if (room.drawerId !== playerId) {
       return cb?.({ ok: false, error: "描き手だけが次へ進めます" });
     }
     startRound(room);
@@ -227,15 +390,16 @@ io.on("connection", (socket) => {
   });
 
   socket.on("endGame", (cb) => {
-    const code = socketRoom.get(socket.id);
-    const room = code && rooms.get(code);
-    if (!room) return cb?.({ ok: false, error: "部屋がありません" });
-    if (room.hostId !== socket.id) {
+    const ctx = getContext(socket);
+    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
+    const { code, room, playerId } = ctx;
+    if (room.hostId !== playerId) {
       return cb?.({ ok: false, error: "ホストだけが終了できます" });
     }
     room.phase = "lobby";
     room.drawerId = null;
     room.word = null;
+    room.drawerStreak = null;
     io.to(code).emit("clearCanvas");
     io.to(code).emit("gameEnded");
     emitLobby(room);
@@ -243,7 +407,17 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
-    leaveRoom(socket);
+    const code = socketRoom.get(socket.id);
+    const playerId = socketPlayer.get(socket.id);
+    socketRoom.delete(socket.id);
+    socketPlayer.delete(socket.id);
+    if (!code || !playerId) return;
+    const room = rooms.get(code);
+    if (!room) return;
+    const player = room.players.get(playerId);
+    if (!player) return;
+    if (player.socketId && player.socketId !== socket.id) return;
+    scheduleDisconnect(room, player);
   });
 });
 
