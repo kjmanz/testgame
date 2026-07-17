@@ -29,10 +29,12 @@
    - **Name:** `draw-guess`（任意）
    - **Language:** Node
    - **Branch:** `main`
-   - **Build Command:** `npm run install:all && npm run build`
+   - **Build Command:** `npm install && npm run build`
    - **Start Command:** `npm start`
    - **Instance type:** Free
 4. **Deploy** を押す
+
+すでにサービスがある場合は、Build Command を上の内容に直してから **Manual Deploy** してください。
 
 **方法B（Blueprint）**
 
