@@ -139,7 +139,6 @@ export default function App() {
   return (
     <div className="app">
       <header className="brand">
-        <div className="brand-badge">アトリエオープン</div>
         <h1>おえかきあて</h1>
         <p>キャンバスに描いて、みんなで当てよう</p>
       </header>

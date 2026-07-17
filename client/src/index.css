@@ -122,19 +122,6 @@ input:focus {
   animation: pop-in 0.45s ease both;
 }
 
-.brand-badge {
-  display: inline-block;
-  margin-bottom: 0.45rem;
-  padding: 0.25rem 0.75rem;
-  border-radius: 999px;
-  border: 2px solid var(--ink);
-  background: var(--paint-yellow);
-  font-size: 0.75rem;
-  font-weight: 800;
-  letter-spacing: 0.04em;
-  transform: rotate(-3deg);
-}
-
 .brand h1 {
   margin: 0;
   font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
