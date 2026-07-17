@@ -32,10 +32,22 @@ function clearSession() {
   sessionStorage.removeItem(SESSION_KEY);
 }
 
+function formatRemain(ms) {
+  const sec = Math.max(0, Math.ceil(ms / 1000));
+  return sec;
+}
+
+function roundTypeLabel(type) {
+  if (type === "relay") return "リレー";
+  if (type === "coop") return "協力";
+  return "通常";
+}
+
 export default function App() {
   const socketRef = useRef(null);
   const wakeLockRef = useRef(null);
-  const [screen, setScreen] = useState("home"); // home | lobby | play
+  const canvasApiRef = useRef(null);
+  const [screen, setScreen] = useState("home"); // home | lobby | play | gallery
   const [name, setName] = useState(() => loadSession()?.name || "");
   const [joinCode, setJoinCode] = useState("");
   const [error, setError] = useState("");
@@ -45,19 +57,93 @@ export default function App() {
   const [hostId, setHostId] = useState("");
   const [drawerId, setDrawerId] = useState("");
   const [drawerName, setDrawerName] = useState("");
+  const [drawerNames, setDrawerNames] = useState([]);
   const [word, setWord] = useState(null);
   const [clearToken, setClearToken] = useState(0);
   const [toast, setToast] = useState("");
+  const [fanfare, setFanfare] = useState(null);
   const [restoring, setRestoring] = useState(() => !!loadSession());
+  const [roundType, setRoundType] = useState("normal");
+  const [drawPhase, setDrawPhase] = useState("drawing");
+  const [canDraw, setCanDraw] = useState(false);
+  const [canNextRound, setCanNextRound] = useState(false);
+  const [canEndDrawing, setCanEndDrawing] = useState(false);
+  const [turnEndsAt, setTurnEndsAt] = useState(null);
+  const [remainSec, setRemainSec] = useState(null);
+  const [relayIndex, setRelayIndex] = useState(null);
+  const [relayTotal, setRelayTotal] = useState(null);
+  const [turnDurationSec, setTurnDurationSec] = useState(null);
+  const [gallery, setGallery] = useState([]);
+  const [gallerySelectMode, setGallerySelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [returnScreen, setReturnScreen] = useState("lobby");
 
   const isHost = playerId && playerId === hostId;
-  const isDrawer = playerId && playerId === drawerId;
+  const modeClass = `mode-${roundType || "normal"}`;
+
+  function applyRoundPayload(data, { forcePlay = true } = {}) {
+    if (forcePlay) {
+      setScreen("play");
+    } else {
+      setScreen((prev) => (prev === "gallery" ? "gallery" : "play"));
+    }
+    setRoundType(data.roundType || "normal");
+    setDrawPhase(data.drawPhase || "drawing");
+    setDrawerId(data.drawerId || "");
+    setDrawerName(data.drawerName || "");
+    setDrawerNames(data.drawerNames || data.coopNames || []);
+    setWord(data.word ?? null);
+    setPlayers(data.players || []);
+    setCanDraw(!!data.canDraw);
+    setCanNextRound(!!data.canNextRound);
+    setCanEndDrawing(!!data.canEndDrawing);
+    setTurnEndsAt(data.turnEndsAt ?? null);
+    setRelayIndex(data.relayIndex ?? null);
+    setRelayTotal(data.relayTotal ?? null);
+    setTurnDurationSec(data.turnDurationSec ?? null);
+  }
+
+  function resetPlayState() {
+    setDrawerId("");
+    setDrawerName("");
+    setDrawerNames([]);
+    setWord(null);
+    setRoundType("normal");
+    setDrawPhase("drawing");
+    setCanDraw(false);
+    setCanNextRound(false);
+    setCanEndDrawing(false);
+    setTurnEndsAt(null);
+    setRemainSec(null);
+    setRelayIndex(null);
+    setRelayTotal(null);
+    setTurnDurationSec(null);
+  }
 
   useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => setToast(""), 2800);
     return () => clearTimeout(t);
   }, [toast]);
+
+  useEffect(() => {
+    if (!fanfare) return;
+    const t = setTimeout(() => setFanfare(null), 2200);
+    return () => clearTimeout(t);
+  }, [fanfare]);
+
+  useEffect(() => {
+    if (!turnEndsAt) {
+      setRemainSec(null);
+      return;
+    }
+    function tick() {
+      setRemainSec(formatRemain(turnEndsAt - Date.now()));
+    }
+    tick();
+    const id = setInterval(tick, 200);
+    return () => clearInterval(id);
+  }, [turnEndsAt]);
 
   useEffect(() => {
     let released = false;
@@ -104,20 +190,17 @@ export default function App() {
       setPlayers(data.players || []);
       setHostId(data.hostId);
       if (data.phase === "lobby") {
-        setScreen("lobby");
-        setDrawerId("");
-        setDrawerName("");
-        setWord(null);
+        setScreen((prev) => (prev === "gallery" ? "gallery" : "lobby"));
+        resetPlayState();
       }
     });
 
     socket.on("roundStart", (data) => {
-      setScreen("play");
-      setDrawerId(data.drawerId);
-      setDrawerName(data.drawerName);
-      setWord(data.word ?? null);
-      setPlayers(data.players || []);
-      setClearToken((n) => n + 1);
+      applyRoundPayload(data, { forcePlay: true });
+    });
+
+    socket.on("roundUpdate", (data) => {
+      applyRoundPayload(data, { forcePlay: false });
     });
 
     socket.on("clearCanvas", () => {
@@ -125,10 +208,8 @@ export default function App() {
     });
 
     socket.on("gameEnded", () => {
-      setScreen("lobby");
-      setDrawerId("");
-      setDrawerName("");
-      setWord(null);
+      setScreen((prev) => (prev === "gallery" ? "gallery" : "lobby"));
+      resetPlayState();
       setClearToken((n) => n + 1);
     });
 
@@ -138,6 +219,18 @@ export default function App() {
 
     socket.on("playerJoined", (data) => {
       if (data?.name) setToast(`${data.name}が遊びに来たよ！`);
+    });
+
+    socket.on("roundFanfare", (data) => {
+      setFanfare(data);
+      if (data?.message) setToast(data.message);
+      if (data?.roundType === "coop" && data.names?.length) {
+        setToast(`🤝 ${data.names.join("・")}が協力！`);
+      }
+    });
+
+    socket.on("galleryUpdate", (data) => {
+      setGallery(data.gallery || []);
     });
 
     function tryRejoin() {
@@ -253,9 +346,9 @@ export default function App() {
       setPlayerId("");
       setPlayers([]);
       setHostId("");
-      setDrawerId("");
-      setDrawerName("");
-      setWord(null);
+      setGallery([]);
+      setSelectedIds(new Set());
+      resetPlayState();
     });
   }
 
@@ -268,8 +361,16 @@ export default function App() {
 
   function nextRound() {
     setError("");
-    socketRef.current?.emit("nextRound", (res) => {
+    const imageDataUrl = canvasApiRef.current?.exportImage?.() || undefined;
+    socketRef.current?.emit("nextRound", { imageDataUrl }, (res) => {
       if (!res?.ok) setError(res?.error || "次へ進めません");
+    });
+  }
+
+  function endDrawing() {
+    setError("");
+    socketRef.current?.emit("endDrawing", (res) => {
+      if (!res?.ok) setError(res?.error || "描き終わりにできません");
     });
   }
 
@@ -280,11 +381,230 @@ export default function App() {
     });
   }
 
+  function openGallery(from) {
+    setReturnScreen(from || screen);
+    setGallerySelectMode(false);
+    setSelectedIds(new Set());
+    setScreen("gallery");
+  }
+
+  function closeGallery() {
+    setGallerySelectMode(false);
+    setSelectedIds(new Set());
+    setScreen(returnScreen === "play" ? "play" : "lobby");
+  }
+
+  function toggleSelect(id) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function deleteSelected() {
+    if (selectedIds.size === 0) return;
+    socketRef.current?.emit(
+      "deleteGalleryItems",
+      { ids: [...selectedIds] },
+      (res) => {
+        if (!res?.ok) setError(res?.error || "削除できません");
+        else {
+          setSelectedIds(new Set());
+          setGallerySelectMode(false);
+        }
+      }
+    );
+  }
+
+  function deleteAllGallery() {
+    if (!gallery.length) return;
+    if (!window.confirm("ギャラリーの絵を全部消しますか？")) return;
+    socketRef.current?.emit("clearGallery", (res) => {
+      if (!res?.ok) setError(res?.error || "削除できません");
+      else {
+        setSelectedIds(new Set());
+        setGallerySelectMode(false);
+      }
+    });
+  }
+
+  async function saveImage(item) {
+    const filename = `oekaki-${item.word || "picture"}-${item.id.slice(0, 8)}.jpg`;
+    try {
+      const res = await fetch(item.imageDataUrl);
+      const blob = await res.blob();
+      if (navigator.share && navigator.canShare?.({ files: [new File([blob], filename, { type: blob.type })] })) {
+        const file = new File([blob], filename, { type: blob.type || "image/jpeg" });
+        await navigator.share({ files: [file], title: item.word || "おえかき" });
+        return;
+      }
+    } catch {
+      // fall through to download
+    }
+    const a = document.createElement("a");
+    a.href = item.imageDataUrl;
+    a.download = filename;
+    a.click();
+  }
+
+  function renderPlayHeader() {
+    if (roundType === "relay") {
+      return (
+        <>
+          <div className="meta row-meta">
+            <span>部屋 {roomCode}</span>
+            <span className="mode-pill relay-pill">RELAY</span>
+          </div>
+          {drawPhase === "drawing" ? (
+            canDraw ? (
+              <>
+                <div className="label">あなたの番！ オダイ</div>
+                <div className="word">{word}</div>
+              </>
+            ) : word ? (
+              <>
+                <div className="label">お題（リレー中）</div>
+                <div className="word">{word}</div>
+                <p className="hint">次の人が継ぎ足してるよ…</p>
+              </>
+            ) : (
+              <>
+                <div className="label">いま描いている人</div>
+                <div className="word">{drawerName || "？？？"}</div>
+                <p className="hint">次は誰？ 絵を見て当てよう！</p>
+              </>
+            )
+          ) : (
+            <>
+              {word ? (
+                <>
+                  <div className="label">お題</div>
+                  <div className="word">{word}</div>
+                  <p className="hint">みんなで当てよう！</p>
+                </>
+              ) : (
+                <>
+                  <div className="label">あてっこタイム</div>
+                  <div className="word">なにだろう？</div>
+                  <p className="hint">絵を見て、当てよう！</p>
+                </>
+              )}
+            </>
+          )}
+          {remainSec != null && drawPhase === "drawing" && (
+            <div className="timer-bar" aria-live="polite">
+              <div className="timer-label">のこり {remainSec}びょう</div>
+              <div className="timer-track">
+                <div
+                  className="timer-fill"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      (remainSec / Math.max(1, turnDurationSec || 10)) * 100
+                    )}%`,
+                  }}
+                />
+              </div>
+              {relayTotal != null && (
+                <div className="timer-sub">
+                  {(relayIndex ?? 0) + 1} / {relayTotal} 人目
+                </div>
+              )}
+            </div>
+          )}
+        </>
+      );
+    }
+
+    if (roundType === "coop") {
+      return (
+        <>
+          <div className="meta row-meta">
+            <span>部屋 {roomCode}</span>
+            <span className="mode-pill coop-pill">協力</span>
+          </div>
+          {word ? (
+            <>
+              <div className="label">みんなのオダイ</div>
+              <div className="word">{word}</div>
+              <p className="hint">
+                {drawerNames.length
+                  ? `${drawerNames.join("・")}が協力！`
+                  : "いっしょに描こう"}
+              </p>
+            </>
+          ) : (
+            <>
+              <div className="label">いま協力中</div>
+              <div className="word">
+                {drawerNames.length ? drawerNames.join("・") : "？？？"}
+              </div>
+              <p className="hint">絵を見て、当てよう！</p>
+            </>
+          )}
+          {remainSec != null && drawPhase === "drawing" && (
+            <div className="timer-bar" aria-live="polite">
+              <div className="timer-label">のこり {remainSec}びょう</div>
+              <div className="timer-track">
+                <div
+                  className="timer-fill coop"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      (remainSec / Math.max(1, turnDurationSec || 40)) * 100
+                    )}%`,
+                  }}
+                />
+              </div>
+            </div>
+          )}
+          {drawPhase === "guessing" && (
+            <p className="hint">あてっこタイム！</p>
+          )}
+        </>
+      );
+    }
+
+    // normal
+    return (
+      <>
+        <div className="meta">部屋 {roomCode}</div>
+        {word ? (
+          <>
+            <div className="label">あなたのオダイ</div>
+            <div className="word">{word}</div>
+          </>
+        ) : (
+          <>
+            <div className="label">いま描いている人</div>
+            <div className="word">{drawerName}</div>
+            <p className="hint">絵を見て、当てよう！</p>
+          </>
+        )}
+      </>
+    );
+  }
+
   return (
-    <div className={`app${screen === "play" ? " is-playing" : ""}`}>
+    <div
+      className={`app${screen === "play" ? " is-playing" : ""} ${screen === "play" ? modeClass : ""}`}
+    >
       {toast && (
         <div className="toast" role="status">
           {toast}
+        </div>
+      )}
+
+      {fanfare && (
+        <div className={`fanfare fanfare-${fanfare.roundType}`} role="status">
+          <div className="fanfare-inner">
+            <div className="fanfare-text">{fanfare.message}</div>
+            {fanfare.roundType === "coop" && fanfare.names?.length > 0 && (
+              <div className="fanfare-sub">{fanfare.names.join("・")}</div>
+            )}
+          </div>
         </div>
       )}
 
@@ -375,6 +695,13 @@ export default function App() {
               </>
             )}
             {!isHost && <p className="hint">ホストの開始待ち…</p>}
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => openGallery("lobby")}
+            >
+              ギャラリー（{gallery.length}）
+            </button>
             <button type="button" className="secondary" onClick={leaveRoom}>
               部屋をでる
             </button>
@@ -384,29 +711,141 @@ export default function App() {
         </div>
       )}
 
-      {!restoring && screen === "play" && (
-        <>
-          <div className="card play-header tape-yellow">
-            <div className="meta">部屋 {roomCode}</div>
-            {isDrawer ? (
-              <>
-                <div className="label">あなたのオダイ</div>
-                <div className="word">{word}</div>
-              </>
-            ) : (
-              <>
-                <div className="label">いま描いている人</div>
-                <div className="word">{drawerName}</div>
-                <p className="hint">絵を見て、当てよう！</p>
-              </>
-            )}
+      {!restoring && screen === "gallery" && (
+        <div className="card tape-yellow gallery-card">
+          <div className="gallery-top">
+            <div className="label">ギャラリー</div>
+            <button
+              type="button"
+              className="ghost-btn"
+              onClick={closeGallery}
+            >
+              もどる
+            </button>
+          </div>
+          <p className="hint">
+            {gallery.length
+              ? "長押しや保存で端末に残せます"
+              : "まだ絵がありません。ラウンドを進めるとここに残ります"}
+          </p>
+
+          {gallery.length > 0 && (
+            <div className="gallery-toolbar">
+              <button
+                type="button"
+                className="secondary small-btn"
+                onClick={() => {
+                  setGallerySelectMode((v) => !v);
+                  setSelectedIds(new Set());
+                }}
+              >
+                {gallerySelectMode ? "選択やめる" : "選択する"}
+              </button>
+              {gallerySelectMode && (
+                <button
+                  type="button"
+                  className="danger small-btn"
+                  onClick={deleteSelected}
+                  disabled={selectedIds.size === 0}
+                >
+                  えらんだのを消す
+                </button>
+              )}
+              <button
+                type="button"
+                className="danger small-btn"
+                onClick={deleteAllGallery}
+              >
+                全部消す
+              </button>
+            </div>
+          )}
+
+          <div className="gallery-grid">
+            {gallery
+              .slice()
+              .reverse()
+              .map((item) => (
+                <div
+                  key={item.id}
+                  className={`gallery-item${selectedIds.has(item.id) ? " selected" : ""}`}
+                  onClick={() => {
+                    if (gallerySelectMode) toggleSelect(item.id);
+                  }}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    saveImage(item);
+                  }}
+                  onTouchStart={(e) => {
+                    const target = e.currentTarget;
+                    target._longPress = setTimeout(() => {
+                      saveImage(item);
+                    }, 550);
+                  }}
+                  onTouchEnd={(e) => {
+                    clearTimeout(e.currentTarget._longPress);
+                  }}
+                  onTouchMove={(e) => {
+                    clearTimeout(e.currentTarget._longPress);
+                  }}
+                >
+                  {gallerySelectMode && (
+                    <span className="gallery-check" aria-hidden="true">
+                      {selectedIds.has(item.id) ? "✓" : ""}
+                    </span>
+                  )}
+                  <img src={item.imageDataUrl} alt={item.word || "絵"} />
+                  <div className="gallery-meta">
+                    <span className="gallery-word">{item.word}</span>
+                    <span className="gallery-type">
+                      {roundTypeLabel(item.roundType)}
+                    </span>
+                  </div>
+                  <div className="gallery-drawers">
+                    {(item.drawerNames || []).join("・")}
+                  </div>
+                  {!gallerySelectMode && (
+                    <button
+                      type="button"
+                      className="gallery-save"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        saveImage(item);
+                      }}
+                    >
+                      保存
+                    </button>
+                  )}
+                </div>
+              ))}
           </div>
 
-          <div className="easel">
+          {error && <p className="error">{error}</p>}
+        </div>
+      )}
+
+      {!restoring && screen === "play" && (
+        <>
+          <div className={`card play-header tape-yellow ${modeClass}`}>
+            {renderPlayHeader()}
+          </div>
+
+          <div className={`easel ${modeClass}`}>
             <div className="easel-clip" aria-hidden="true" />
-            <div className="canvas-wrap">
+            {roundType === "relay" && (
+              <div className="easel-badge relay-badge" aria-hidden="true">
+                RELAY
+              </div>
+            )}
+            {roundType === "coop" && (
+              <div className="easel-badge coop-badge" aria-hidden="true">
+                協力
+              </div>
+            )}
+            <div className={`canvas-wrap ${modeClass}`}>
               <DrawingCanvas
-                enabled={!!isDrawer}
+                ref={canvasApiRef}
+                enabled={!!canDraw}
                 clearToken={clearToken}
                 onStroke={emitStroke}
               />
@@ -414,11 +853,23 @@ export default function App() {
           </div>
 
           <div className="actions">
-            {isDrawer && (
+            {canEndDrawing && (
+              <button type="button" className="secondary" onClick={endDrawing}>
+                描きおわり
+              </button>
+            )}
+            {canNextRound && (
               <button type="button" onClick={nextRound}>
                 つぎのお題へ
               </button>
             )}
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => openGallery("play")}
+            >
+              ギャラリー（{gallery.length}）
+            </button>
             {isHost && (
               <button type="button" className="danger" onClick={endGame}>
                 おわり

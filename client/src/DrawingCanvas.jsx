@@ -1,13 +1,49 @@
-import { useEffect, useRef } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 
 /**
  * 正規化座標 (0-1) で線を送受信するキャンバス
  */
-export default function DrawingCanvas({ enabled, clearToken, onStroke }) {
+const DrawingCanvas = forwardRef(function DrawingCanvas(
+  { enabled, clearToken, onStroke },
+  ref
+) {
   const canvasRef = useRef(null);
   const drawingRef = useRef(false);
   const lastRef = useRef(null);
-  const remoteLastRef = useRef(null);
+  /** @type {React.MutableRefObject<Map<string, {x:number,y:number}|null>>} */
+  const remoteLastMapRef = useRef(new Map());
+
+  useImperativeHandle(ref, () => ({
+    /**
+     * JPEG 圧縮した data URL を返す（ギャラリー用）
+     * @param {{ maxSize?: number, quality?: number }} [opts]
+     */
+    exportImage({ maxSize = 640, quality = 0.72 } = {}) {
+      const canvas = canvasRef.current;
+      if (!canvas) return null;
+      const srcW = canvas.width;
+      const srcH = canvas.height;
+      if (!srcW || !srcH) return null;
+
+      const scale = Math.min(1, maxSize / Math.max(srcW, srcH));
+      const outW = Math.max(1, Math.round(srcW * scale));
+      const outH = Math.max(1, Math.round(srcH * scale));
+
+      const tmp = document.createElement("canvas");
+      tmp.width = outW;
+      tmp.height = outH;
+      const ctx = tmp.getContext("2d");
+      if (!ctx) return null;
+      ctx.fillStyle = "#fbf4e4";
+      ctx.fillRect(0, 0, outW, outH);
+      ctx.drawImage(canvas, 0, 0, outW, outH);
+      try {
+        return tmp.toDataURL("image/jpeg", quality);
+      } catch {
+        return null;
+      }
+    },
+  }));
 
   function setupContext() {
     const canvas = canvasRef.current;
@@ -31,7 +67,7 @@ export default function DrawingCanvas({ enabled, clearToken, onStroke }) {
     ctx.fillRect(0, 0, rect.width, rect.height);
     drawingRef.current = false;
     lastRef.current = null;
-    remoteLastRef.current = null;
+    remoteLastMapRef.current.clear();
   }
 
   useEffect(() => {
@@ -104,20 +140,21 @@ export default function DrawingCanvas({ enabled, clearToken, onStroke }) {
 
   function drawRemote(data) {
     if (!data) return;
+    const key = data.playerId || "default";
     if (data.type === "start") {
-      remoteLastRef.current = { x: data.x, y: data.y };
+      remoteLastMapRef.current.set(key, { x: data.x, y: data.y });
       return;
     }
     if (data.type === "end") {
-      remoteLastRef.current = null;
+      remoteLastMapRef.current.delete(key);
       return;
     }
     if (data.type === "move") {
-      const last = remoteLastRef.current;
+      const last = remoteLastMapRef.current.get(key);
       if (last) {
         strokeSegment(last, { x: data.x, y: data.y }, data.color, data.width);
       }
-      remoteLastRef.current = { x: data.x, y: data.y };
+      remoteLastMapRef.current.set(key, { x: data.x, y: data.y });
     }
   }
 
@@ -183,4 +220,6 @@ export default function DrawingCanvas({ enabled, clearToken, onStroke }) {
       onPointerLeave={handleEnd}
     />
   );
-}
+});
+
+export default DrawingCanvas;
