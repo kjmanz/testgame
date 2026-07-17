@@ -1,11 +1,16 @@
 import cors from "cors";
 import express from "express";
+import { existsSync } from "fs";
 import { createServer } from "http";
+import path from "path";
+import { fileURLToPath } from "url";
 import { Server } from "socket.io";
 import { randomWord } from "./words.js";
 
 const PORT = process.env.PORT || 3001;
 const MAX_PLAYERS = 10;
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const clientDist = path.join(__dirname, "../client/dist");
 
 const app = express();
 app.use(cors());
@@ -241,6 +246,14 @@ io.on("connection", (socket) => {
     leaveRoom(socket);
   });
 });
+
+if (existsSync(clientDist)) {
+  app.use(express.static(clientDist));
+  app.get(/.*/, (req, res, next) => {
+    if (req.path.startsWith("/socket.io")) return next();
+    res.sendFile(path.join(clientDist, "index.html"));
+  });
+}
 
 httpServer.listen(PORT, "0.0.0.0", () => {
   console.log(`Server listening on http://0.0.0.0:${PORT}`);
