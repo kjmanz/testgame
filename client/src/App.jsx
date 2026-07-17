@@ -397,7 +397,7 @@ export default function App() {
               <>
                 <div className="label">いま描いている人</div>
                 <div className="word">{drawerName}</div>
-                <p className="hint">絵を見て、口頭で当てよう！</p>
+                <p className="hint">絵を見て、当てよう！</p>
               </>
             )}
           </div>
