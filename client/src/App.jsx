@@ -1088,6 +1088,14 @@ export default function App() {
                 onStroke={emitStroke}
                 historySeed={historySeed}
               />
+              {remainSec != null && drawPhase === "drawing" && (
+                <div
+                  className={`canvas-timer${remainSec <= 5 ? " is-urgent" : ""}`}
+                  aria-hidden="true"
+                >
+                  {remainSec}
+                </div>
+              )}
             </div>
           </div>
 

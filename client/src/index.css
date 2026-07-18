@@ -125,6 +125,16 @@ input:focus {
   animation: pop-in 0.45s ease both;
 }
 
+/* プレイ中はタイトルを隠して、キャンバスとボタンを1画面に収めやすくする */
+.app.is-playing {
+  padding-top: 0.6rem;
+  gap: 0.75rem;
+}
+
+.app.is-playing .brand {
+  display: none;
+}
+
 .brand h1 {
   margin: 0;
   font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
@@ -770,6 +780,33 @@ input:focus {
       #f7efd8 2px,
       #f7efd8 4px
     );
+}
+
+/* 描いている間、キャンバスの角に残り秒数を重ねる（線は下を通る） */
+.canvas-timer {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 3;
+  width: 54px;
+  height: 54px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  border: 3px solid var(--ink);
+  background: rgba(255, 248, 232, 0.92);
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: 1.55rem;
+  color: var(--ink);
+  box-shadow: 2px 3px 0 rgba(43, 36, 28, 0.25);
+  pointer-events: none;
+}
+
+.canvas-timer.is-urgent {
+  background: #ff5a2e;
+  border-color: #8b2208;
+  color: #fff;
+  animation: pulse-urgent 0.6s ease-in-out infinite;
 }
 
 .canvas-wrap.mode-liar {
