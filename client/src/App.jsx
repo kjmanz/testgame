@@ -49,6 +49,8 @@ export default function App() {
   const socketRef = useRef(null);
   const wakeLockRef = useRef(null);
   const canvasApiRef = useRef(null);
+  /** サーバー時刻 - 端末時刻（タイマー表示のずれ補正用） */
+  const serverOffsetRef = useRef(0);
   const [screen, setScreen] = useState("home"); // home | lobby | play | gallery
   const [name, setName] = useState(() => loadSession()?.name || "");
   const [joinCode, setJoinCode] = useState("");
@@ -76,6 +78,7 @@ export default function App() {
   const [relayTotal, setRelayTotal] = useState(null);
   const [turnDurationSec, setTurnDurationSec] = useState(null);
   const [gallery, setGallery] = useState([]);
+  const [historySeed, setHistorySeed] = useState({ token: 0, strokes: [] });
   const [gallerySelectMode, setGallerySelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [returnScreen, setReturnScreen] = useState("lobby");
@@ -140,7 +143,9 @@ export default function App() {
       return;
     }
     function tick() {
-      setRemainSec(formatRemain(turnEndsAt - Date.now()));
+      setRemainSec(
+        formatRemain(turnEndsAt - (Date.now() + serverOffsetRef.current))
+      );
     }
     tick();
     const id = setInterval(tick, 200);
@@ -207,6 +212,7 @@ export default function App() {
 
     socket.on("clearCanvas", () => {
       setClearToken((n) => n + 1);
+      setHistorySeed({ token: 0, strokes: [] });
     });
 
     socket.on("gameEnded", () => {
@@ -234,6 +240,25 @@ export default function App() {
     socket.on("galleryUpdate", (data) => {
       setGallery(data.gallery || []);
     });
+
+    socket.on("strokeHistory", (data) => {
+      setHistorySeed((prev) => ({
+        token: prev.token + 1,
+        strokes: data?.strokes || [],
+      }));
+    });
+
+    function syncClock() {
+      const t0 = Date.now();
+      socket.emit("timeSync", (res) => {
+        if (!res?.now) return;
+        const t1 = Date.now();
+        serverOffsetRef.current = res.now - (t0 + t1) / 2;
+      });
+    }
+
+    if (socket.connected) syncClock();
+    socket.on("connect", syncClock);
 
     function tryRejoin() {
       const session = loadSession();
@@ -351,6 +376,7 @@ export default function App() {
       setHostId("");
       setGallery([]);
       setSelectedIds(new Set());
+      setHistorySeed({ token: 0, strokes: [] });
       resetPlayState();
     });
   }
@@ -394,7 +420,18 @@ export default function App() {
   function closeGallery() {
     setGallerySelectMode(false);
     setSelectedIds(new Set());
-    setScreen(returnScreen === "play" ? "play" : "lobby");
+    const next = returnScreen === "play" ? "play" : "lobby";
+    setScreen(next);
+    if (next === "play") {
+      // ギャラリー表示中はキャンバスが外れているので描き直す
+      socketRef.current?.emit("requestStrokeHistory", (res) => {
+        if (!res?.ok) return;
+        setHistorySeed((prev) => ({
+          token: prev.token + 1,
+          strokes: res.strokes || [],
+        }));
+      });
+    }
   }
 
   function toggleSelect(id) {
@@ -792,13 +829,15 @@ export default function App() {
                   えらんだのを消す
                 </button>
               )}
-              <button
-                type="button"
-                className="danger small-btn"
-                onClick={deleteAllGallery}
-              >
-                全部消す
-              </button>
+              {isHost && (
+                <button
+                  type="button"
+                  className="danger small-btn"
+                  onClick={deleteAllGallery}
+                >
+                  全部消す
+                </button>
+              )}
             </div>
           )}
 
@@ -890,6 +929,7 @@ export default function App() {
                 enabled={!!canDraw}
                 clearToken={clearToken}
                 onStroke={emitStroke}
+                historySeed={historySeed}
               />
             </div>
           </div>

@@ -424,6 +424,14 @@ export const WORDS = [
 
 const unique = [...new Set(WORDS)];
 
-export function randomWord() {
-  return unique[Math.floor(Math.random() * unique.length)];
+/**
+ * @param {Set<string>} [exclude] 直近に使ったお題（候補が尽きたら無視する）
+ */
+export function randomWord(exclude) {
+  const pool =
+    exclude && exclude.size > 0
+      ? unique.filter((w) => !exclude.has(w))
+      : unique;
+  const list = pool.length > 0 ? pool : unique;
+  return list[Math.floor(Math.random() * list.length)];
 }

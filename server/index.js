@@ -22,6 +22,8 @@ const EVENT_MIN_GAP = 5;
 const EVENT_FORCE_GAP = 8;
 const EVENT_CHANCE = 0.22;
 const MAX_GALLERY_DATA_URL_LEN = 400_000;
+const MAX_STROKES = 20_000;
+const RECENT_WORDS_MAX = 20;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const clientDist = path.join(__dirname, "../client/dist");
 
@@ -74,6 +76,8 @@ const io = new Server(httpServer, {
  *  roundsSinceSpecial: number,
  *  lastWasSpecial: boolean,
  *  gallery: GalleryItem[],
+ *  strokes: object[],
+ *  recentWords: string[],
  * }} Room
  */
 
@@ -431,6 +435,16 @@ function resetRoundFields(room) {
   room.relayIndex = 0;
   room.turnDurations = [];
   room.seenWordIds = new Set();
+  room.strokes = [];
+}
+
+function pickWord(room) {
+  const word = randomWord(new Set(room.recentWords));
+  room.recentWords.push(word);
+  if (room.recentWords.length > RECENT_WORDS_MAX) {
+    room.recentWords = room.recentWords.slice(-RECENT_WORDS_MAX);
+  }
+  return word;
 }
 
 function startRound(room) {
@@ -441,7 +455,7 @@ function startRound(room) {
   resetRoundFields(room);
   room.phase = "playing";
   room.roundType = roundType;
-  room.word = randomWord();
+  room.word = pickWord(room);
 
   if (roundType === "relay") {
     room.lastWasSpecial = true;
@@ -513,6 +527,7 @@ function syncPlayerState(socket, room, playerId) {
   emitGallery(room, socket.id);
   if (room.phase === "playing" && room.word) {
     io.to(socket.id).emit("roundStart", buildRoundPayload(room, playerId));
+    io.to(socket.id).emit("strokeHistory", { strokes: room.strokes });
   } else {
     emitLobby(room);
   }
@@ -660,6 +675,8 @@ function createEmptyRoom(code, hostId) {
     roundsSinceSpecial: 0,
     lastWasSpecial: false,
     gallery: [],
+    strokes: [],
+    recentWords: [],
   };
 }
 
@@ -808,10 +825,38 @@ io.on("connection", (socket) => {
     if (!ctx) return;
     const { code, room, playerId } = ctx;
     if (!canPlayerDraw(room, playerId)) return;
-    socket.to(code).emit("stroke", {
-      ...data,
-      playerId,
-    });
+
+    const type = data?.type;
+    if (type !== "start" && type !== "move" && type !== "end") return;
+
+    /** @type {Record<string, unknown>} */
+    const event = { type, playerId };
+    if (type !== "end") {
+      const x = Number(data.x);
+      const y = Number(data.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      event.x = x;
+      event.y = y;
+      event.color =
+        typeof data.color === "string" ? data.color.slice(0, 24) : "#1a1a1a";
+      event.width = Math.min(40, Math.max(1, Number(data.width) || 4));
+    }
+
+    room.strokes.push(event);
+    if (room.strokes.length > MAX_STROKES) {
+      room.strokes = room.strokes.slice(-MAX_STROKES);
+    }
+    socket.to(code).emit("stroke", event);
+  });
+
+  socket.on("requestStrokeHistory", (cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return cb?.({ ok: false, strokes: [] });
+    cb?.({ ok: true, strokes: ctx.room.strokes });
+  });
+
+  socket.on("timeSync", (cb) => {
+    cb?.({ now: Date.now() });
   });
 
   socket.on("endDrawing", (cb) => {
@@ -894,7 +939,10 @@ io.on("connection", (socket) => {
   socket.on("clearGallery", (cb) => {
     const ctx = getContext(socket);
     if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
-    const { room } = ctx;
+    const { room, playerId } = ctx;
+    if (room.hostId !== playerId) {
+      return cb?.({ ok: false, error: "ホストだけが全部消せます" });
+    }
     room.gallery = [];
     emitGallery(room);
     cb?.({ ok: true });

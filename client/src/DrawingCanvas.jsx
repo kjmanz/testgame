@@ -1,15 +1,20 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 
+const MAX_HISTORY = 20000;
+
 /**
- * 正規化座標 (0-1) で線を送受信するキャンバス
+ * 正規化座標 (0-1) で線を送受信するキャンバス。
+ * 描画イベントを履歴として保持し、リサイズ時や履歴受信時に再描画する。
  */
 const DrawingCanvas = forwardRef(function DrawingCanvas(
-  { enabled, clearToken, onStroke },
+  { enabled, clearToken, onStroke, historySeed },
   ref
 ) {
   const canvasRef = useRef(null);
   const drawingRef = useRef(false);
   const lastRef = useRef(null);
+  /** @type {React.MutableRefObject<object[]>} 全描画イベント（自分＋他人） */
+  const historyRef = useRef([]);
   /** @type {React.MutableRefObject<Map<string, {x:number,y:number}|null>>} */
   const remoteLastMapRef = useRef(new Map());
 
@@ -59,22 +64,70 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     return { ctx, rect };
   }
 
-  function clearBoard() {
+  function strokeSegment(from, to, color = "#1a1a1a", width = 4) {
+    const canvas = canvasRef.current;
+    if (!canvas || !from || !to) return;
+    const ctx = canvas.getContext("2d");
+    const rect = canvas.getBoundingClientRect();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    ctx.moveTo(from.x * rect.width, from.y * rect.height);
+    ctx.lineTo(to.x * rect.width, to.y * rect.height);
+    ctx.stroke();
+  }
+
+  /** キャンバスを初期化し、履歴を先頭から描き直す */
+  function redrawFromHistory() {
     const ready = setupContext();
     if (!ready) return;
     const { ctx, rect } = ready;
     ctx.fillStyle = "#fbf4e4";
     ctx.fillRect(0, 0, rect.width, rect.height);
+
+    const lastMap = new Map();
+    for (const ev of historyRef.current) {
+      const key = ev.playerId || "local";
+      if (ev.type === "start") {
+        lastMap.set(key, { x: ev.x, y: ev.y });
+      } else if (ev.type === "end") {
+        lastMap.delete(key);
+      } else if (ev.type === "move") {
+        const last = lastMap.get(key);
+        if (last) {
+          strokeSegment(last, { x: ev.x, y: ev.y }, ev.color, ev.width);
+        }
+        lastMap.set(key, { x: ev.x, y: ev.y });
+      }
+    }
+
+    // 描きかけの線が途切れないように現在位置を引き継ぐ
+    remoteLastMapRef.current = new Map(
+      [...lastMap].filter(([key]) => key !== "local")
+    );
+    lastRef.current = lastMap.get("local") || null;
+  }
+
+  function pushHistory(ev) {
+    historyRef.current.push(ev);
+    if (historyRef.current.length > MAX_HISTORY) {
+      historyRef.current = historyRef.current.slice(-MAX_HISTORY);
+    }
+  }
+
+  function clearBoard() {
+    historyRef.current = [];
     drawingRef.current = false;
-    lastRef.current = null;
-    remoteLastMapRef.current.clear();
+    redrawFromHistory();
   }
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    clearBoard();
-    const ro = new ResizeObserver(() => clearBoard());
+    redrawFromHistory();
+    const ro = new ResizeObserver(() => redrawFromHistory());
     ro.observe(canvas.parentElement || canvas);
     return () => ro.disconnect();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -85,9 +138,21 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clearToken]);
 
+  // サーバーからの履歴（途中参加・再接続・ギャラリーから復帰）
+  useEffect(() => {
+    if (!historySeed || !historySeed.token) return;
+    historyRef.current = [...(historySeed.strokes || [])];
+    drawingRef.current = false;
+    redrawFromHistory();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [historySeed]);
+
   useEffect(() => {
     function onRemote(e) {
-      drawRemote(e.detail);
+      const data = e.detail;
+      if (!data) return;
+      pushHistory(data);
+      drawRemote(data);
     }
     window.addEventListener("remote-stroke", onRemote);
     return () => window.removeEventListener("remote-stroke", onRemote);
@@ -123,23 +188,7 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     };
   }
 
-  function strokeSegment(from, to, color = "#1a1a1a", width = 4) {
-    const canvas = canvasRef.current;
-    if (!canvas || !from || !to) return;
-    const ctx = canvas.getContext("2d");
-    const rect = canvas.getBoundingClientRect();
-    ctx.strokeStyle = color;
-    ctx.lineWidth = width;
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-    ctx.beginPath();
-    ctx.moveTo(from.x * rect.width, from.y * rect.height);
-    ctx.lineTo(to.x * rect.width, to.y * rect.height);
-    ctx.stroke();
-  }
-
   function drawRemote(data) {
-    if (!data) return;
     const key = data.playerId || "default";
     if (data.type === "start") {
       remoteLastMapRef.current.set(key, { x: data.x, y: data.y });
@@ -172,13 +221,15 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     const pos = getNormPos(e);
     if (!pos) return;
     lastRef.current = pos;
-    onStroke?.({
+    const ev = {
       type: "start",
       x: pos.x,
       y: pos.y,
       width: 4,
       color: "#1a1a1a",
-    });
+    };
+    pushHistory(ev);
+    onStroke?.(ev);
   }
 
   function handleMove(e) {
@@ -189,13 +240,15 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     const last = lastRef.current;
     if (last) {
       strokeSegment(last, pos);
-      onStroke?.({
+      const ev = {
         type: "move",
         x: pos.x,
         y: pos.y,
         width: 4,
         color: "#1a1a1a",
-      });
+      };
+      pushHistory(ev);
+      onStroke?.(ev);
     }
     lastRef.current = pos;
   }
@@ -204,6 +257,7 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     if (!enabled) return;
     e.preventDefault();
     if (drawingRef.current) {
+      pushHistory({ type: "end" });
       onStroke?.({ type: "end" });
     }
     drawingRef.current = false;
