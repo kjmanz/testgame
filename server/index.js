@@ -11,19 +11,21 @@ import { randomWord } from "./words.js";
 const PORT = process.env.PORT || 3001;
 const MAX_PLAYERS = 20;
 const DISCONNECT_GRACE_MS = 45_000;
+/** 通常ラウンドの描き手が切断したときは短めに見切る（全員が待たされるため） */
+const DRAWER_DISCONNECT_GRACE_MS = 12_000;
 const MAX_CONSECUTIVE_DRAWS = 2;
 const RELAY_MIN_PLAYERS = 3;
 const COOP_MIN_PLAYERS = 3;
 const RELAY_MAX_DRAWERS = 5;
 const COOP_MAX_DRAWERS = 3;
 const COOP_DURATION_MS = 40_000;
-const LIAR_MIN_PLAYERS = 3;
+const LIAR_MIN_PLAYERS = 4;
 const LIAR_MAX_DRAWERS = 3;
 const LIAR_DURATION_MS = 40_000;
 const GALLERY_MAX = 30;
-const EVENT_MIN_GAP = 5;
-const EVENT_FORCE_GAP = 8;
-const EVENT_CHANCE = 0.22;
+const EVENT_MIN_GAP = 3;
+const EVENT_FORCE_GAP = 6;
+const EVENT_CHANCE = 0.3;
 const MAX_GALLERY_DATA_URL_LEN = 400_000;
 const MAX_STROKES = 20_000;
 const RECENT_WORDS_MAX = 20;
@@ -83,6 +85,7 @@ const io = new Server(httpServer, {
  *  gallery: GalleryItem[],
  *  strokes: object[],
  *  recentWords: string[],
+ *  roundSeq: number,
  * }} Room
  */
 
@@ -303,6 +306,7 @@ function buildRoundPayload(room, playerId) {
 
   /** @type {Record<string, unknown>} */
   const payload = {
+    roundId: room.roundSeq,
     roundType: room.roundType,
     drawPhase: room.drawPhase,
     drawerId: room.drawerId,
@@ -487,6 +491,7 @@ function startRound(room) {
 
   const roundType = chooseRoundType(room);
   resetRoundFields(room);
+  room.roundSeq += 1;
   room.phase = "playing";
   room.roundType = roundType;
   room.word = pickWord(room);
@@ -647,6 +652,10 @@ function removePlayer(room, playerId) {
       room.drawerIds = room.drawerIds.filter((id) => id !== playerId);
       if (room.drawerIds.length === 0) {
         if (room.drawerStreak?.id === playerId) room.drawerStreak = null;
+        io.to(room.code).emit("roundAborted", {
+          reason: "drawerLeft",
+          name: player.name,
+        });
         startRound(room);
       } else {
         if (room.drawerId === playerId) {
@@ -665,6 +674,10 @@ function removePlayer(room, playerId) {
         room.drawPhase === "drawing" && room.liarId === playerId;
       if (liarLeftWhileDrawing || room.drawerIds.length === 0) {
         if (room.drawerStreak?.id === playerId) room.drawerStreak = null;
+        io.to(room.code).emit("roundAborted", {
+          reason: liarLeftWhileDrawing ? "liarLeft" : "drawerLeft",
+          name: player.name,
+        });
         startRound(room);
       } else {
         if (room.drawerId === playerId) {
@@ -681,6 +694,10 @@ function removePlayer(room, playerId) {
       if (room.drawerStreak?.id === playerId) {
         room.drawerStreak = null;
       }
+      io.to(room.code).emit("roundAborted", {
+        reason: "drawerLeft",
+        name: player.name,
+      });
       startRound(room);
       return;
     }
@@ -690,7 +707,7 @@ function removePlayer(room, playerId) {
   if (room.phase === "playing") emitRoundSync(room);
 }
 
-function scheduleDisconnect(room, player) {
+function scheduleDisconnect(room, player, graceMs = DISCONNECT_GRACE_MS) {
   if (player.disconnectTimer) {
     clearTimeout(player.disconnectTimer);
   }
@@ -701,7 +718,7 @@ function scheduleDisconnect(room, player) {
     const still = current.players.get(player.id);
     if (!still || still.socketId) return;
     removePlayer(current, player.id);
-  }, DISCONNECT_GRACE_MS);
+  }, graceMs);
 }
 
 function addGalleryItem(room, { imageDataUrl, word, drawerNames, roundType }) {
@@ -750,6 +767,7 @@ function createEmptyRoom(code, hostId) {
     recentWords: [],
     liarId: null,
     liarName: "",
+    roundSeq: 0,
   };
 }
 
@@ -855,6 +873,7 @@ io.on("connection", (socket) => {
     }
 
     if (trimmed) player.name = trimmed;
+    const wasDisconnected = !player.socketId;
     bindSocket(socket, room, player);
 
     cb?.({
@@ -867,6 +886,9 @@ io.on("connection", (socket) => {
     });
 
     syncPlayerState(socket, room, player.id);
+    if (wasDisconnected) {
+      socket.to(roomCode).emit("playerReturned", { name: player.name });
+    }
   });
 
   socket.on("leaveRoom", (cb) => {
@@ -936,6 +958,14 @@ io.on("connection", (socket) => {
     const ctx = getContext(socket);
     if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
     const { code, room, playerId } = ctx;
+    // すでに発表済みなら同時押しでもエラーにしない
+    if (
+      room.phase === "playing" &&
+      room.roundType === "liar" &&
+      room.drawPhase === "reveal"
+    ) {
+      return cb?.({ ok: true });
+    }
     if (!canRevealLiar(room, playerId)) {
       return cb?.({ ok: false, error: "こたえあわせできません" });
     }
@@ -959,6 +989,11 @@ io.on("connection", (socket) => {
     const { room, playerId } = ctx;
     if (room.phase !== "playing") {
       return cb?.({ ok: false, error: "プレイ中ではありません" });
+    }
+    // 同時押し対策: 別のラウンドに対する「つぎへ」は黙って無視する
+    const clientRoundId = data?.roundId;
+    if (clientRoundId != null && clientRoundId !== room.roundSeq) {
+      return cb?.({ ok: true, stale: true });
     }
     if (!canPlayerNextRound(room, playerId)) {
       return cb?.({ ok: false, error: "つぎへ進めません" });
@@ -1037,7 +1072,18 @@ io.on("connection", (socket) => {
     const player = room.players.get(playerId);
     if (!player) return;
     if (player.socketId && player.socketId !== socket.id) return;
-    scheduleDisconnect(room, player);
+
+    // 通常ラウンドの描き手が切れたら、全員に知らせて短めに見切る
+    const isActiveNormalDrawer =
+      room.phase === "playing" &&
+      room.roundType === "normal" &&
+      room.drawerId === playerId;
+    if (isActiveNormalDrawer) {
+      io.to(code).emit("drawerDisconnected", { name: player.name });
+      scheduleDisconnect(room, player, DRAWER_DISCONNECT_GRACE_MS);
+    } else {
+      scheduleDisconnect(room, player);
+    }
 
     // リレー中の今の描き手が切れたらすぐ次へ
     if (

@@ -3,6 +3,8 @@ import { io } from "socket.io-client";
 import DrawingCanvas from "./DrawingCanvas.jsx";
 
 const SESSION_KEY = "oekaki-session";
+/** ブラウザを閉じても3時間は同じ部屋に戻れる */
+const SESSION_TTL_MS = 3 * 60 * 60 * 1000;
 
 function createSocket() {
   const url = import.meta.env.VITE_SOCKET_URL || undefined;
@@ -12,24 +14,40 @@ function createSocket() {
   });
 }
 
-function loadSession() {
+function readSessionRaw() {
   try {
-    const raw = sessionStorage.getItem(SESSION_KEY);
+    const raw = localStorage.getItem(SESSION_KEY);
     if (!raw) return null;
-    const data = JSON.parse(raw);
-    if (!data?.playerId || !data?.roomCode || !data?.name) return null;
-    return data;
+    return JSON.parse(raw);
   } catch {
     return null;
   }
 }
 
+function loadSession() {
+  const data = readSessionRaw();
+  if (!data?.playerId || !data?.roomCode || !data?.name) return null;
+  if (!data.savedAt || Date.now() - data.savedAt > SESSION_TTL_MS) return null;
+  return data;
+}
+
 function saveSession(data) {
-  sessionStorage.setItem(SESSION_KEY, JSON.stringify(data));
+  try {
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({ ...data, savedAt: Date.now() })
+    );
+  } catch {
+    // ストレージが使えない環境では復帰できないだけ
+  }
 }
 
 function clearSession() {
-  sessionStorage.removeItem(SESSION_KEY);
+  try {
+    localStorage.removeItem(SESSION_KEY);
+  } catch {
+    // ignore
+  }
 }
 
 function formatRemain(ms) {
@@ -52,7 +70,8 @@ export default function App() {
   /** サーバー時刻 - 端末時刻（タイマー表示のずれ補正用） */
   const serverOffsetRef = useRef(0);
   const [screen, setScreen] = useState("home"); // home | lobby | play | gallery
-  const [name, setName] = useState(() => loadSession()?.name || "");
+  // 期限切れセッションでも名前だけは引き継いで入力の手間を省く
+  const [name, setName] = useState(() => readSessionRaw()?.name || "");
   const [joinCode, setJoinCode] = useState("");
   const [error, setError] = useState("");
   const [roomCode, setRoomCode] = useState("");
@@ -79,6 +98,8 @@ export default function App() {
   const [isLiar, setIsLiar] = useState(false);
   const [canReveal, setCanReveal] = useState(false);
   const [liarName, setLiarName] = useState("");
+  const [roundId, setRoundId] = useState(null);
+  const [advancing, setAdvancing] = useState(false);
   const [gallery, setGallery] = useState([]);
   const [historySeed, setHistorySeed] = useState({ token: 0, strokes: [] });
   const [gallerySelectMode, setGallerySelectMode] = useState(false);
@@ -110,6 +131,8 @@ export default function App() {
     setIsLiar(!!data.isLiar);
     setCanReveal(!!data.canReveal);
     setLiarName(data.liarName || "");
+    setRoundId(data.roundId ?? null);
+    setAdvancing(false);
   }
 
   function resetPlayState() {
@@ -129,6 +152,8 @@ export default function App() {
     setIsLiar(false);
     setCanReveal(false);
     setLiarName("");
+    setRoundId(null);
+    setAdvancing(false);
   }
 
   useEffect(() => {
@@ -252,6 +277,22 @@ export default function App() {
         roundType: "liar",
         message: `うそつきは ${data.liarName}！`,
       });
+    });
+
+    socket.on("drawerDisconnected", (data) => {
+      if (data?.name) setToast(`${data.name}の接続が切れたよ…ちょっと待ってね`);
+    });
+
+    socket.on("playerReturned", (data) => {
+      if (data?.name) setToast(`${data.name}がもどってきたよ！`);
+    });
+
+    socket.on("roundAborted", (data) => {
+      if (data?.reason === "liarLeft") {
+        setToast(`🕵️ うそつきの${data.name}が逃げた！やりなおし！`);
+      } else if (data?.name) {
+        setToast(`${data.name}がぬけたので、つぎのお題へ！`);
+      }
     });
 
     socket.on("galleryUpdate", (data) => {
@@ -406,9 +447,12 @@ export default function App() {
   }
 
   function nextRound() {
+    if (advancing) return;
     setError("");
+    setAdvancing(true);
     const imageDataUrl = canvasApiRef.current?.exportImage?.() || undefined;
-    socketRef.current?.emit("nextRound", { imageDataUrl }, (res) => {
+    socketRef.current?.emit("nextRound", { imageDataUrl, roundId }, (res) => {
+      setAdvancing(false);
       if (!res?.ok) setError(res?.error || "次へ進めません");
     });
   }
@@ -1054,7 +1098,7 @@ export default function App() {
               </button>
             )}
             {canNextRound && (
-              <button type="button" onClick={nextRound}>
+              <button type="button" onClick={nextRound} disabled={advancing}>
                 つぎのお題へ
               </button>
             )}
