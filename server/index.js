@@ -16,8 +16,9 @@ const DRAWER_DISCONNECT_GRACE_MS = 12_000;
 const MAX_CONSECUTIVE_DRAWS = 2;
 const RELAY_MIN_PLAYERS = 3;
 const COOP_MIN_PLAYERS = 3;
+const COOP_MIN_DRAWERS = 2;
 const RELAY_MAX_DRAWERS = 5;
-const COOP_MAX_DRAWERS = 3;
+const COOP_MAX_DRAWERS = 5;
 const COOP_DURATION_MS = 40_000;
 const LIAR_MIN_PLAYERS = 4;
 const LIAR_MAX_DRAWERS = 3;
@@ -537,7 +538,12 @@ function startRound(room) {
   if (roundType === "coop") {
     room.lastWasSpecial = true;
     room.roundsSinceSpecial = 0;
-    const count = Math.min(COOP_MAX_DRAWERS, players.length);
+    // 回答者を原則2人残し、参加人数に応じた範囲で描き手数も変化させる。
+    const maxCount = Math.min(
+      COOP_MAX_DRAWERS,
+      Math.max(COOP_MIN_DRAWERS, players.length - 2),
+    );
+    const count = randomInt(COOP_MIN_DRAWERS, maxCount);
     const members = shuffle(players.map((p) => p.id)).slice(0, count);
     room.drawerIds = members;
     room.drawerId = members[0] || null;
