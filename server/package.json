@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node --watch index.js",
     "dev:relay": "node --watch dev-relay.js",
+    "dev:coop": "node --watch dev-coop.js",
     "start": "node index.js"
   },
   "dependencies": {
