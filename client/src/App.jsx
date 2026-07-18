@@ -76,6 +76,9 @@ export default function App() {
   const [relayIndex, setRelayIndex] = useState(null);
   const [relayTotal, setRelayTotal] = useState(null);
   const [turnDurationSec, setTurnDurationSec] = useState(null);
+  const [isLiar, setIsLiar] = useState(false);
+  const [canReveal, setCanReveal] = useState(false);
+  const [liarName, setLiarName] = useState("");
   const [gallery, setGallery] = useState([]);
   const [historySeed, setHistorySeed] = useState({ token: 0, strokes: [] });
   const [gallerySelectMode, setGallerySelectMode] = useState(false);
@@ -104,6 +107,9 @@ export default function App() {
     setRelayIndex(data.relayIndex ?? null);
     setRelayTotal(data.relayTotal ?? null);
     setTurnDurationSec(data.turnDurationSec ?? null);
+    setIsLiar(!!data.isLiar);
+    setCanReveal(!!data.canReveal);
+    setLiarName(data.liarName || "");
   }
 
   function resetPlayState() {
@@ -120,6 +126,9 @@ export default function App() {
     setRelayIndex(null);
     setRelayTotal(null);
     setTurnDurationSec(null);
+    setIsLiar(false);
+    setCanReveal(false);
+    setLiarName("");
   }
 
   useEffect(() => {
@@ -232,6 +241,17 @@ export default function App() {
       if (data?.roundType === "coop" && data.names?.length) {
         setToast(`🤝 ${data.names.join("・")}が協力！`);
       }
+      if (data?.roundType === "liar" && data.names?.length) {
+        setToast(`🕵️ ${data.names.join("・")}のだれかがうそつき…！`);
+      }
+    });
+
+    socket.on("liarReveal", (data) => {
+      if (!data?.liarName) return;
+      setFanfare({
+        roundType: "liar",
+        message: `うそつきは ${data.liarName}！`,
+      });
     });
 
     socket.on("galleryUpdate", (data) => {
@@ -397,6 +417,13 @@ export default function App() {
     setError("");
     socketRef.current?.emit("endGame", (res) => {
       if (!res?.ok) setError(res?.error || "終了できません");
+    });
+  }
+
+  function revealLiar() {
+    setError("");
+    socketRef.current?.emit("revealLiar", (res) => {
+      if (!res?.ok) setError(res?.error || "こたえあわせできません");
     });
   }
 
@@ -580,6 +607,97 @@ export default function App() {
                 </div>
               )}
             </div>
+          )}
+        </>
+      );
+    }
+
+    if (roundType === "liar") {
+      return (
+        <>
+          <div className="meta row-meta">
+            <span>部屋 {roomCode}</span>
+            <span className="mode-pill liar-pill">うそつき</span>
+          </div>
+          {drawPhase === "drawing" && (
+            <>
+              {isLiar ? (
+                <div className="info-block info-drawer">
+                  <div className="info-label">🕵️ きみは うそつき！</div>
+                  <div className="drawer-value">お題を知らないのは きみだけ</div>
+                  <p className="hint">バレないように、それっぽく描こう！</p>
+                </div>
+              ) : word ? (
+                <>
+                  <div className="info-block info-prompt">
+                    <div className="info-label">みんなのお題</div>
+                    <div className="prompt-value">{word}</div>
+                  </div>
+                  <p className="hint">ひとりだけ、お題を知らずに描いてるよ…</p>
+                </>
+              ) : (
+                <div className="info-block info-drawer">
+                  <div className="info-label">うそつきお絵かき中</div>
+                  <div className="drawer-value">
+                    {drawerNames.length ? drawerNames.join("・") : "？？？"}
+                  </div>
+                  <p className="hint">
+                    この中のひとりは お題を知らない！絵も当てよう！
+                  </p>
+                </div>
+              )}
+              {remainSec != null && (
+                <div className="timer-bar" aria-live="polite">
+                  <div className="timer-label">のこり {remainSec}びょう</div>
+                  <div className="timer-track">
+                    <div
+                      className="timer-fill liar"
+                      style={{
+                        width: `${Math.min(
+                          100,
+                          (remainSec / Math.max(1, turnDurationSec || 40)) * 100
+                        )}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+          {drawPhase === "guessing" && (
+            <>
+              <div className="info-block info-drawer">
+                <div className="info-label">さあ、もんだいです</div>
+                <div className="drawer-value">
+                  お題を知らずに描いたのは だれでしょう？
+                </div>
+              </div>
+              <div className="info-block info-relay-order">
+                <div className="info-label">ようぎしゃ</div>
+                <div className="relay-order">
+                  {drawerNames.map((n, i) => (
+                    <span key={`${n}-${i}`} className="relay-order-name is-done">
+                      {n}
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <p className="hint">口で話し合って当てよう！</p>
+            </>
+          )}
+          {drawPhase === "reveal" && (
+            <>
+              <div className="info-block info-drawer">
+                <div className="info-label">こたえ</div>
+                <div className="drawer-value">🕵️ うそつきは {liarName}！</div>
+              </div>
+              {word && (
+                <div className="info-block info-prompt">
+                  <div className="info-label">お題は</div>
+                  <div className="prompt-value">{word}</div>
+                </div>
+              )}
+            </>
           )}
         </>
       );
@@ -913,6 +1031,11 @@ export default function App() {
                 協力
               </div>
             )}
+            {roundType === "liar" && (
+              <div className="easel-badge liar-badge" aria-hidden="true">
+                うそつき
+              </div>
+            )}
             <div className={`canvas-wrap ${modeClass}`}>
               <DrawingCanvas
                 ref={canvasApiRef}
@@ -925,6 +1048,11 @@ export default function App() {
           </div>
 
           <div className="actions">
+            {canReveal && (
+              <button type="button" onClick={revealLiar}>
+                こたえあわせ
+              </button>
+            )}
             {canNextRound && (
               <button type="button" onClick={nextRound}>
                 つぎのお題へ

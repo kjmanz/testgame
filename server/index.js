@@ -17,6 +17,9 @@ const COOP_MIN_PLAYERS = 3;
 const RELAY_MAX_DRAWERS = 5;
 const COOP_MAX_DRAWERS = 3;
 const COOP_DURATION_MS = 40_000;
+const LIAR_MIN_PLAYERS = 3;
+const LIAR_MAX_DRAWERS = 3;
+const LIAR_DURATION_MS = 40_000;
 const GALLERY_MAX = 30;
 const EVENT_MIN_GAP = 5;
 const EVENT_FORCE_GAP = 8;
@@ -52,7 +55,7 @@ const io = new Server(httpServer, {
  *  imageDataUrl: string,
  *  word: string,
  *  drawerNames: string[],
- *  roundType: 'normal' | 'relay' | 'coop',
+ *  roundType: 'normal' | 'relay' | 'coop' | 'liar',
  *  createdAt: number,
  * }} GalleryItem
  */
@@ -62,11 +65,13 @@ const io = new Server(httpServer, {
  *  hostId: string,
  *  players: Map<string, Player>,
  *  phase: 'lobby' | 'playing',
- *  roundType: 'normal' | 'relay' | 'coop',
- *  drawPhase: 'drawing' | 'guessing',
+ *  roundType: 'normal' | 'relay' | 'coop' | 'liar',
+ *  drawPhase: 'drawing' | 'guessing' | 'reveal',
  *  drawerId: string | null,
  *  drawerIds: string[],
  *  word: string | null,
+ *  liarId: string | null,
+ *  liarName: string,
  *  drawerStreak: { id: string, count: number } | null,
  *  relayIndex: number,
  *  turnDurations: number[],
@@ -204,10 +209,16 @@ function pickDrawer(room) {
 
 function chooseRoundType(room) {
   const forced = process.env.FORCE_ROUND_TYPE;
-  if (forced === "relay" || forced === "coop" || forced === "normal") {
+  if (
+    forced === "relay" ||
+    forced === "coop" ||
+    forced === "liar" ||
+    forced === "normal"
+  ) {
     const n = room.players.size;
     if (forced === "relay" && n < RELAY_MIN_PLAYERS) return "normal";
     if (forced === "coop" && n < COOP_MIN_PLAYERS) return "normal";
+    if (forced === "liar" && n < LIAR_MIN_PLAYERS) return "normal";
     return forced;
   }
 
@@ -215,6 +226,7 @@ function chooseRoundType(room) {
   const eligible = [];
   if (n >= RELAY_MIN_PLAYERS) eligible.push("relay");
   if (n >= COOP_MIN_PLAYERS) eligible.push("coop");
+  if (n >= LIAR_MIN_PLAYERS) eligible.push("liar");
 
   if (eligible.length === 0 || room.lastWasSpecial) {
     return "normal";
@@ -232,7 +244,7 @@ function chooseRoundType(room) {
 
 function canPlayerDraw(room, playerId) {
   if (room.phase !== "playing" || room.drawPhase !== "drawing") return false;
-  if (room.roundType === "coop") {
+  if (room.roundType === "coop" || room.roundType === "liar") {
     return room.drawerIds.includes(playerId);
   }
   return room.drawerId === playerId;
@@ -245,6 +257,11 @@ function canPlayerSeeWord(room, playerId) {
   }
   if (room.roundType === "coop") {
     return room.drawerIds.includes(playerId);
+  }
+  if (room.roundType === "liar") {
+    // こたえ発表後は全員に公開。それまでは正直な描き手だけ
+    if (room.drawPhase === "reveal") return true;
+    return room.seenWordIds.has(playerId);
   }
   // relay: already drawn or currently drawing
   return room.seenWordIds.has(playerId);
@@ -263,7 +280,17 @@ function canPlayerNextRound(room, playerId) {
     if (room.drawPhase !== "guessing") return false;
     return room.drawerIds.includes(playerId);
   }
+  if (room.roundType === "liar") {
+    if (room.drawPhase !== "reveal") return false;
+    return room.drawerIds.includes(playerId) || room.hostId === playerId;
+  }
   return false;
+}
+
+function canRevealLiar(room, playerId) {
+  if (room.phase !== "playing" || room.roundType !== "liar") return false;
+  if (room.drawPhase !== "guessing") return false;
+  return room.drawerIds.includes(playerId) || room.hostId === playerId;
 }
 
 function buildRoundPayload(room, playerId) {
@@ -293,7 +320,9 @@ function buildRoundPayload(room, playerId) {
         ? room.turnDurations[room.relayIndex] ?? null
         : room.roundType === "coop" && room.drawPhase === "drawing"
           ? Math.round(COOP_DURATION_MS / 1000)
-          : null,
+          : room.roundType === "liar" && room.drawPhase === "drawing"
+            ? Math.round(LIAR_DURATION_MS / 1000)
+            : null,
     relayIndex:
       room.roundType === "relay" ? room.relayIndex : null,
     relayTotal:
@@ -302,6 +331,12 @@ function buildRoundPayload(room, playerId) {
 
   if (room.roundType === "coop") {
     payload.coopNames = drawerNames;
+  }
+
+  if (room.roundType === "liar") {
+    payload.isLiar = room.liarId === playerId;
+    payload.canReveal = canRevealLiar(room, playerId);
+    payload.liarName = room.drawPhase === "reveal" ? room.liarName : null;
   }
 
   return payload;
@@ -318,10 +353,12 @@ function emitRoundStart(room, { clear = false, fanfare = false } = {}) {
         ? "⚡ リレー！"
         : room.roundType === "coop"
           ? "🤝 協力！"
-          : null;
+          : room.roundType === "liar"
+            ? "🕵️ うそつきお絵かき！"
+            : null;
     if (message) {
       const names =
-        room.roundType === "coop"
+        room.roundType === "coop" || room.roundType === "liar"
           ? playerNames(room, room.drawerIds)
           : [];
       io.to(room.code).emit("roundFanfare", {
@@ -405,15 +442,19 @@ function advanceRelay(room) {
   beginRelayTurn(room);
 }
 
-function scheduleCoopTimer(room) {
+/** 協力・うそつき用: 一定時間で自動的にあてっこタイムへ */
+function scheduleTimedDrawing(room, ms) {
   clearTurnTimer(room);
-  room.turnEndsAt = Date.now() + COOP_DURATION_MS;
+  room.turnEndsAt = Date.now() + ms;
   room.turnTimer = setTimeout(() => {
     room.turnTimer = null;
-    if (room.roundType === "coop" && room.drawPhase === "drawing") {
+    if (
+      (room.roundType === "coop" || room.roundType === "liar") &&
+      room.drawPhase === "drawing"
+    ) {
       enterGuessing(room);
     }
-  }, COOP_DURATION_MS);
+  }, ms);
 }
 
 function resetRoundFields(room) {
@@ -427,6 +468,8 @@ function resetRoundFields(room) {
   room.turnDurations = [];
   room.seenWordIds = new Set();
   room.strokes = [];
+  room.liarId = null;
+  room.liarName = "";
 }
 
 function pickWord(room) {
@@ -496,7 +539,26 @@ function startRound(room) {
     room.seenWordIds = new Set(members);
     room.drawerStreak = null;
     room.drawPhase = "drawing";
-    scheduleCoopTimer(room);
+    scheduleTimedDrawing(room, COOP_DURATION_MS);
+    emitRoundStart(room, { clear: true, fanfare: true });
+    return;
+  }
+
+  if (roundType === "liar") {
+    room.lastWasSpecial = true;
+    room.roundsSinceSpecial = 0;
+    const count = Math.min(LIAR_MAX_DRAWERS, players.length);
+    const members = shuffle(players.map((p) => p.id)).slice(0, count);
+    const liarId = members[Math.floor(Math.random() * members.length)];
+    room.drawerIds = members;
+    room.drawerId = members[0] || null;
+    room.liarId = liarId;
+    room.liarName = room.players.get(liarId)?.name || "";
+    // うそつきにはお題を見せない
+    room.seenWordIds = new Set(members.filter((id) => id !== liarId));
+    room.drawerStreak = null;
+    room.drawPhase = "drawing";
+    scheduleTimedDrawing(room, LIAR_DURATION_MS);
     emitRoundStart(room, { clear: true, fanfare: true });
     return;
   }
@@ -596,6 +658,24 @@ function removePlayer(room, playerId) {
       return;
     }
 
+    if (room.roundType === "liar") {
+      room.drawerIds = room.drawerIds.filter((id) => id !== playerId);
+      // 描いている途中でうそつき本人が抜けたらラウンドが成立しないのでやり直し
+      const liarLeftWhileDrawing =
+        room.drawPhase === "drawing" && room.liarId === playerId;
+      if (liarLeftWhileDrawing || room.drawerIds.length === 0) {
+        if (room.drawerStreak?.id === playerId) room.drawerStreak = null;
+        startRound(room);
+      } else {
+        if (room.drawerId === playerId) {
+          room.drawerId = room.drawerIds[0];
+        }
+        emitLobby(room);
+        emitRoundSync(room);
+      }
+      return;
+    }
+
     // normal drawer left
     if (room.drawerId === playerId) {
       if (room.drawerStreak?.id === playerId) {
@@ -668,6 +748,8 @@ function createEmptyRoom(code, hostId) {
     gallery: [],
     strokes: [],
     recentWords: [],
+    liarId: null,
+    liarName: "",
   };
 }
 
@@ -848,6 +930,22 @@ io.on("connection", (socket) => {
 
   socket.on("timeSync", (cb) => {
     cb?.({ now: Date.now() });
+  });
+
+  socket.on("revealLiar", (cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
+    const { code, room, playerId } = ctx;
+    if (!canRevealLiar(room, playerId)) {
+      return cb?.({ ok: false, error: "こたえあわせできません" });
+    }
+    room.drawPhase = "reveal";
+    io.to(code).emit("liarReveal", {
+      liarName: room.liarName,
+      word: room.word,
+    });
+    emitRoundSync(room);
+    cb?.({ ok: true });
   });
 
   socket.on("nextRound", (data, cb) => {
