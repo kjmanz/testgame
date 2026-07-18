@@ -332,38 +332,39 @@ input:focus {
 }
 
 .relay-order {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(var(--relay-total, 1), minmax(0, 1fr));
   align-items: center;
-  gap: 0.2rem 0.15rem;
-  padding: 0.45rem 0.55rem;
+  gap: 0.2rem;
+  min-height: 2.65rem;
+  padding: 0.35rem 0.4rem;
+  overflow: hidden;
   border-radius: 12px;
   background: rgba(255, 122, 69, 0.1);
   border: 2px solid rgba(196, 58, 26, 0.28);
 }
 
 .relay-order-item {
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  gap: 0.15rem;
-}
-
-.relay-order-arrow {
-  margin: 0 0.15rem;
-  font-weight: 900;
-  color: #c43a1a;
-  opacity: 0.7;
+  justify-content: center;
+  min-width: 0;
 }
 
 .relay-order-name {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  display: block;
+  width: 100%;
+  min-width: 0;
   font-family: "M PLUS Rounded 1c", sans-serif;
-  font-size: 1.05rem;
+  font-size: clamp(0.72rem, 3.2vw, 0.95rem);
   font-weight: 800;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: center;
   color: #5c4033;
-  padding: 0.2rem 0.45rem;
+  padding: 0.2rem 0.25rem;
   border-radius: 999px;
 }
 
@@ -375,9 +376,6 @@ input:focus {
 
 .relay-order-name.is-hidden {
   color: #9a8578;
-  min-width: 1.6rem;
-  justify-content: center;
-  text-align: center;
 }
 
 .relay-order-name.is-current {

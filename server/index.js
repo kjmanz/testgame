@@ -16,6 +16,7 @@ const DRAWER_DISCONNECT_GRACE_MS = 12_000;
 const MAX_CONSECUTIVE_DRAWS = 2;
 const RELAY_MIN_PLAYERS = 3;
 const COOP_MIN_PLAYERS = 3;
+const RELAY_MIN_DRAWERS = 2;
 const COOP_MIN_DRAWERS = 2;
 const RELAY_MAX_DRAWERS = 5;
 const COOP_MAX_DRAWERS = 5;
@@ -500,7 +501,12 @@ function startRound(room) {
   if (roundType === "relay") {
     room.lastWasSpecial = true;
     room.roundsSinceSpecial = 0;
-    const count = Math.min(RELAY_MAX_DRAWERS, players.length);
+    // 回答者を原則2人残し、参加人数に応じた範囲で描き手数も変化させる。
+    const maxCount = Math.min(
+      RELAY_MAX_DRAWERS,
+      Math.max(RELAY_MIN_DRAWERS, players.length - 2),
+    );
+    const count = randomInt(RELAY_MIN_DRAWERS, maxCount);
     const order = shuffle(players.map((p) => p.id)).slice(0, count);
     room.drawerIds = order;
     room.turnDurations = order.map(() => randomInt(5, 10));

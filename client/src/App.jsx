@@ -573,24 +573,44 @@ export default function App() {
     if (!drawerNames.length) return null;
     const current = relayIndex ?? 0;
     const drawing = drawPhase === "drawing";
-    // 終わった人だけ名前、いま／これから描く人は ？
+    const total = drawerNames.length;
     return (
       <div className="info-block info-relay-order">
-        <div className="info-label">描く順番</div>
-        <div className="relay-order" aria-label="描く順番">
+        <div className="info-label">
+          {drawing ? `描く順番 ${Math.min(current + 1, total)}/${total}人目` : "描いた人"}
+        </div>
+        <div
+          className="relay-order"
+          style={{ "--relay-total": String(total) }}
+          aria-label="描く順番"
+        >
           {drawerNames.map((n, i) => {
-            // 先頭〜いま描いている人まで名前表示、これから描く人は ？
-            const revealed = !drawing || i <= current;
-            const label = revealed ? n : "？";
-            const className = !revealed
-              ? "relay-order-name is-hidden"
-              : drawing && i === current
+            const isPast = drawing && i < current;
+            const isCurrent = drawing && i === current;
+            const label = isPast ? "✓" : isCurrent || !drawing ? n : "？";
+            const className = isPast
+              ? "relay-order-name is-done"
+              : isCurrent
                 ? "relay-order-name is-current"
-                : "relay-order-name is-done";
+                : drawing
+                  ? "relay-order-name is-hidden"
+                  : "relay-order-name is-done";
+            const statusLabel = isPast
+              ? `${i + 1}人目、${n}、完了`
+              : isCurrent
+                ? `${i + 1}人目、${n}、いま描いています`
+                : drawing
+                  ? `${i + 1}人目、まだ秘密`
+                  : `${i + 1}人目、${n}`;
             return (
               <span key={`${n}-${i}`} className="relay-order-item">
-                {i > 0 && <span className="relay-order-arrow">→</span>}
-                <span className={className}>{label}</span>
+                <span
+                  className={className}
+                  title={label === n ? n : undefined}
+                  aria-label={statusLabel}
+                >
+                  {label}
+                </span>
               </span>
             );
           })}
