@@ -9,7 +9,7 @@ import { Server } from "socket.io";
 import { randomWord } from "./words.js";
 
 const PORT = process.env.PORT || 3001;
-const MAX_PLAYERS = 10;
+const MAX_PLAYERS = 20;
 const DISCONNECT_GRACE_MS = 45_000;
 const MAX_CONSECUTIVE_DRAWS = 2;
 const RELAY_MIN_PLAYERS = 3;
@@ -266,14 +266,6 @@ function canPlayerNextRound(room, playerId) {
   return false;
 }
 
-function canEndDrawing(room, playerId) {
-  if (room.phase !== "playing" || room.drawPhase !== "drawing") return false;
-  if (room.roundType === "coop") {
-    return room.drawerIds.includes(playerId);
-  }
-  return false;
-}
-
 function buildRoundPayload(room, playerId) {
   const players = publicPlayers(room);
   const currentDrawer = room.drawerId
@@ -295,7 +287,6 @@ function buildRoundPayload(room, playerId) {
     canDraw: canPlayerDraw(room, playerId),
     canSeeWord: seesWord,
     canNextRound: canPlayerNextRound(room, playerId),
-    canEndDrawing: canEndDrawing(room, playerId),
     turnEndsAt: room.turnEndsAt,
     turnDurationSec:
       room.roundType === "relay" && room.drawPhase === "drawing"
@@ -725,7 +716,7 @@ io.on("connection", (socket) => {
     const room = rooms.get(roomCode);
     if (!room) return cb?.({ ok: false, error: "部屋が見つかりません" });
     if (room.players.size >= MAX_PLAYERS) {
-      return cb?.({ ok: false, error: "部屋が満員です（最大10人）" });
+      return cb?.({ ok: false, error: `部屋が満員です（最大${MAX_PLAYERS}人）` });
     }
 
     const playerId = randomUUID();
@@ -857,17 +848,6 @@ io.on("connection", (socket) => {
 
   socket.on("timeSync", (cb) => {
     cb?.({ now: Date.now() });
-  });
-
-  socket.on("endDrawing", (cb) => {
-    const ctx = getContext(socket);
-    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
-    const { room, playerId } = ctx;
-    if (!canEndDrawing(room, playerId)) {
-      return cb?.({ ok: false, error: "描き終わりにできません" });
-    }
-    enterGuessing(room);
-    cb?.({ ok: true });
   });
 
   socket.on("nextRound", (data, cb) => {

@@ -71,7 +71,6 @@ export default function App() {
   const [drawPhase, setDrawPhase] = useState("drawing");
   const [canDraw, setCanDraw] = useState(false);
   const [canNextRound, setCanNextRound] = useState(false);
-  const [canEndDrawing, setCanEndDrawing] = useState(false);
   const [turnEndsAt, setTurnEndsAt] = useState(null);
   const [remainSec, setRemainSec] = useState(null);
   const [relayIndex, setRelayIndex] = useState(null);
@@ -101,7 +100,6 @@ export default function App() {
     setPlayers(data.players || []);
     setCanDraw(!!data.canDraw);
     setCanNextRound(!!data.canNextRound);
-    setCanEndDrawing(!!data.canEndDrawing);
     setTurnEndsAt(data.turnEndsAt ?? null);
     setRelayIndex(data.relayIndex ?? null);
     setRelayTotal(data.relayTotal ?? null);
@@ -117,7 +115,6 @@ export default function App() {
     setDrawPhase("drawing");
     setCanDraw(false);
     setCanNextRound(false);
-    setCanEndDrawing(false);
     setTurnEndsAt(null);
     setRemainSec(null);
     setRelayIndex(null);
@@ -393,13 +390,6 @@ export default function App() {
     const imageDataUrl = canvasApiRef.current?.exportImage?.() || undefined;
     socketRef.current?.emit("nextRound", { imageDataUrl }, (res) => {
       if (!res?.ok) setError(res?.error || "次へ進めません");
-    });
-  }
-
-  function endDrawing() {
-    setError("");
-    socketRef.current?.emit("endDrawing", (res) => {
-      if (!res?.ok) setError(res?.error || "描き終わりにできません");
     });
   }
 
@@ -749,7 +739,7 @@ export default function App() {
           <div className="code-big">{roomCode}</div>
           <p className="hint">このコードをみんなに教えて入室してもらおう</p>
 
-          <div className="label">さんかしゃ（{players.length}/10）</div>
+          <div className="label">さんかしゃ（{players.length}/20）</div>
           <ul className="players">
             {players.map((p) => (
               <li key={p.id}>
@@ -935,11 +925,6 @@ export default function App() {
           </div>
 
           <div className="actions">
-            {canEndDrawing && (
-              <button type="button" className="secondary" onClick={endDrawing}>
-                描きおわり
-              </button>
-            )}
             {canNextRound && (
               <button type="button" onClick={nextRound}>
                 つぎのお題へ
