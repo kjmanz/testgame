@@ -28,6 +28,7 @@ const GALLERY_MAX = 30;
 const EVENT_MIN_GAP = 3;
 const EVENT_FORCE_GAP = 6;
 const EVENT_CHANCE = 0.3;
+const EXTENSION_ROUNDS = 3;
 const MAX_GALLERY_DATA_URL_LEN = 400_000;
 const MAX_STROKES = 20_000;
 const RECENT_WORDS_MAX = 20;
@@ -68,7 +69,7 @@ const io = new Server(httpServer, {
  *  code: string,
  *  hostId: string,
  *  players: Map<string, Player>,
- *  phase: 'lobby' | 'playing',
+ *  phase: 'lobby' | 'playing' | 'finished',
  *  roundType: 'normal' | 'relay' | 'coop' | 'liar',
  *  drawPhase: 'drawing' | 'guessing' | 'reveal',
  *  drawerId: string | null,
@@ -88,6 +89,10 @@ const io = new Server(httpServer, {
  *  strokes: object[],
  *  recentWords: string[],
  *  roundSeq: number,
+ *  totalRounds: number,
+ *  completedRounds: number,
+ *  drawCounts: Map<string, number>,
+ *  lastCompletedRoundSeq: number | null,
  * }} Room
  */
 
@@ -122,6 +127,10 @@ function publicPlayers(room) {
   }));
 }
 
+function activePlayers(room) {
+  return [...room.players.values()].filter((player) => player.socketId);
+}
+
 function playerNames(room, ids) {
   return ids
     .map((id) => room.players.get(id)?.name)
@@ -142,6 +151,9 @@ function emitLobby(room) {
     phase: room.phase,
     players: publicPlayers(room),
     hostId: room.hostId,
+    completedRounds: room.completedRounds,
+    totalRounds: room.totalRounds,
+    extensionRounds: EXTENSION_ROUNDS,
   });
 }
 
@@ -192,15 +204,51 @@ function randomInt(min, max) {
   return min + Math.floor(Math.random() * (max - min + 1));
 }
 
+function chooseTotalRounds(playerCount) {
+  if (playerCount <= 4) return randomInt(12, 16);
+  if (playerCount <= 7) return randomInt(16, 20);
+  if (playerCount <= 10) return randomInt(20, 24);
+  return randomInt(24, 30);
+}
+
+function getDrawCount(room, playerId) {
+  return room.drawCounts.get(playerId) || 0;
+}
+
+function recordDrawers(room, ids) {
+  for (const id of new Set(ids)) {
+    room.drawCounts.set(id, getDrawCount(room, id) + 1);
+  }
+}
+
+function pickFairPlayers(room, players, count) {
+  const ranked = shuffle(players).sort(
+    (a, b) => getDrawCount(room, a.id) - getDrawCount(room, b.id),
+  );
+  const selected = ranked.slice(0, Math.min(count, ranked.length));
+  return shuffle(selected);
+}
+
 function pickDrawer(room) {
-  const players = [...room.players.values()];
+  const players = activePlayers(room);
   if (players.length === 0) return null;
 
-  let candidates = players;
+  const fewestDraws = Math.min(
+    ...players.map((player) => getDrawCount(room, player.id)),
+  );
+  let candidates = players.filter(
+    (player) => getDrawCount(room, player.id) === fewestDraws,
+  );
+
+  // 同じ担当回数の人が複数いるときだけ、同じ人の連続担当を避ける。
+  // 担当回数が少ない人（途中参加者を含む）の優先は崩さない。
   const streak = room.drawerStreak;
-  if (streak && streak.count >= MAX_CONSECUTIVE_DRAWS && players.length > 1) {
-    const filtered = players.filter((p) => p.id !== streak.id);
-    if (filtered.length > 0) candidates = filtered;
+  if (
+    streak &&
+    streak.count >= MAX_CONSECUTIVE_DRAWS &&
+    candidates.length > 1
+  ) {
+    candidates = candidates.filter((player) => player.id !== streak.id);
   }
 
   const drawer = candidates[Math.floor(Math.random() * candidates.length)];
@@ -212,7 +260,7 @@ function pickDrawer(room) {
   return drawer;
 }
 
-function chooseRoundType(room) {
+function chooseRoundType(room, playerCount = activePlayers(room).length) {
   const forced = process.env.FORCE_ROUND_TYPE;
   if (
     forced === "relay" ||
@@ -220,14 +268,14 @@ function chooseRoundType(room) {
     forced === "liar" ||
     forced === "normal"
   ) {
-    const n = room.players.size;
+    const n = playerCount;
     if (forced === "relay" && n < RELAY_MIN_PLAYERS) return "normal";
     if (forced === "coop" && n < COOP_MIN_PLAYERS) return "normal";
     if (forced === "liar" && n < LIAR_MIN_PLAYERS) return "normal";
     return forced;
   }
 
-  const n = room.players.size;
+  const n = playerCount;
   const eligible = [];
   if (n >= RELAY_MIN_PLAYERS) eligible.push("relay");
   if (n >= COOP_MIN_PLAYERS) eligible.push("coop");
@@ -309,6 +357,12 @@ function buildRoundPayload(room, playerId) {
   /** @type {Record<string, unknown>} */
   const payload = {
     roundId: room.roundSeq,
+    roundNumber: room.completedRounds + 1,
+    totalRounds: room.totalRounds,
+    remainingRounds: Math.max(
+      0,
+      room.totalRounds - room.completedRounds - 1,
+    ),
     roundType: room.roundType,
     drawPhase: room.drawPhase,
     drawerId: room.drawerId,
@@ -478,6 +532,29 @@ function resetRoundFields(room) {
   room.liarName = "";
 }
 
+function resetGameProgress(room) {
+  room.totalRounds = 0;
+  room.completedRounds = 0;
+  room.drawCounts = new Map();
+  room.lastCompletedRoundSeq = null;
+}
+
+function buildFinishedPayload(room) {
+  return {
+    completedRounds: room.completedRounds,
+    totalRounds: room.totalRounds,
+    extensionRounds: EXTENSION_ROUNDS,
+  };
+}
+
+function finishGame(room) {
+  room.phase = "finished";
+  resetRoundFields(room);
+  io.to(room.code).emit("clearCanvas");
+  emitLobby(room);
+  io.to(room.code).emit("gameFinished", buildFinishedPayload(room));
+}
+
 function pickWord(room) {
   const word = randomWord(new Set(room.recentWords));
   room.recentWords.push(word);
@@ -488,10 +565,10 @@ function pickWord(room) {
 }
 
 function startRound(room) {
-  const players = [...room.players.values()];
+  const players = activePlayers(room);
   if (players.length === 0) return;
 
-  const roundType = chooseRoundType(room);
+  const roundType = chooseRoundType(room, players.length);
   resetRoundFields(room);
   room.roundSeq += 1;
   room.phase = "playing";
@@ -507,7 +584,9 @@ function startRound(room) {
       Math.max(RELAY_MIN_DRAWERS, players.length - 2),
     );
     const count = randomInt(RELAY_MIN_DRAWERS, maxCount);
-    const order = shuffle(players.map((p) => p.id)).slice(0, count);
+    const order = pickFairPlayers(room, players, count).map(
+      (player) => player.id,
+    );
     room.drawerIds = order;
     room.turnDurations = order.map(() => randomInt(5, 10));
     room.relayIndex = 0;
@@ -550,7 +629,9 @@ function startRound(room) {
       Math.max(COOP_MIN_DRAWERS, players.length - 2),
     );
     const count = randomInt(COOP_MIN_DRAWERS, maxCount);
-    const members = shuffle(players.map((p) => p.id)).slice(0, count);
+    const members = pickFairPlayers(room, players, count).map(
+      (player) => player.id,
+    );
     room.drawerIds = members;
     room.drawerId = members[0] || null;
     room.seenWordIds = new Set(members);
@@ -565,7 +646,9 @@ function startRound(room) {
     room.lastWasSpecial = true;
     room.roundsSinceSpecial = 0;
     const count = Math.min(LIAR_MAX_DRAWERS, players.length);
-    const members = shuffle(players.map((p) => p.id)).slice(0, count);
+    const members = pickFairPlayers(room, players, count).map(
+      (player) => player.id,
+    );
     const liarId = members[Math.floor(Math.random() * members.length)];
     room.drawerIds = members;
     room.drawerId = members[0] || null;
@@ -598,6 +681,8 @@ function syncPlayerState(socket, room, playerId) {
   if (room.phase === "playing" && room.word) {
     io.to(socket.id).emit("roundStart", buildRoundPayload(room, playerId));
     io.to(socket.id).emit("strokeHistory", { strokes: room.strokes });
+  } else if (room.phase === "finished") {
+    io.to(socket.id).emit("gameFinished", buildFinishedPayload(room));
   } else {
     emitLobby(room);
   }
@@ -636,6 +721,7 @@ function removePlayer(room, playerId) {
 
   room.players.delete(playerId);
   room.seenWordIds.delete(playerId);
+  room.drawCounts.delete(playerId);
 
   if (room.players.size === 0) {
     clearTurnTimer(room);
@@ -651,10 +737,14 @@ function removePlayer(room, playerId) {
   }
 
   // ひとりだけ残ったらゲームを畳んでロビーへ（部屋コードで再招集できる）
-  if (room.phase === "playing" && room.players.size === 1) {
+  if (
+    (room.phase === "playing" || room.phase === "finished") &&
+    room.players.size === 1
+  ) {
     clearTurnTimer(room);
     room.phase = "lobby";
     resetRoundFields(room);
+    resetGameProgress(room);
     room.drawerStreak = null;
     io.to(room.code).emit("clearCanvas");
     io.to(room.code).emit("gameEnded", { reason: "alone" });
@@ -797,6 +887,10 @@ function createEmptyRoom(code, hostId) {
     liarId: null,
     liarName: "",
     roundSeq: 0,
+    totalRounds: 0,
+    completedRounds: 0,
+    drawCounts: new Map(),
+    lastCompletedRoundSeq: null,
   };
 }
 
@@ -826,6 +920,9 @@ io.on("connection", (socket) => {
         hostId: room.hostId,
         players: publicPlayers(room),
         phase: room.phase,
+        completedRounds: room.completedRounds,
+        totalRounds: room.totalRounds,
+        extensionRounds: EXTENSION_ROUNDS,
       });
       emitLobby(room);
       emitGallery(room, socket.id);
@@ -865,17 +962,18 @@ io.on("connection", (socket) => {
       hostId: room.hostId,
       players: publicPlayers(room),
       phase: room.phase,
+      completedRounds: room.completedRounds,
+      totalRounds: room.totalRounds,
+      extensionRounds: EXTENSION_ROUNDS,
     });
 
     socket.to(roomCode).emit("playerJoined", { name: trimmed });
     emitGallery(room, socket.id);
 
-    if (room.phase === "playing") {
+    if (room.phase !== "lobby") {
       syncPlayerState(socket, room, playerId);
-      emitLobby(room);
-    } else {
-      emitLobby(room);
     }
+    emitLobby(room);
   });
 
   socket.on("rejoinRoom", ({ code, playerId, name }, cb) => {
@@ -912,6 +1010,9 @@ io.on("connection", (socket) => {
       hostId: room.hostId,
       players: publicPlayers(room),
       phase: room.phase,
+      completedRounds: room.completedRounds,
+      totalRounds: room.totalRounds,
+      extensionRounds: EXTENSION_ROUNDS,
     });
 
     syncPlayerState(socket, room, player.id);
@@ -934,14 +1035,22 @@ io.on("connection", (socket) => {
     if (room.hostId !== playerId) {
       return cb?.({ ok: false, error: "ホストだけが開始できます" });
     }
-    if (room.players.size < 2) {
+    if (room.phase !== "lobby") {
+      return cb?.({ ok: false, error: "すでにゲームが始まっています" });
+    }
+    const activeCount = activePlayers(room).length;
+    if (activeCount < 2) {
       return cb?.({ ok: false, error: "2人以上必要です" });
     }
     room.drawerStreak = null;
     room.roundsSinceSpecial = 0;
     room.lastWasSpecial = false;
+    room.totalRounds = chooseTotalRounds(activeCount);
+    room.completedRounds = 0;
+    room.drawCounts = new Map();
+    room.lastCompletedRoundSeq = null;
     startRound(room);
-    cb?.({ ok: true });
+    cb?.({ ok: true, totalRounds: room.totalRounds });
   });
 
   socket.on("stroke", (data) => {
@@ -1016,12 +1125,21 @@ io.on("connection", (socket) => {
     const ctx = getContext(socket);
     if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
     const { room, playerId } = ctx;
+    const clientRoundId = data?.roundId;
+    if (!Number.isInteger(clientRoundId)) {
+      return cb?.({ ok: false, error: "ラウンド情報がありません" });
+    }
+    if (clientRoundId === room.lastCompletedRoundSeq) {
+      return cb?.({ ok: true, stale: true });
+    }
+    if (room.phase === "finished") {
+      return cb?.({ ok: true, finished: true });
+    }
     if (room.phase !== "playing") {
       return cb?.({ ok: false, error: "プレイ中ではありません" });
     }
     // 同時押し対策: 別のラウンドに対する「つぎへ」は黙って無視する
-    const clientRoundId = data?.roundId;
-    if (clientRoundId != null && clientRoundId !== room.roundSeq) {
+    if (clientRoundId !== room.roundSeq) {
       return cb?.({ ok: true, stale: true });
     }
     if (!canPlayerNextRound(room, playerId)) {
@@ -1041,8 +1159,43 @@ io.on("connection", (socket) => {
       });
     }
 
+    recordDrawers(
+      room,
+      room.drawerIds.filter((id) => room.players.has(id)),
+    );
+    room.lastCompletedRoundSeq = room.roundSeq;
+    room.completedRounds += 1;
+    if (room.completedRounds >= room.totalRounds) {
+      finishGame(room);
+      cb?.({ ok: true, finished: true });
+      return;
+    }
+
     startRound(room);
     cb?.({ ok: true });
+  });
+
+  socket.on("extendGame", (cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
+    const { code, room, playerId } = ctx;
+    if (room.hostId !== playerId) {
+      return cb?.({ ok: false, error: "ホストだけが延長できます" });
+    }
+    if (room.phase !== "finished") {
+      return cb?.({ ok: false, error: "いまは延長できません" });
+    }
+    if (activePlayers(room).length < 2) {
+      return cb?.({ ok: false, error: "延長には2人以上必要です" });
+    }
+
+    room.totalRounds += EXTENSION_ROUNDS;
+    io.to(code).emit("gameExtended", {
+      addedRounds: EXTENSION_ROUNDS,
+      totalRounds: room.totalRounds,
+    });
+    startRound(room);
+    cb?.({ ok: true, totalRounds: room.totalRounds });
   });
 
   socket.on("endGame", (cb) => {
@@ -1055,6 +1208,7 @@ io.on("connection", (socket) => {
     clearTurnTimer(room);
     room.phase = "lobby";
     resetRoundFields(room);
+    resetGameProgress(room);
     room.drawerStreak = null;
     io.to(code).emit("clearCanvas");
     io.to(code).emit("gameEnded");

@@ -69,7 +69,7 @@ export default function App() {
   const canvasApiRef = useRef(null);
   /** サーバー時刻 - 端末時刻（タイマー表示のずれ補正用） */
   const serverOffsetRef = useRef(0);
-  const [screen, setScreen] = useState("home"); // home | lobby | play | gallery
+  const [screen, setScreen] = useState("home"); // home | lobby | play | finished | gallery
   // 期限切れセッションでも名前だけは引き継いで入力の手間を省く
   const [name, setName] = useState(() => readSessionRaw()?.name || "");
   const [joinCode, setJoinCode] = useState("");
@@ -99,7 +99,11 @@ export default function App() {
   const [canReveal, setCanReveal] = useState(false);
   const [liarName, setLiarName] = useState("");
   const [roundId, setRoundId] = useState(null);
+  const [roundNumber, setRoundNumber] = useState(0);
+  const [totalRounds, setTotalRounds] = useState(0);
+  const [extensionRounds, setExtensionRounds] = useState(3);
   const [advancing, setAdvancing] = useState(false);
+  const [finishBusy, setFinishBusy] = useState(false);
   const [gallery, setGallery] = useState([]);
   const [historySeed, setHistorySeed] = useState({ token: 0, strokes: [] });
   const [gallerySelectMode, setGallerySelectMode] = useState(false);
@@ -110,6 +114,7 @@ export default function App() {
   const modeClass = `mode-${roundType || "normal"}`;
 
   function applyRoundPayload(data, { forcePlay = true } = {}) {
+    setError("");
     if (forcePlay) {
       setScreen("play");
     } else {
@@ -132,7 +137,10 @@ export default function App() {
     setCanReveal(!!data.canReveal);
     setLiarName(data.liarName || "");
     setRoundId(data.roundId ?? null);
+    setRoundNumber(data.roundNumber ?? 0);
+    setTotalRounds(data.totalRounds ?? 0);
     setAdvancing(false);
+    setFinishBusy(false);
   }
 
   function resetPlayState() {
@@ -154,6 +162,24 @@ export default function App() {
     setLiarName("");
     setRoundId(null);
     setAdvancing(false);
+  }
+
+  function resetGameProgress() {
+    setRoundNumber(0);
+    setTotalRounds(0);
+    setExtensionRounds(3);
+    setFinishBusy(false);
+  }
+
+  function showFinished(data, { resetBusy = true } = {}) {
+    resetPlayState();
+    setError("");
+    setRoundNumber(data?.completedRounds ?? data?.totalRounds ?? 0);
+    setTotalRounds(data?.totalRounds ?? 0);
+    setExtensionRounds(data?.extensionRounds ?? 3);
+    if (resetBusy) setFinishBusy(false);
+    setReturnScreen("finished");
+    setScreen((prev) => (prev === "gallery" ? "gallery" : "finished"));
   }
 
   useEffect(() => {
@@ -228,8 +254,12 @@ export default function App() {
       setPlayers(data.players || []);
       setHostId(data.hostId);
       if (data.phase === "lobby") {
+        setReturnScreen("lobby");
         setScreen((prev) => (prev === "gallery" ? "gallery" : "lobby"));
         resetPlayState();
+        resetGameProgress();
+      } else if (data.phase === "finished") {
+        showFinished(data, { resetBusy: false });
       }
     });
 
@@ -247,12 +277,24 @@ export default function App() {
     });
 
     socket.on("gameEnded", (data) => {
+      setReturnScreen("lobby");
       setScreen((prev) => (prev === "gallery" ? "gallery" : "lobby"));
       resetPlayState();
+      resetGameProgress();
       setClearToken((n) => n + 1);
       if (data?.reason === "alone") {
         setToast("みんな出ちゃったのでロビーにもどったよ");
       }
+    });
+
+    socket.on("gameFinished", (data) => {
+      showFinished(data);
+    });
+
+    socket.on("gameExtended", (data) => {
+      setTotalRounds(data?.totalRounds ?? 0);
+      setFinishBusy(false);
+      setToast(`あと${data?.addedRounds || 3}問、延長！`);
     });
 
     socket.on("stroke", (data) => {
@@ -361,7 +403,11 @@ export default function App() {
             roomCode: res.code,
             name: session.name,
           });
-          if (res.phase === "lobby") setScreen("lobby");
+          if (res.phase === "lobby") {
+            setScreen("lobby");
+          } else if (res.phase === "finished") {
+            showFinished(res);
+          }
           // playing は roundStart で play へ
         }
       );
@@ -400,6 +446,7 @@ export default function App() {
         roomCode: res.code,
         name: trimmed,
       });
+      resetGameProgress();
       setScreen("lobby");
     });
   }
@@ -427,6 +474,8 @@ export default function App() {
         });
         if (res.phase === "playing") {
           setScreen("play");
+        } else if (res.phase === "finished") {
+          showFinished(res);
         } else {
           setScreen("lobby");
         }
@@ -447,6 +496,7 @@ export default function App() {
       setSelectedIds(new Set());
       setHistorySeed({ token: 0, strokes: [] });
       resetPlayState();
+      resetGameProgress();
     });
   }
 
@@ -470,8 +520,24 @@ export default function App() {
 
   function endGame() {
     setError("");
+    if (screen === "finished") setFinishBusy(true);
     socketRef.current?.emit("endGame", (res) => {
-      if (!res?.ok) setError(res?.error || "終了できません");
+      if (!res?.ok) {
+        setFinishBusy(false);
+        setError(res?.error || "終了できません");
+      }
+    });
+  }
+
+  function extendGame() {
+    if (finishBusy) return;
+    setError("");
+    setFinishBusy(true);
+    socketRef.current?.emit("extendGame", (res) => {
+      if (!res?.ok) {
+        setFinishBusy(false);
+        setError(res?.error || "延長できません");
+      }
     });
   }
 
@@ -497,7 +563,12 @@ export default function App() {
   function closeGallery() {
     setGallerySelectMode(false);
     setSelectedIds(new Set());
-    const next = returnScreen === "play" ? "play" : "lobby";
+    const next =
+      returnScreen === "play"
+        ? "play"
+        : returnScreen === "finished"
+          ? "finished"
+          : "lobby";
     setScreen(next);
     if (next === "play") {
       // ギャラリー表示中はキャンバスが外れているので描き直す
@@ -619,12 +690,26 @@ export default function App() {
     );
   }
 
+  function renderRoundProgress() {
+    if (!roundNumber || !totalRounds) return null;
+    const isLast = roundNumber >= totalRounds;
+    return (
+      <span
+        className={`round-progress${isLast ? " is-last" : ""}`}
+        aria-label={`お題 ${roundNumber}問目、全${totalRounds}問`}
+      >
+        お題 {roundNumber}/{totalRounds}
+      </span>
+    );
+  }
+
   function renderPlayHeader() {
     if (roundType === "relay") {
       return (
         <>
           <div className="meta row-meta">
             <span>部屋 {roomCode}</span>
+            {renderRoundProgress()}
             <span className="mode-pill relay-pill">リレー</span>
           </div>
           {drawPhase === "drawing" ? (
@@ -697,6 +782,7 @@ export default function App() {
         <>
           <div className="meta row-meta">
             <span>部屋 {roomCode}</span>
+            {renderRoundProgress()}
             <span className="mode-pill liar-pill">うそつき</span>
           </div>
           {drawPhase === "drawing" && (
@@ -754,7 +840,10 @@ export default function App() {
               </div>
               <div className="info-block info-relay-order">
                 <div className="info-label">ようぎしゃ</div>
-                <div className="relay-order">
+                <div
+                  className="relay-order"
+                  style={{ "--relay-total": String(drawerNames.length || 1) }}
+                >
                   {drawerNames.map((n, i) => (
                     <span key={`${n}-${i}`} className="relay-order-name is-done">
                       {n}
@@ -788,6 +877,7 @@ export default function App() {
         <>
           <div className="meta row-meta">
             <span>部屋 {roomCode}</span>
+            {renderRoundProgress()}
             <span className="mode-pill coop-pill">協力</span>
           </div>
           {word ? (
@@ -838,7 +928,10 @@ export default function App() {
     // normal
     return (
       <>
-        <div className="meta">部屋 {roomCode}</div>
+        <div className="meta row-meta">
+          <span>部屋 {roomCode}</span>
+          {renderRoundProgress()}
+        </div>
         {word ? (
           <div className="info-block info-prompt">
             <div className="info-label">あなたのお題</div>
@@ -969,6 +1062,58 @@ export default function App() {
               ギャラリー（{gallery.length}）
             </button>
             <button type="button" className="secondary" onClick={leaveRoom}>
+              部屋をでる
+            </button>
+          </div>
+
+          {error && <p className="error">{error}</p>}
+        </div>
+      )}
+
+      {!restoring && screen === "finished" && (
+        <div className="card tape-yellow finish-card">
+          <div className="finish-icon" aria-hidden="true">
+            🎉
+          </div>
+          <div className="finish-title">全{totalRounds}問 おしまい！</div>
+          <p className="finish-summary">
+            みんなで{totalRounds}このお題を描きました
+          </p>
+
+          <div className="actions">
+            {isHost ? (
+              <>
+                <button type="button" onClick={extendGame} disabled={finishBusy}>
+                  あと{extensionRounds}問だけ延長！
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={endGame}
+                  disabled={finishBusy}
+                >
+                  ロビーへ戻る
+                </button>
+              </>
+            ) : (
+              <p className="finish-wait" role="status" aria-live="polite">
+                ホストが決めています…
+              </p>
+            )}
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => openGallery("finished")}
+              disabled={finishBusy}
+            >
+              ギャラリーを見る（{gallery.length}）
+            </button>
+            <button
+              type="button"
+              className="ghost-btn"
+              onClick={leaveRoomWithConfirm}
+              disabled={finishBusy}
+            >
               部屋をでる
             </button>
           </div>
@@ -1143,7 +1288,7 @@ export default function App() {
             )}
             {canNextRound && (
               <button type="button" onClick={nextRound} disabled={advancing}>
-                つぎのお題へ
+                {roundNumber >= totalRounds ? "けっかを見る" : "つぎのお題へ"}
               </button>
             )}
             <button
