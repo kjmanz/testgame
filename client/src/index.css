@@ -810,6 +810,10 @@ input:focus {
   outline-offset: 1px;
 }
 
+.gallery-image-wrap {
+  position: relative;
+}
+
 .gallery-item img {
   display: block;
   width: 100%;
@@ -820,33 +824,44 @@ input:focus {
 
 .gallery-meta {
   display: flex;
-  justify-content: space-between;
+  align-items: center;
   gap: 0.25rem;
-  padding: 0.35rem 0.45rem 0;
+  padding: 0.35rem 0.45rem 0.1rem;
   font-weight: 800;
   font-size: 0.78rem;
 }
 
 .gallery-word {
   color: var(--paint-coral);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.gallery-type {
-  color: var(--muted);
-  font-size: 0.7rem;
+.gallery-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.35rem;
+  padding: 0.15rem 0.45rem 0.45rem;
 }
 
 .gallery-drawers {
-  padding: 0.15rem 0.45rem 0.45rem;
+  flex: 1;
+  min-width: 0;
+  padding: 0;
   font-size: 0.68rem;
   color: var(--muted);
   font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .gallery-save {
-  position: absolute;
-  right: 6px;
-  bottom: 6px;
+  position: static;
+  flex-shrink: 0;
   padding: 0.28rem 0.55rem;
   font-size: 0.72rem;
   box-shadow: 1px 2px 0 var(--ink);

@@ -37,12 +37,6 @@ function formatRemain(ms) {
   return sec;
 }
 
-function roundTypeLabel(type) {
-  if (type === "relay") return "リレー";
-  if (type === "coop") return "協力";
-  return "通常";
-}
-
 /** 全角数字なども半角4桁に正規化 */
 function normalizeRoomCode(code) {
   return String(code || "")
@@ -440,13 +434,16 @@ export default function App() {
   }
 
   async function saveImage(item) {
-    const filename = `oekaki-${item.word || "picture"}-${item.id.slice(0, 8)}.jpg`;
+    const word = String(item.word || "").trim();
+    const safeWord = (word || "picture").replace(/[\\/:*?"<>|]/g, "_");
+    const title = word ? `おえかき「${word}」` : "おえかき";
+    const filename = `${safeWord}-${item.id.slice(0, 8)}.jpg`;
     try {
       const res = await fetch(item.imageDataUrl);
       const blob = await res.blob();
       if (navigator.share && navigator.canShare?.({ files: [new File([blob], filename, { type: blob.type })] })) {
         const file = new File([blob], filename, { type: blob.type || "image/jpeg" });
-        await navigator.share({ files: [file], title: item.word || "おえかき" });
+        await navigator.share({ files: [file], title, text: title });
         return;
       }
     } catch {
@@ -838,28 +835,29 @@ export default function App() {
                       {selectedIds.has(item.id) ? "✓" : ""}
                     </span>
                   )}
-                  <img src={item.imageDataUrl} alt={item.word || "絵"} />
+                  <div className="gallery-image-wrap">
+                    <img src={item.imageDataUrl} alt={item.word || "絵"} />
+                  </div>
                   <div className="gallery-meta">
                     <span className="gallery-word">{item.word}</span>
-                    <span className="gallery-type">
-                      {roundTypeLabel(item.roundType)}
-                    </span>
                   </div>
-                  <div className="gallery-drawers">
-                    {(item.drawerNames || []).join("・")}
+                  <div className="gallery-foot">
+                    <div className="gallery-drawers">
+                      {(item.drawerNames || []).join("・")}
+                    </div>
+                    {!gallerySelectMode && (
+                      <button
+                        type="button"
+                        className="gallery-save"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          saveImage(item);
+                        }}
+                      >
+                        保存
+                      </button>
+                    )}
                   </div>
-                  {!gallerySelectMode && (
-                    <button
-                      type="button"
-                      className="gallery-save"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        saveImage(item);
-                      }}
-                    >
-                      保存
-                    </button>
-                  )}
                 </div>
               ))}
           </div>
