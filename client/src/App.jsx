@@ -43,6 +43,14 @@ function roundTypeLabel(type) {
   return "通常";
 }
 
+/** 全角数字なども半角4桁に正規化 */
+function normalizeRoomCode(code) {
+  return String(code || "")
+    .normalize("NFKC")
+    .replace(/\D/g, "")
+    .slice(0, 4);
+}
+
 export default function App() {
   const socketRef = useRef(null);
   const wakeLockRef = useRef(null);
@@ -311,9 +319,10 @@ export default function App() {
   function joinRoom() {
     setError("");
     const trimmed = name.trim();
+    const code = normalizeRoomCode(joinCode);
     socketRef.current?.emit(
       "joinRoom",
-      { code: joinCode, name: trimmed },
+      { code, name: trimmed },
       (res) => {
         if (!res?.ok) {
           setError(res?.error || "入室に失敗しました");
@@ -449,48 +458,82 @@ export default function App() {
     a.click();
   }
 
+  function renderRelayOrder() {
+    if (!drawerNames.length) return null;
+    const current = relayIndex ?? 0;
+    const drawing = drawPhase === "drawing";
+    // 終わった人だけ名前、いま／これから描く人は ？
+    return (
+      <div className="info-block info-relay-order">
+        <div className="info-label">描く順番</div>
+        <div className="relay-order" aria-label="描く順番">
+          {drawerNames.map((n, i) => {
+            // 先頭〜いま描いている人まで名前表示、これから描く人は ？
+            const revealed = !drawing || i <= current;
+            const label = revealed ? n : "？";
+            const className = !revealed
+              ? "relay-order-name is-hidden"
+              : drawing && i === current
+                ? "relay-order-name is-current"
+                : "relay-order-name is-done";
+            return (
+              <span key={`${n}-${i}`} className="relay-order-item">
+                {i > 0 && <span className="relay-order-arrow">→</span>}
+                <span className={className}>{label}</span>
+              </span>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
   function renderPlayHeader() {
     if (roundType === "relay") {
       return (
         <>
           <div className="meta row-meta">
             <span>部屋 {roomCode}</span>
-            <span className="mode-pill relay-pill">RELAY</span>
+            <span className="mode-pill relay-pill">リレー</span>
           </div>
           {drawPhase === "drawing" ? (
             canDraw ? (
-              <>
-                <div className="label">あなたの番！ オダイ</div>
-                <div className="word">{word}</div>
-              </>
-            ) : word ? (
-              <>
-                <div className="label">お題（リレー中）</div>
-                <div className="word">{word}</div>
-                <p className="hint">次の人が継ぎ足してるよ…</p>
-              </>
+              <div className="info-block info-prompt">
+                <div className="info-label">あなたの番！ お題</div>
+                <div className="prompt-value">{word}</div>
+              </div>
             ) : (
               <>
-                <div className="label">いま描いている人</div>
-                <div className="word">{drawerName || "？？？"}</div>
-                <p className="hint">次は誰？ 絵を見て当てよう！</p>
+                {word && (
+                  <div className="info-block info-prompt">
+                    <div className="info-label">お題</div>
+                    <div className="prompt-value">{word}</div>
+                  </div>
+                )}
+                {renderRelayOrder()}
+                <p className="hint">
+                  {word
+                    ? "つぎの人が継ぎ足してるよ…"
+                    : "絵を見て当てよう！"}
+                </p>
               </>
             )
           ) : (
             <>
               {word ? (
-                <>
-                  <div className="label">お題</div>
-                  <div className="word">{word}</div>
+                <div className="info-block info-prompt">
+                  <div className="info-label">お題</div>
+                  <div className="prompt-value">{word}</div>
                   <p className="hint">みんなで当てよう！</p>
-                </>
+                </div>
               ) : (
-                <>
-                  <div className="label">あてっこタイム</div>
-                  <div className="word">なにだろう？</div>
+                <div className="info-block info-drawer">
+                  <div className="info-label">あてっこタイム</div>
+                  <div className="drawer-value">なにだろう？</div>
                   <p className="hint">絵を見て、当てよう！</p>
-                </>
+                </div>
               )}
+              {!canDraw && renderRelayOrder()}
             </>
           )}
           {remainSec != null && drawPhase === "drawing" && (
@@ -527,22 +570,25 @@ export default function App() {
           </div>
           {word ? (
             <>
-              <div className="label">みんなのオダイ</div>
-              <div className="word">{word}</div>
-              <p className="hint">
-                {drawerNames.length
-                  ? `${drawerNames.join("・")}が協力！`
-                  : "いっしょに描こう"}
-              </p>
+              <div className="info-block info-prompt">
+                <div className="info-label">みんなのお題</div>
+                <div className="prompt-value">{word}</div>
+              </div>
+              <div className="info-block info-drawer">
+                <div className="info-label">描いている人</div>
+                <div className="drawer-value">
+                  {drawerNames.length ? drawerNames.join("・") : "？？？"}
+                </div>
+              </div>
             </>
           ) : (
-            <>
-              <div className="label">いま協力中</div>
-              <div className="word">
+            <div className="info-block info-drawer">
+              <div className="info-label">いま協力中</div>
+              <div className="drawer-value">
                 {drawerNames.length ? drawerNames.join("・") : "？？？"}
               </div>
               <p className="hint">絵を見て、当てよう！</p>
-            </>
+            </div>
           )}
           {remainSec != null && drawPhase === "drawing" && (
             <div className="timer-bar" aria-live="polite">
@@ -572,16 +618,16 @@ export default function App() {
       <>
         <div className="meta">部屋 {roomCode}</div>
         {word ? (
-          <>
-            <div className="label">あなたのオダイ</div>
-            <div className="word">{word}</div>
-          </>
+          <div className="info-block info-prompt">
+            <div className="info-label">あなたのお題</div>
+            <div className="prompt-value">{word}</div>
+          </div>
         ) : (
-          <>
-            <div className="label">いま描いている人</div>
-            <div className="word">{drawerName}</div>
+          <div className="info-block info-drawer">
+            <div className="info-label">いま描いている人</div>
+            <div className="drawer-value">{drawerName}</div>
             <p className="hint">絵を見て、当てよう！</p>
-          </>
+          </div>
         )}
       </>
     );
@@ -642,9 +688,7 @@ export default function App() {
             <div className="label">部屋コード（4桁）</div>
             <input
               value={joinCode}
-              onChange={(e) =>
-                setJoinCode(e.target.value.replace(/\D/g, "").slice(0, 4))
-              }
+              onChange={(e) => setJoinCode(normalizeRoomCode(e.target.value))}
               placeholder="1234"
               inputMode="numeric"
               maxLength={4}
@@ -834,7 +878,7 @@ export default function App() {
             <div className="easel-clip" aria-hidden="true" />
             {roundType === "relay" && (
               <div className="easel-badge relay-badge" aria-hidden="true">
-                RELAY
+                リレー
               </div>
             )}
             {roundType === "coop" && (

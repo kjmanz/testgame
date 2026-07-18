@@ -268,6 +268,114 @@ input:focus {
   line-height: 1.25;
 }
 
+.info-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.info-block + .info-block {
+  margin-top: 0.45rem;
+}
+
+.info-label {
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+}
+
+.info-prompt .info-label {
+  color: #c43a1a;
+}
+
+.info-drawer .info-label {
+  color: #1a6f66;
+}
+
+.prompt-value {
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: 1.75rem;
+  line-height: 1.25;
+  color: #b71c1c;
+  padding: 0.35rem 0.55rem;
+  border-radius: 10px;
+  background: linear-gradient(transparent 62%, rgba(255, 201, 60, 0.7) 62%);
+  border: 2px dashed rgba(196, 58, 26, 0.35);
+}
+
+.drawer-value {
+  display: inline-flex;
+  align-self: flex-start;
+  font-family: "M PLUS Rounded 1c", sans-serif;
+  font-size: 1.25rem;
+  font-weight: 800;
+  line-height: 1.3;
+  color: #0f5c54;
+  padding: 0.4rem 0.85rem;
+  border-radius: 999px;
+  background: rgba(44, 177, 161, 0.18);
+  border: 2px solid #1a8f7f;
+}
+
+.info-relay-order .info-label {
+  color: #9a3412;
+}
+
+.relay-order {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.2rem 0.15rem;
+  padding: 0.45rem 0.55rem;
+  border-radius: 12px;
+  background: rgba(255, 122, 69, 0.1);
+  border: 2px solid rgba(196, 58, 26, 0.28);
+}
+
+.relay-order-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.15rem;
+}
+
+.relay-order-arrow {
+  margin: 0 0.15rem;
+  font-weight: 900;
+  color: #c43a1a;
+  opacity: 0.7;
+}
+
+.relay-order-name {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: "M PLUS Rounded 1c", sans-serif;
+  font-size: 1.05rem;
+  font-weight: 800;
+  color: #5c4033;
+  padding: 0.2rem 0.45rem;
+  border-radius: 999px;
+}
+
+.relay-order-name.is-done {
+  color: #5c4033;
+  background: rgba(255, 255, 255, 0.65);
+  border: 2px solid rgba(196, 58, 26, 0.28);
+}
+
+.relay-order-name.is-hidden {
+  color: #9a8578;
+  min-width: 1.6rem;
+  justify-content: center;
+  text-align: center;
+}
+
+.relay-order-name.is-current {
+  color: #fff;
+  background: #ff7a45;
+  border: 2px solid #c43a1a;
+}
+
 .easel {
   position: relative;
   padding: 0.85rem 0.85rem 1.05rem;
@@ -429,6 +537,7 @@ input:focus {
 .relay-pill {
   background: #ff7a45;
   color: #fff;
+  letter-spacing: 0.04em;
   animation: pulse-urgent 1s ease-in-out infinite;
 }
 
@@ -473,12 +582,25 @@ input:focus {
   background: rgba(44, 177, 161, 0.8);
 }
 
-.play-header.mode-relay .word {
-  color: #d84315;
+.play-header.mode-relay .prompt-value {
+  color: #b71c1c;
+  border-color: rgba(216, 67, 21, 0.4);
 }
 
-.play-header.mode-coop .word {
-  color: #1a8f7f;
+.play-header.mode-coop .prompt-value {
+  color: #14665c;
+  border-color: rgba(26, 143, 127, 0.4);
+  background: linear-gradient(transparent 62%, rgba(44, 177, 161, 0.28) 62%);
+}
+
+.play-header.mode-coop .drawer-value {
+  background: rgba(255, 126, 182, 0.16);
+  border-color: #d45a8a;
+  color: #9c2d5c;
+}
+
+.play-header.mode-coop .info-drawer .info-label {
+  color: #9c2d5c;
 }
 
 .timer-bar {
@@ -540,9 +662,9 @@ input:focus {
   top: 8px;
   right: 10px;
   z-index: 3;
-  font-size: 0.68rem;
+  font-size: 0.72rem;
   font-weight: 900;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.04em;
   padding: 0.18rem 0.45rem;
   border-radius: 6px;
   border: 2px solid var(--ink);

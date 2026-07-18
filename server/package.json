@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "node --watch index.js",
+    "dev:relay": "node --watch dev-relay.js",
     "start": "node index.js"
   },
   "dependencies": {

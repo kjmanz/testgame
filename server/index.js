@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 3001;
 const MAX_PLAYERS = 10;
 const DISCONNECT_GRACE_MS = 45_000;
 const MAX_CONSECUTIVE_DRAWS = 2;
-const RELAY_MIN_PLAYERS = 4;
+const RELAY_MIN_PLAYERS = 3;
 const COOP_MIN_PLAYERS = 3;
 const RELAY_MAX_DRAWERS = 5;
 const COOP_MAX_DRAWERS = 3;
@@ -90,6 +90,14 @@ function generateCode() {
     if (!rooms.has(code)) return code;
   }
   throw new Error("部屋コードを発行できませんでした");
+}
+
+/** 全角数字なども半角4桁に正規化 */
+function normalizeRoomCode(code) {
+  return String(code || "")
+    .normalize("NFKC")
+    .replace(/\D/g, "")
+    .slice(0, 4);
 }
 
 function publicPlayers(room) {
@@ -191,6 +199,14 @@ function pickDrawer(room) {
 }
 
 function chooseRoundType(room) {
+  const forced = process.env.FORCE_ROUND_TYPE;
+  if (forced === "relay" || forced === "coop" || forced === "normal") {
+    const n = room.players.size;
+    if (forced === "relay" && n < RELAY_MIN_PLAYERS) return "normal";
+    if (forced === "coop" && n < COOP_MIN_PLAYERS) return "normal";
+    return forced;
+  }
+
   const n = room.players.size;
   const eligible = [];
   if (n >= RELAY_MIN_PLAYERS) eligible.push("relay");
@@ -353,7 +369,7 @@ function enterGuessing(room) {
 function scheduleRelayTurn(room) {
   clearTurnTimer(room);
   const durationSec =
-    room.turnDurations[room.relayIndex] ?? randomInt(3, 10);
+    room.turnDurations[room.relayIndex] ?? randomInt(5, 10);
   const ms = durationSec * 1000;
   room.turnEndsAt = Date.now() + ms;
   room.turnTimer = setTimeout(() => {
@@ -433,7 +449,7 @@ function startRound(room) {
     const count = Math.min(RELAY_MAX_DRAWERS, players.length);
     const order = shuffle(players.map((p) => p.id)).slice(0, count);
     room.drawerIds = order;
-    room.turnDurations = order.map(() => randomInt(3, 10));
+    room.turnDurations = order.map(() => randomInt(5, 10));
     room.relayIndex = 0;
     room.drawerStreak = null;
     room.drawPhase = "drawing";
@@ -683,7 +699,7 @@ io.on("connection", (socket) => {
 
   socket.on("joinRoom", ({ code, name }, cb) => {
     const trimmed = String(name || "").trim().slice(0, 12);
-    const roomCode = String(code || "").trim();
+    const roomCode = normalizeRoomCode(code);
     if (!trimmed) return cb?.({ ok: false, error: "名前を入力してください" });
     if (!/^\d{4}$/.test(roomCode)) {
       return cb?.({ ok: false, error: "部屋コードは4桁です" });
@@ -726,7 +742,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("rejoinRoom", ({ code, playerId, name }, cb) => {
-    const roomCode = String(code || "").trim();
+    const roomCode = normalizeRoomCode(code);
     const id = String(playerId || "").trim();
     const trimmed = String(name || "").trim().slice(0, 12);
 
