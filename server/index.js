@@ -635,7 +635,24 @@ function removePlayer(room, playerId) {
     const nextHost = [...room.players.values()][0];
     room.hostId = nextHost.id;
     nextHost.isHost = true;
+    io.to(room.code).emit("hostChanged", { name: nextHost.name });
   }
+
+  // ひとりだけ残ったらゲームを畳んでロビーへ（部屋コードで再招集できる）
+  if (room.phase === "playing" && room.players.size === 1) {
+    clearTurnTimer(room);
+    room.phase = "lobby";
+    resetRoundFields(room);
+    room.drawerStreak = null;
+    io.to(room.code).emit("clearCanvas");
+    io.to(room.code).emit("gameEnded", { reason: "alone" });
+    emitLobby(room);
+    return;
+  }
+
+  // ホスト交代や人数変化を全経路で確実に配る
+  // （描き手退出→ラウンドやり直しの経路は下でemitLobbyを通らないため）
+  emitLobby(room);
 
   if (room.phase === "playing" && wasInRound) {
     if (room.roundType === "relay" && room.drawPhase === "drawing") {
@@ -1082,6 +1099,9 @@ io.on("connection", (socket) => {
       io.to(code).emit("drawerDisconnected", { name: player.name });
       scheduleDisconnect(room, player, DRAWER_DISCONNECT_GRACE_MS);
     } else {
+      if (room.hostId === playerId && room.players.size > 1) {
+        io.to(code).emit("hostDisconnected", { name: player.name });
+      }
       scheduleDisconnect(room, player);
     }
 

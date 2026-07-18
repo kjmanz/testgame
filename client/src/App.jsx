@@ -246,10 +246,13 @@ export default function App() {
       setHistorySeed({ token: 0, strokes: [] });
     });
 
-    socket.on("gameEnded", () => {
+    socket.on("gameEnded", (data) => {
       setScreen((prev) => (prev === "gallery" ? "gallery" : "lobby"));
       resetPlayState();
       setClearToken((n) => n + 1);
+      if (data?.reason === "alone") {
+        setToast("みんな出ちゃったのでロビーにもどったよ");
+      }
     });
 
     socket.on("stroke", (data) => {
@@ -285,6 +288,14 @@ export default function App() {
 
     socket.on("playerReturned", (data) => {
       if (data?.name) setToast(`${data.name}がもどってきたよ！`);
+    });
+
+    socket.on("hostDisconnected", (data) => {
+      if (data?.name) setToast(`ホストの${data.name}の接続が切れたよ…`);
+    });
+
+    socket.on("hostChanged", (data) => {
+      if (data?.name) setToast(`👑 ${data.name}があたらしいホストになったよ！`);
     });
 
     socket.on("roundAborted", (data) => {
@@ -469,6 +480,11 @@ export default function App() {
     socketRef.current?.emit("revealLiar", (res) => {
       if (!res?.ok) setError(res?.error || "こたえあわせできません");
     });
+  }
+
+  function leaveRoomWithConfirm() {
+    if (!window.confirm("ほんとに部屋からでる？")) return;
+    leaveRoom();
   }
 
   function openGallery(from) {
@@ -1122,6 +1138,13 @@ export default function App() {
                 おわり
               </button>
             )}
+            <button
+              type="button"
+              className="ghost-btn"
+              onClick={leaveRoomWithConfirm}
+            >
+              部屋をでる
+            </button>
             {error && <p className="error">{error}</p>}
           </div>
         </>
