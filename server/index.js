@@ -40,7 +40,11 @@ const LIAR_MIN_PLAYERS = 4;
 const LIAR_MAX_DRAWERS = 3;
 const LIAR_DURATION_MS = 40_000;
 const GRADUAL_MIN_PLAYERS = 2;
-const GRADUAL_DURATION_MS = 40_000;
+/**
+ * 見ている側は幕がかかったまま待つだけなので、協力・うそつきの40秒より短くする。
+ * 描き手を急かす声も飛ばないぶん、上限がないと丁寧に描きこんでしまう。
+ */
+const GRADUAL_DURATION_MS = 20_000;
 const GALLERY_MAX = 60;
 const EVENT_MIN_GAP = 3;
 const EVENT_FORCE_GAP = 6;
