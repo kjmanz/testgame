@@ -625,9 +625,10 @@ export default function App() {
   /** 爆笑リプレイ: みんなの画面で同時に早送り再生する */
   function requestReplay() {
     if (replaying) return;
+    setError("");
     socketRef.current?.emit("broadcastReplay", (res) => {
-      // 合図が配れなかったときは自分の画面だけで再生する
-      if (!res?.ok) canvasApiRef.current?.playReplay();
+      // 断られたら流さない（自分だけ再生すると、止めた意味がなくなる）
+      if (!res?.ok) setError(res?.error || "いまはリプレイできません");
     });
   }
 
@@ -2028,17 +2029,17 @@ export default function App() {
                 {roundNumber >= totalRounds ? "けっかを見る" : "つぎのお題へ"}
               </button>
             )}
-            {hasDrawing &&
-              !(roundType === "gradual" && drawPhase === "drawing") && (
-                <button
-                  type="button"
-                  className="quiet replay-btn"
-                  onClick={requestReplay}
-                  disabled={replaying}
-                >
-                  {replaying ? "▶ さいせい中…" : "▶ 描いた順にリプレイ"}
-                </button>
-              )}
+            {/* リプレイは、こたえを知っている人（＝つぎへ進められる人）だけに出す */}
+            {canNextRound && hasDrawing && (
+              <button
+                type="button"
+                className="quiet replay-btn"
+                onClick={requestReplay}
+                disabled={replaying}
+              >
+                {replaying ? "▶ さいせい中…" : "▶ 描いた順にリプレイ"}
+              </button>
+            )}
             <button
               type="button"
               className="secondary"

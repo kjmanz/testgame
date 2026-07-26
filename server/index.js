@@ -1715,13 +1715,15 @@ io.on("connection", (socket) => {
   onSocket(socket, "broadcastReplay", (cb) => {
     const ctx = getContext(socket);
     if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
-    const { code, room } = ctx;
+    const { code, room, playerId } = ctx;
     if (room.phase !== "playing") {
       return reply(cb, { ok: false, error: "いまはリプレイできません" });
     }
-    // だんだん見えるの公開前に、みんなの画面へ絵が流れたら台無し
-    if (room.roundType === "gradual" && room.drawPhase === "drawing") {
-      return reply(cb, { ok: false, error: "公開してからリプレイできます" });
+    // 流していいのは、こたえを知っている人（＝そのラウンドを次へ進められる人）だけ。
+    // 当てっこの最中に全員の画面が白くなると、ただの邪魔になる。
+    // リレー・協力・うそつき・だんだんでは、描く時間が終わるまで false になる。
+    if (!canPlayerNextRound(room, playerId)) {
+      return reply(cb, { ok: false, error: "こたえが出てからリプレイできます" });
     }
     const now = Date.now();
     if (now - room.lastReplayAt < REPLAY_COOLDOWN_MS) {
