@@ -762,6 +762,145 @@ input:focus {
   color: #6d3fa0;
 }
 
+/* —— しばりルーレット —— */
+.constraint-pill {
+  background: linear-gradient(90deg, #ffc93c, #ff9f1c);
+  color: #6b3b00;
+  animation: pulse-urgent 1.2s ease-in-out infinite;
+}
+
+.info-constraint {
+  padding: 0.5rem 0.6rem;
+  border: 3px dashed #d98324;
+  border-radius: 12px;
+  background:
+    repeating-linear-gradient(
+      -45deg,
+      rgba(255, 201, 60, 0.22) 0 10px,
+      transparent 10px 20px
+    ),
+    #fffaf0;
+}
+
+.info-constraint .info-label {
+  color: #a35709;
+}
+
+.constraint-value {
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: 1.3rem;
+  line-height: 1.25;
+  color: #8a4b06;
+}
+
+.constraint-rule {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 800;
+  color: var(--ink);
+}
+
+.constraint-gauge {
+  display: flex;
+  align-items: center;
+  gap: 0.22rem;
+  flex-wrap: wrap;
+  margin-top: 0.2rem;
+}
+
+.constraint-tick {
+  width: 16px;
+  height: 8px;
+  border-radius: 999px;
+  border: 2px solid #8a4b06;
+  background: #ffc93c;
+}
+
+.constraint-tick.is-used {
+  background: rgba(138, 75, 6, 0.12);
+}
+
+.constraint-remain {
+  margin-left: 0.25rem;
+  font-size: 0.82rem;
+  font-weight: 900;
+  color: #8a4b06;
+}
+
+.constraint-gauge.is-empty .constraint-remain {
+  color: #b71c1c;
+}
+
+.timer-fill.constraint {
+  background: linear-gradient(90deg, #ffc93c, #ff7a45);
+}
+
+.easel.has-constraint {
+  background: linear-gradient(180deg, #f0c27b 0%, #d99b45 55%, #a86a1f 100%);
+  border-color: #7a4a12;
+}
+
+.constraint-badge {
+  background: #fff6df;
+  color: #8a4b06;
+  transform: rotate(-4deg);
+}
+
+/* めかくししばり: 描いている本人にだけ、絵を隠す（線は下を通る） */
+.canvas-blind {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  pointer-events: none;
+  background:
+    repeating-linear-gradient(
+      -45deg,
+      rgba(255, 201, 60, 0.35) 0 18px,
+      rgba(255, 248, 232, 0.35) 18px 36px
+    ),
+    #fbf4e4;
+}
+
+.canvas-blind-face {
+  font-size: 3rem;
+  line-height: 1;
+}
+
+.canvas-blind-text {
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: 1.05rem;
+  color: #8a4b06;
+}
+
+/* —— 爆笑リプレイ —— */
+.canvas-replay {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 3;
+  padding: 0.25rem 0.6rem;
+  border-radius: 999px;
+  border: 2px solid var(--ink);
+  background: #ff5a2e;
+  color: #fff;
+  font-size: 0.78rem;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+  animation: pulse-urgent 1s ease-in-out infinite;
+}
+
+.replay-btn {
+  border-color: #8a4b06;
+  color: #8a4b06;
+  background: #fff6df;
+}
+
 .timer-bar {
   margin-top: 0.35rem;
   display: flex;
@@ -988,6 +1127,22 @@ input:focus {
   color: #4a2f96;
 }
 
+.fanfare-constraint .fanfare-text {
+  background: linear-gradient(135deg, #fff0c9, #ffd9a0);
+  color: #8a4b06;
+}
+
+.fanfare-constraint-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  font-size: 1.15rem;
+}
+
+.fanfare-constraint-sub span {
+  font-size: 0.92rem;
+}
+
 .ghost-btn,
 .small-btn {
   padding: 0.55rem 0.9rem;
@@ -1062,6 +1217,19 @@ input:focus {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gallery-constraint {
+  flex-shrink: 0;
+  margin-left: auto;
+  padding: 0.06rem 0.34rem;
+  border-radius: 999px;
+  border: 2px solid #d98324;
+  background: #fff6df;
+  color: #8a4b06;
+  font-size: 0.66rem;
+  font-weight: 900;
   white-space: nowrap;
 }
 
@@ -1142,9 +1310,7 @@ input:focus {
   overflow-wrap: anywhere;
 }
 
-.ai-ceremony h2,
-.ai-masterpiece h2,
-.ai-style-dialog h2 {
+.ai-ceremony h2 {
   margin: 0;
   color: #4f2b89;
   font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
@@ -1248,214 +1414,6 @@ input:focus {
   line-height: 1.45;
 }
 
-.gallery-item.is-masterpiece {
-  border-color: #67449f;
-  background: #faf3ff;
-  box-shadow: 3px 4px 0 rgba(79, 43, 137, 0.18);
-}
-
-.gallery-masterpiece-badge {
-  position: absolute;
-  right: 0.35rem;
-  bottom: 0.35rem;
-  max-width: calc(100% - 0.7rem);
-  padding: 0.2rem 0.42rem;
-  border: 1px solid #4f2b89;
-  border-radius: 999px;
-  background: rgba(250, 243, 255, 0.94);
-  color: #4f2b89;
-  font-size: 0.6rem;
-  font-weight: 900;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.gallery-ai-pending,
-.gallery-ai-critique {
-  margin: 0.28rem 0.42rem;
-  padding: 0.36rem 0.42rem;
-  border-radius: 8px;
-  background: #f6eeff;
-  color: #5b3b8e;
-  overflow-wrap: anywhere;
-}
-
-.gallery-ai-pending {
-  font-size: 0.62rem;
-  font-weight: 900;
-}
-
-.gallery-ai-critique p {
-  margin: 0;
-  font-size: 0.62rem;
-  font-weight: 700;
-  line-height: 1.4;
-}
-
-.gallery-masterpiece-button {
-  width: calc(100% - 0.8rem);
-  min-height: 44px;
-  margin: 0 0.4rem 0.45rem;
-  padding: 0.42rem 0.3rem;
-  border-width: 2px;
-  background: linear-gradient(135deg, #7450ae, #b6529f);
-  box-shadow: 1px 2px 0 var(--ink);
-  font-size: 0.68rem;
-}
-
-.ai-masterpiece-available {
-  margin: 0;
-  padding: 0.65rem;
-  border: 2px dashed rgba(79, 43, 137, 0.48);
-  border-radius: 12px;
-  background: rgba(246, 238, 255, 0.72);
-  color: #4f2b89;
-  font-size: 0.78rem;
-  font-weight: 900;
-  text-align: center;
-}
-
-.ai-masterpiece {
-  display: flex;
-  flex-direction: column;
-  gap: 0.55rem;
-  padding: 0.75rem;
-  border: 3px solid #67449f;
-  border-radius: 16px;
-  background: linear-gradient(145deg, #f7efff, #fff8db);
-  text-align: center;
-  box-shadow: 3px 4px 0 rgba(79, 43, 137, 0.16);
-}
-
-.ai-masterpiece h2 {
-  font-size: 1.05rem;
-  overflow-wrap: anywhere;
-}
-
-.ai-masterpiece > img {
-  display: block;
-  width: 100%;
-  aspect-ratio: 1;
-  border: 3px solid var(--ink);
-  border-radius: 12px;
-  background: #fbf4e4;
-  object-fit: cover;
-}
-
-.ai-masterpiece .secondary {
-  padding-block: 0.65rem;
-}
-
-.ai-masterpiece-busy {
-  padding: 0.55rem;
-}
-
-.ai-masterpiece-error {
-  margin: 0;
-  padding: 0.65rem;
-  border: 2px dashed rgba(79, 43, 137, 0.4);
-  border-radius: 12px;
-  background: rgba(246, 238, 255, 0.72);
-  color: #5b3b8e;
-  font-size: 0.76rem;
-  font-weight: 800;
-  text-align: center;
-}
-
-.ai-dialog-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 70;
-  display: grid;
-  place-items: center;
-  padding:
-    max(1rem, env(safe-area-inset-top))
-    max(1rem, env(safe-area-inset-right))
-    max(1rem, env(safe-area-inset-bottom))
-    max(1rem, env(safe-area-inset-left));
-  background: rgba(43, 36, 28, 0.58);
-}
-
-.ai-style-dialog {
-  width: min(100%, 28rem);
-  max-height: calc(100dvh - 2rem);
-  overflow-y: auto;
-  padding: 1rem;
-  border: 3px solid var(--ink);
-  border-radius: 20px;
-  background:
-    radial-gradient(circle at 90% 8%, rgba(255, 201, 60, 0.48), transparent 25%),
-    #fff8e8;
-  box-shadow: 7px 9px 0 rgba(43, 36, 28, 0.24);
-  animation: pop-in 0.25s ease both;
-}
-
-.ai-dialog-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 0.7rem;
-}
-
-.ai-style-dialog h2 {
-  font-size: 1.35rem;
-}
-
-.ai-dialog-close {
-  width: 2.25rem;
-  height: 2.25rem;
-  padding: 0;
-  font-size: 1.3rem;
-  line-height: 1;
-}
-
-.ai-style-preview {
-  display: block;
-  width: min(48vw, 11rem);
-  aspect-ratio: 1;
-  margin: 0.8rem auto;
-  border: 3px solid var(--ink);
-  border-radius: 12px;
-  background: #fbf4e4;
-  object-fit: cover;
-}
-
-.ai-style-options {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 0.55rem;
-  margin-top: 0.75rem;
-}
-
-.ai-dialog-busy {
-  margin: 0.55rem 0 0;
-  padding: 0.5rem 0.65rem;
-  border-radius: 10px;
-  background: #f6eeff;
-  color: #4f2b89;
-  font-size: 0.74rem;
-  font-weight: 900;
-  text-align: center;
-}
-
-.ai-style-option {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 44px;
-  gap: 0.35rem;
-  padding: 0.72rem 0.45rem;
-  border-width: 2px;
-  background: #6c4aa2;
-  box-shadow: 2px 3px 0 var(--ink);
-  font-size: 0.8rem;
-}
-
-.ai-style-option span {
-  font-size: 1.15rem;
-}
-
 @keyframes ai-paint {
   0%,
   100% {
@@ -1553,8 +1511,7 @@ input:focus {
     padding: 0.16rem 0.4rem;
   }
 
-  .gallery-grid,
-  .ai-style-options {
+  .gallery-grid {
     grid-template-columns: 1fr;
   }
 
@@ -1573,9 +1530,10 @@ input:focus {
   .card,
   .easel,
   .relay-pill,
+  .constraint-pill,
+  .canvas-replay,
   .fanfare,
   .fanfare-text,
-  .ai-style-dialog,
   .ai-busy-icon {
     animation: none;
   }

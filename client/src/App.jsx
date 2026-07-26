@@ -8,22 +8,13 @@ const SESSION_KEY = "oekaki-session";
 const SESSION_TTL_MS = 3 * 60 * 60 * 1000;
 const EMPTY_AI_STATE = {
   enabled: false,
-  styles: [],
   gameSeq: 0,
   currentGalleryCount: 0,
-  pendingCritiques: 0,
-  readyCritiques: 0,
+  awardCandidateCount: 0,
   awardsStatus: "idle",
   awards: null,
   awardsError: "",
   canRetryAwards: true,
-  masterpieceEligible: false,
-  masterpieceStatus: "idle",
-  masterpiece: null,
-  masterpieceError: "",
-  canRetryMasterpiece: true,
-  anyMasterpieceGenerating: false,
-  masterpieceGeneratingOwnerName: "",
 };
 
 function createSocket() {
@@ -141,9 +132,9 @@ export default function App() {
   const socketRef = useRef(null);
   const wakeLockRef = useRef(null);
   const canvasApiRef = useRef(null);
-  const styleDialogRef = useRef(null);
-  const stylizeReturnFocusRef = useRef(null);
   const playerIdRef = useRef("");
+  /** 何か描かれたか（線ごとに再描画しないための箱） */
+  const hasDrawingRef = useRef(false);
   /** サーバー時刻 - 端末時刻（タイマー表示のずれ補正用） */
   const serverOffsetRef = useRef(0);
   const [initialInviteCode] = useState(readInviteRoomCode);
@@ -183,6 +174,10 @@ export default function App() {
   const [isLiar, setIsLiar] = useState(false);
   const [canReveal, setCanReveal] = useState(false);
   const [liarName, setLiarName] = useState("");
+  const [constraint, setConstraint] = useState(null);
+  const [strokesUsed, setStrokesUsed] = useState(0);
+  const [hasDrawing, setHasDrawing] = useState(false);
+  const [replaying, setReplaying] = useState(false);
   const [roundId, setRoundId] = useState(null);
   const [roundNumber, setRoundNumber] = useState(0);
   const [totalRounds, setTotalRounds] = useState(0);
@@ -195,35 +190,19 @@ export default function App() {
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [returnScreen, setReturnScreen] = useState("lobby");
   const [aiState, setAiState] = useState(EMPTY_AI_STATE);
-  const [stylizeTargetId, setStylizeTargetId] = useState("");
 
   const isHost = playerId && playerId === hostId;
-  const isOwnMasterpieceGenerating =
-    aiState.masterpieceStatus === "generating";
-  const isAiFinishBusy =
-    aiState.anyMasterpieceGenerating ||
-    aiState.awardsStatus === "generating";
+  const isAiFinishBusy = aiState.awardsStatus === "generating";
   const modeClass = `mode-${roundType || "normal"}`;
   const inviteUrl = useMemo(() => buildInviteUrl(roomCode), [roomCode]);
-  const stylizeTarget = useMemo(
-    () => gallery.find((item) => item.id === stylizeTargetId) || null,
-    [gallery, stylizeTargetId]
-  );
-  const masterpieceItem = useMemo(
-    () =>
-      gallery.find(
-        (item) => item.id === aiState.masterpiece?.galleryItemId
-      ) || null,
-    [gallery, aiState.masterpiece]
-  );
   const canShareInvite =
     typeof navigator !== "undefined" && typeof navigator.share === "function";
 
-  function closeStylizeDialog({ restoreFocus = true } = {}) {
-    setStylizeTargetId("");
-    if (restoreFocus) {
-      window.setTimeout(() => stylizeReturnFocusRef.current?.focus(), 0);
-    }
+  /** 線が届くたびに再描画しないよう、変化したときだけ state を動かす */
+  function markDrawing(value) {
+    if (hasDrawingRef.current === value) return;
+    hasDrawingRef.current = value;
+    setHasDrawing(value);
   }
 
   function applyRoundPayload(data, { forcePlay = true } = {}) {
@@ -249,6 +228,8 @@ export default function App() {
     setIsLiar(!!data.isLiar);
     setCanReveal(!!data.canReveal);
     setLiarName(data.liarName || "");
+    setConstraint(data.constraint || null);
+    setStrokesUsed(data.constraintStrokesUsed ?? 0);
     setRoundId(data.roundId ?? null);
     setRoundNumber(data.roundNumber ?? 0);
     setTotalRounds(data.totalRounds ?? 0);
@@ -273,6 +254,9 @@ export default function App() {
     setIsLiar(false);
     setCanReveal(false);
     setLiarName("");
+    setConstraint(null);
+    setStrokesUsed(0);
+    markDrawing(false);
     setRoundId(null);
     setAdvancing(false);
   }
@@ -310,49 +294,6 @@ export default function App() {
     const t = setTimeout(() => setFanfare(null), 2200);
     return () => clearTimeout(t);
   }, [fanfare]);
-
-  useEffect(() => {
-    if (!stylizeTargetId) return;
-    if (!gallery.some((item) => item.id === stylizeTargetId)) {
-      closeStylizeDialog({ restoreFocus: false });
-    }
-  }, [gallery, stylizeTargetId]);
-
-  useEffect(() => {
-    if (!stylizeTargetId) return;
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-
-    function handleDialogKeys(event) {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        closeStylizeDialog();
-        return;
-      }
-      if (event.key !== "Tab") return;
-      const focusable = [
-        ...(styleDialogRef.current?.querySelectorAll(
-          'button:not(:disabled), [href], input:not(:disabled), [tabindex]:not([tabindex="-1"])'
-        ) || []),
-      ];
-      if (focusable.length === 0) return;
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    }
-
-    window.addEventListener("keydown", handleDialogKeys);
-    return () => {
-      document.body.style.overflow = previousOverflow;
-      window.removeEventListener("keydown", handleDialogKeys);
-    };
-  }, [stylizeTargetId]);
 
   useEffect(() => {
     window.scrollTo(0, 0);
@@ -438,6 +379,7 @@ export default function App() {
     socket.on("clearCanvas", () => {
       setClearToken((n) => n + 1);
       setHistorySeed({ token: 0, strokes: [] });
+      markDrawing(false);
     });
 
     socket.on("gameEnded", (data) => {
@@ -445,7 +387,6 @@ export default function App() {
       setScreen((prev) => (prev === "gallery" ? "gallery" : "lobby"));
       resetPlayState();
       resetGameProgress();
-      closeStylizeDialog({ restoreFocus: false });
       setClearToken((n) => n + 1);
       if (data?.reason === "alone") {
         setToast("みんな出ちゃったのでロビーにもどったよ");
@@ -459,12 +400,16 @@ export default function App() {
     socket.on("gameExtended", (data) => {
       setTotalRounds(data?.totalRounds ?? 0);
       setFinishBusy(false);
-      closeStylizeDialog({ restoreFocus: false });
       setToast(`あと${data?.addedRounds || 3}問、延長！`);
     });
 
     socket.on("stroke", (data) => {
       window.dispatchEvent(new CustomEvent("remote-stroke", { detail: data }));
+      if (data?.type === "move") markDrawing(true);
+    });
+
+    socket.on("replayStart", () => {
+      canvasApiRef.current?.playReplay();
     });
 
     socket.on("playerJoined", (data) => {
@@ -479,6 +424,11 @@ export default function App() {
       }
       if (data?.roundType === "liar" && data.names?.length) {
         setToast(`🕵️ ${data.names.join("・")}のだれかがうそつき…！`);
+      }
+      if (data?.constraint) {
+        setToast(
+          `${data.constraint.emoji} ${data.constraint.label}：${data.constraint.rule}`
+        );
       }
     });
 
@@ -533,52 +483,21 @@ export default function App() {
       });
     });
 
-    socket.on("galleryItemAiUpdate", (data) => {
-      if (!data?.id) return;
-      setGallery((items) =>
-        items.map((item) =>
-          item.id === data.id
-            ? {
-                ...item,
-                aiCritiqueStatus: data.aiCritiqueStatus,
-                aiCritique: data.aiCritique || null,
-              }
-            : item
-        )
-      );
-    });
-
     socket.on("aiStateUpdate", (data) => {
-      setAiState({
-        ...EMPTY_AI_STATE,
-        ...data,
-        styles: Array.isArray(data?.styles) ? data.styles : [],
-      });
-      if (data?.masterpieceStatus === "ready") {
-        closeStylizeDialog({ restoreFocus: false });
-      }
+      setAiState({ ...EMPTY_AI_STATE, ...data });
     });
 
     socket.on("aiAwardsReady", () => {
       setToast("🏆 AI画伯の授賞式がはじまるよ！");
     });
 
-    socket.on("aiMasterpieceReady", (data) => {
-      if (data?.playerId === playerIdRef.current) {
-        closeStylizeDialog({ restoreFocus: false });
-        setToast(`✨ あなたの${data?.styleLabel || "名画"}が完成しました！`);
-      } else {
-        setToast(
-          `✨ ${data?.playerName || "参加者"}さんの名画が完成しました！`
-        );
-      }
-    });
-
     socket.on("strokeHistory", (data) => {
+      const strokes = data?.strokes || [];
       setHistorySeed((prev) => ({
         token: prev.token + 1,
-        strokes: data?.strokes || [],
+        strokes,
       }));
+      markDrawing(strokes.some((ev) => ev?.type === "move"));
     });
 
     function syncClock() {
@@ -653,9 +572,19 @@ export default function App() {
   const emitStroke = useMemo(
     () => (data) => {
       socketRef.current?.emit("stroke", data);
+      if (data?.type === "move") markDrawing(true);
     },
     []
   );
+
+  /** 爆笑リプレイ: みんなの画面で同時に早送り再生する */
+  function requestReplay() {
+    if (replaying) return;
+    socketRef.current?.emit("broadcastReplay", (res) => {
+      // 合図が配れなかったときは自分の画面だけで再生する
+      if (!res?.ok) canvasApiRef.current?.playReplay();
+    });
+  }
 
   function createRoom() {
     setError("");
@@ -729,7 +658,6 @@ export default function App() {
       setGallery([]);
       setSelectedIds(new Set());
       setAiState(EMPTY_AI_STATE);
-      setStylizeTargetId("");
       setHistorySeed({ token: 0, strokes: [] });
       resetPlayState();
       resetGameProgress();
@@ -821,30 +749,6 @@ export default function App() {
     });
   }
 
-  function requestMasterpiece(style) {
-    if (
-      !stylizeTarget ||
-      !aiState.masterpieceEligible ||
-      aiState.anyMasterpieceGenerating ||
-      aiState.masterpieceStatus === "generating"
-    ) {
-      return;
-    }
-    setError("");
-    socketRef.current?.emit(
-      "stylizeGalleryItem",
-      { id: stylizeTarget.id, style },
-      (res) => {
-        if (!res?.ok) {
-          setError(res?.error || "名画化できません");
-          return;
-        }
-        closeStylizeDialog({ restoreFocus: false });
-        setToast("✨ AI画伯が名画を制作中です。少し待ってね");
-      }
-    );
-  }
-
   function revealLiar() {
     setError("");
     socketRef.current?.emit("revealLiar", (res) => {
@@ -861,14 +765,12 @@ export default function App() {
     setReturnScreen(from || screen);
     setGallerySelectMode(false);
     setSelectedIds(new Set());
-    setStylizeTargetId("");
     setScreen("gallery");
   }
 
   function closeGallery() {
     setGallerySelectMode(false);
     setSelectedIds(new Set());
-    setStylizeTargetId("");
     const next =
       returnScreen === "play"
         ? "play"
@@ -880,10 +782,12 @@ export default function App() {
       // ギャラリー表示中はキャンバスが外れているので描き直す
       socketRef.current?.emit("requestStrokeHistory", (res) => {
         if (!res?.ok) return;
+        const strokes = res.strokes || [];
         setHistorySeed((prev) => ({
           token: prev.token + 1,
-          strokes: res.strokes || [],
+          strokes,
         }));
+        markDrawing(strokes.some((ev) => ev?.type === "move"));
       });
     }
   }
@@ -927,8 +831,7 @@ export default function App() {
   async function saveImage(item) {
     const word = String(item.word || "").trim();
     const safeWord = (word || "picture").replace(/[\\/:*?"<>|]/g, "_");
-    const titlePrefix = item.isMasterpiece ? "AI名画" : "おえかき";
-    const title = word ? `${titlePrefix}「${word}」` : titlePrefix;
+    const title = word ? `おえかき「${word}」` : "おえかき";
     const mimeType =
       item.imageDataUrl?.match(/^data:(image\/(?:jpeg|png|webp));/)?.[1] ||
       "image/jpeg";
@@ -936,8 +839,7 @@ export default function App() {
       { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" }[
         mimeType
       ] || "jpg";
-    const styleSuffix = item.isMasterpiece ? `-${item.style || "masterpiece"}` : "";
-    const filename = `${safeWord}${styleSuffix}-${String(item.id || "image").slice(0, 8)}.${extension}`;
+    const filename = `${safeWord}-${String(item.id || "image").slice(0, 8)}.${extension}`;
     try {
       const res = await fetch(item.imageDataUrl);
       const blob = await res.blob();
@@ -1006,6 +908,44 @@ export default function App() {
             );
           })}
         </div>
+      </div>
+    );
+  }
+
+  /** しばりは描き手だけでなく全員に見せる（知らないと、ただ下手な人になる） */
+  function renderConstraint() {
+    if (!constraint) return null;
+    const remaining =
+      constraint.kind === "strokes"
+        ? Math.max(0, constraint.value - strokesUsed)
+        : null;
+    const mine = drawerId && playerId && drawerId === playerId;
+    return (
+      <div className="info-block info-constraint">
+        <div className="info-label">🎲 このお題のしばり</div>
+        <div className="constraint-value">
+          {constraint.emoji} {constraint.label}
+        </div>
+        <p className="constraint-rule">{constraint.rule}</p>
+        {mine && drawPhase === "drawing" && (
+          <p className="hint">{constraint.hint}</p>
+        )}
+        {remaining != null && mine && drawPhase === "drawing" && (
+          <div
+            className={`constraint-gauge${remaining === 0 ? " is-empty" : ""}`}
+            aria-label={`のこり${remaining}本`}
+          >
+            {Array.from({ length: constraint.value }, (_, i) => (
+              <span
+                key={i}
+                className={`constraint-tick${i < remaining ? "" : " is-used"}`}
+              />
+            ))}
+            <span className="constraint-remain">
+              {remaining === 0 ? "つかいきった！" : `のこり ${remaining}本`}
+            </span>
+          </div>
+        )}
       </div>
     );
   }
@@ -1251,6 +1191,9 @@ export default function App() {
         <div className="meta row-meta">
           <span>部屋 {roomCode}</span>
           {renderRoundProgress()}
+          {constraint && (
+            <span className="mode-pill constraint-pill">しばり</span>
+          )}
         </div>
         {word ? (
           <div className="info-block info-prompt">
@@ -1262,6 +1205,23 @@ export default function App() {
             <div className="info-label">いま描いている人</div>
             <div className="drawer-value">{drawerName}</div>
             <p className="hint">絵を見て、当てよう！</p>
+          </div>
+        )}
+        {renderConstraint()}
+        {remainSec != null && drawPhase === "drawing" && (
+          <div className="timer-bar" aria-live="polite">
+            <div className="timer-label">のこり {remainSec}びょう</div>
+            <div className="timer-track">
+              <div
+                className="timer-fill constraint"
+                style={{
+                  width: `${Math.min(
+                    100,
+                    (remainSec / Math.max(1, turnDurationSec || 10)) * 100
+                  )}%`,
+                }}
+              />
+            </div>
           </div>
         )}
       </>
@@ -1285,77 +1245,13 @@ export default function App() {
             {fanfare.roundType === "coop" && fanfare.names?.length > 0 && (
               <div className="fanfare-sub">{fanfare.names.join("・")}</div>
             )}
-          </div>
-        </div>
-      )}
-
-      {stylizeTarget && (
-        <div
-          className="ai-dialog-backdrop"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget) closeStylizeDialog();
-          }}
-        >
-          <section
-            ref={styleDialogRef}
-            className="ai-style-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="ai-style-title"
-            aria-describedby="ai-style-description"
-            aria-busy={aiState.anyMasterpieceGenerating}
-          >
-            <div className="ai-dialog-head">
-              <div>
-                <div className="ai-eyebrow">AI名画化</div>
-                <h2 id="ai-style-title">どんな名画にする？</h2>
+            {fanfare.constraint && (
+              <div className="fanfare-sub fanfare-constraint-sub">
+                {fanfare.constraint.emoji} {fanfare.constraint.label}
+                <span>{fanfare.constraint.rule}</span>
               </div>
-              <button
-                type="button"
-                className="ghost-btn ai-dialog-close"
-                onClick={() => closeStylizeDialog()}
-                aria-label="閉じる"
-              >
-                ×
-              </button>
-            </div>
-            <img
-              className="ai-style-preview"
-              src={stylizeTarget.imageDataUrl}
-              alt={`名画化する「${stylizeTarget.word || "絵"}」`}
-            />
-            <p className="hint" id="ai-style-description">
-              元の楽しい線を残したまま変身します。名画化は一人につき、1ゲーム1枚です。
-            </p>
-            {aiState.anyMasterpieceGenerating &&
-              !isOwnMasterpieceGenerating && (
-                <p className="ai-dialog-busy" role="status">
-                  {aiState.masterpieceGeneratingOwnerName
-                    ? `${aiState.masterpieceGeneratingOwnerName}さんの名画を制作中です。完成後に選べます`
-                    : "ほかの参加者の名画を制作中です。完成後に選べます"}
-                </p>
-              )}
-            <div className="ai-style-options">
-              {(aiState.styles || []).map((style, index) => (
-                <button
-                  key={style.id}
-                  type="button"
-                  className="ai-style-option"
-                  onClick={() => requestMasterpiece(style.id)}
-                  disabled={aiState.anyMasterpieceGenerating}
-                  autoFocus={index === 0}
-                >
-                  <span aria-hidden="true">{style.emoji}</span>
-                  {style.label}
-                </button>
-              ))}
-            </div>
-            {error && (
-              <p className="error" role="alert">
-                {error}
-              </p>
             )}
-          </section>
+          </div>
         </div>
       )}
 
@@ -1608,23 +1504,15 @@ export default function App() {
                         );
                       })}
                     </ol>
-                    <p className="hint">
-                      参加者それぞれが、ギャラリーから1枚をAI名画にできます
-                    </p>
                   </>
                 )}
 
               {(aiState.awardsStatus === "idle" ||
                 aiState.awardsStatus === "error") && (
                 <>
-                  {aiState.pendingCritiques > 0 ? (
-                    <p className="ai-ceremony-note" role="status">
-                      AI画伯があと{aiState.pendingCritiques}
-                      枚を鑑賞しています…
-                    </p>
-                  ) : aiState.readyCritiques < 2 ? (
+                  {aiState.awardCandidateCount < 2 ? (
                     <p className="ai-ceremony-note">
-                      講評できた作品が2枚以上あると授賞式を開けます
+                      絵が2枚以上あると授賞式を開けます
                     </p>
                   ) : (
                     <p className="ai-ceremony-note">
@@ -1643,10 +1531,7 @@ export default function App() {
                       type="button"
                       className="ai-awards-button"
                       onClick={requestAiAwards}
-                      disabled={
-                        aiState.pendingCritiques > 0 ||
-                        aiState.readyCritiques < 2
-                      }
+                      disabled={aiState.awardCandidateCount < 2}
                     >
                       {aiState.awardsStatus === "error"
                         ? "授賞式をもう一度ためす"
@@ -1666,11 +1551,7 @@ export default function App() {
 
           {isAiFinishBusy && (
             <p className="finish-wait" role="status">
-              {aiState.awardsStatus === "generating"
-                ? "AI授賞式を準備中です。完成すると延長・ロビーへ戻る操作ができます"
-                : aiState.masterpieceGeneratingOwnerName
-                  ? `${aiState.masterpieceGeneratingOwnerName}さんのAI名画を制作中です。完成すると延長・ロビーへ戻る操作ができます`
-                  : "AI名画を制作中です。完成すると延長・ロビーへ戻る操作ができます"}
+              AI授賞式を準備中です。完成すると延長・ロビーへ戻る操作ができます
             </p>
           )}
 
@@ -1742,70 +1623,6 @@ export default function App() {
               : "まだ絵がありません。ラウンドを進めるとここに残ります"}
           </p>
 
-          {aiState.enabled &&
-            returnScreen === "finished" &&
-            aiState.masterpieceEligible &&
-            !aiState.anyMasterpieceGenerating &&
-            (aiState.masterpieceStatus === "idle" ||
-              (aiState.masterpieceStatus === "error" &&
-                aiState.canRetryMasterpiece)) && (
-              <p className="ai-masterpiece-available" role="status">
-                ✨ あなたはこのゲームで、あと1枚を名画化できます
-              </p>
-            )}
-
-          {aiState.enabled && aiState.anyMasterpieceGenerating && (
-              <section className="ai-masterpiece ai-masterpiece-busy">
-                <div className="ai-busy" role="status">
-                  <span className="ai-busy-icon" aria-hidden="true">
-                    🖌️
-                  </span>
-                  {isOwnMasterpieceGenerating
-                    ? "あなたの名画を制作中…完成まで少しかかります"
-                    : aiState.masterpieceGeneratingOwnerName
-                      ? `${aiState.masterpieceGeneratingOwnerName}さんの名画を制作中…完成後にあなたも作れます`
-                      : "ほかの参加者の名画を制作中…完成後にあなたも作れます"}
-                </div>
-              </section>
-            )}
-
-          {aiState.enabled &&
-            aiState.masterpieceStatus === "ready" &&
-            masterpieceItem && (
-              <section
-                className="ai-masterpiece"
-                aria-labelledby="masterpiece-title"
-              >
-                <div className="ai-eyebrow">✨ AI名画が完成！</div>
-                <h2 id="masterpiece-title">
-                  {aiState.masterpiece?.styleLabel || "名画"}になった「
-                  {masterpieceItem.word}」
-                </h2>
-                <img
-                  src={masterpieceItem.imageDataUrl}
-                  alt={`${masterpieceItem.word || "絵"}のAI名画`}
-                  loading="lazy"
-                  decoding="async"
-                />
-                <button
-                  type="button"
-                  className="secondary"
-                  onClick={() => saveImage(masterpieceItem)}
-                >
-                  名画を保存・共有
-                </button>
-              </section>
-            )}
-
-          {aiState.enabled &&
-            (aiState.masterpieceStatus === "error" ||
-              aiState.masterpieceStatus === "used") &&
-            aiState.masterpieceError && (
-              <p className="ai-masterpiece-error" role="status">
-                {aiState.masterpieceError}
-              </p>
-            )}
-
           {gallery.length > 0 && (
             <div className="gallery-toolbar">
               <button
@@ -1847,7 +1664,7 @@ export default function App() {
               .map((item) => (
                 <div
                   key={item.id}
-                  className={`gallery-item${selectedIds.has(item.id) ? " selected" : ""}${item.isMasterpiece ? " is-masterpiece" : ""}`}
+                  className={`gallery-item${selectedIds.has(item.id) ? " selected" : ""}`}
                   onClick={() => {
                     if (gallerySelectMode) toggleSelect(item.id);
                   }}
@@ -1880,42 +1697,15 @@ export default function App() {
                       loading="lazy"
                       decoding="async"
                     />
-                    {item.isMasterpiece && (
-                      <span
-                        className="gallery-masterpiece-badge"
-                        title={
-                          item.masterpieceOwnerName
-                            ? `${item.masterpieceOwnerName}さんが名画化`
-                            : undefined
-                        }
-                      >
-                        ✨ {item.styleLabel || "AI名画"}
-                        {item.masterpieceOwnerName
-                          ? `・${item.masterpieceOwnerName}さん`
-                          : ""}
-                      </span>
-                    )}
                   </div>
                   <div className="gallery-meta">
                     <span className="gallery-word">{item.word}</span>
+                    {item.constraintLabel && (
+                      <span className="gallery-constraint">
+                        {item.constraintLabel}
+                      </span>
+                    )}
                   </div>
-                  {!item.isMasterpiece &&
-                    aiState.enabled &&
-                    returnScreen !== "play" &&
-                    item.aiCritiqueStatus === "pending" && (
-                      <div className="gallery-ai-pending" role="status">
-                        🎨 AI画伯が鑑賞中…
-                      </div>
-                    )}
-                  {!item.isMasterpiece &&
-                    aiState.enabled &&
-                    returnScreen !== "play" &&
-                    item.aiCritiqueStatus === "ready" &&
-                    item.aiCritique?.comment && (
-                      <div className="gallery-ai-critique">
-                        <p>✨ {item.aiCritique.comment}</p>
-                      </div>
-                    )}
                   <div className="gallery-foot">
                     <div className="gallery-drawers">
                       {(item.drawerNames || []).join("・")}
@@ -1933,33 +1723,6 @@ export default function App() {
                       </button>
                     )}
                   </div>
-                  {!gallerySelectMode &&
-                    !item.isMasterpiece &&
-                    returnScreen === "finished" &&
-                    aiState.enabled &&
-                    aiState.masterpieceEligible &&
-                    item.gameSeq === aiState.gameSeq &&
-                    (aiState.masterpieceStatus === "idle" ||
-                      (aiState.masterpieceStatus === "error" &&
-                        aiState.canRetryMasterpiece)) && (
-                      <button
-                        type="button"
-                        className="gallery-masterpiece-button"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          if (aiState.anyMasterpieceGenerating) return;
-                          setError("");
-                          stylizeReturnFocusRef.current =
-                            event.currentTarget;
-                          setStylizeTargetId(item.id);
-                        }}
-                        disabled={aiState.anyMasterpieceGenerating}
-                      >
-                        {aiState.anyMasterpieceGenerating
-                          ? "🖌️ ただいま制作中"
-                          : "✨ この絵を名画化"}
-                      </button>
-                    )}
                 </div>
               ))}
           </div>
@@ -1974,8 +1737,15 @@ export default function App() {
             {renderPlayHeader()}
           </div>
 
-          <div className={`easel ${modeClass}`}>
+          <div
+            className={`easel ${modeClass}${constraint ? " has-constraint" : ""}`}
+          >
             <div className="easel-clip" aria-hidden="true" />
+            {constraint && (
+              <div className="easel-badge constraint-badge" aria-hidden="true">
+                {constraint.emoji} {constraint.label}
+              </div>
+            )}
             {roundType === "relay" && (
               <div className="easel-badge relay-badge" aria-hidden="true">
                 リレー
@@ -1994,11 +1764,30 @@ export default function App() {
             <div className={`canvas-wrap ${modeClass}`}>
               <DrawingCanvas
                 ref={canvasApiRef}
-                enabled={!!canDraw}
+                enabled={!!canDraw && !replaying}
                 clearToken={clearToken}
                 onStroke={emitStroke}
                 historySeed={historySeed}
+                penWidth={constraint?.kind === "pen" ? constraint.value : 4}
+                strokeLimit={
+                  constraint?.kind === "strokes" ? constraint.value : 0
+                }
+                strokeUsedSeed={strokesUsed}
+                onStrokeUsed={setStrokesUsed}
+                onReplayChange={setReplaying}
               />
+              {/* めかくししばり: 描いている本人にだけ絵を隠す（線は下を通る） */}
+              {constraint?.kind === "blind" && canDraw && !replaying && (
+                <div className="canvas-blind" aria-hidden="true">
+                  <span className="canvas-blind-face">🙈</span>
+                  <span className="canvas-blind-text">見ないで描こう！</span>
+                </div>
+              )}
+              {replaying && (
+                <div className="canvas-replay" aria-hidden="true">
+                  ▶ リプレイ
+                </div>
+              )}
               {remainSec != null && drawPhase === "drawing" && (
                 <div
                   className={`canvas-timer${remainSec <= 5 ? " is-urgent" : ""}`}
@@ -2019,6 +1808,16 @@ export default function App() {
             {canNextRound && (
               <button type="button" onClick={nextRound} disabled={advancing}>
                 {roundNumber >= totalRounds ? "けっかを見る" : "つぎのお題へ"}
+              </button>
+            )}
+            {hasDrawing && (
+              <button
+                type="button"
+                className="quiet replay-btn"
+                onClick={requestReplay}
+                disabled={replaying}
+              >
+                {replaying ? "▶ さいせい中…" : "▶ 描いた順にリプレイ"}
               </button>
             )}
             <button

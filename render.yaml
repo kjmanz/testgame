@@ -16,5 +16,3 @@ services:
         sync: false
       - key: OPENAI_TEXT_MODEL
         value: gpt-5.6-luna
-      - key: OPENAI_IMAGE_MODEL
-        value: gpt-image-2

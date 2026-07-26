@@ -12,15 +12,13 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { Server } from "socket.io";
 import {
-  MAX_MASTERPIECE_DATA_URL_LENGTH,
   aiErrorLogDetails,
   createAwards,
-  critiqueDrawing,
   isAiConfigured,
   parseImageDataUrl,
   publicAiCapabilities,
-  stylizeDrawing,
 } from "./ai.js";
+import { findConstraint, randomConstraint } from "./constraints.js";
 import { hasVisibleDrawing } from "./drawing.js";
 import { randomWord } from "./words.js";
 
@@ -45,38 +43,31 @@ const GALLERY_MAX = 60;
 const EVENT_MIN_GAP = 3;
 const EVENT_FORCE_GAP = 6;
 const EVENT_CHANCE = 0.3;
+/** しばりはふつうのラウンドだけ。たまに出るくらいの間隔にする */
+const CONSTRAINT_MIN_GAP = 4;
+const CONSTRAINT_FORCE_GAP = 9;
+const CONSTRAINT_CHANCE = 0.25;
+const RECENT_CONSTRAINTS_MAX = 4;
+/** リプレイの連打よけ */
+const REPLAY_COOLDOWN_MS = 2_000;
 const EXTENSION_ROUNDS = 3;
 const MAX_GALLERY_DATA_URL_LEN = 400_000;
 const MAX_TOTAL_GALLERY_DATA_URL_LEN = 80_000_000;
-const MASTERPIECE_STORAGE_RESERVE = 10_000_000;
 const MAX_STROKES = 20_000;
 const RECENT_WORDS_MAX = 20;
 const AI_RATE_WINDOW_MS = 60 * 60 * 1000;
 const AI_RATE_LIMITS = {
   room: Math.max(1, Number(process.env.ROOM_CREATE_RATE_LIMIT) || 10),
-  critique: Math.max(1, Number(process.env.AI_CRITIQUE_RATE_LIMIT) || 90),
   awards: Math.max(1, Number(process.env.AI_AWARDS_RATE_LIMIT) || 12),
-  masterpiece: Math.max(
-    1,
-    Number(process.env.AI_MASTERPIECE_RATE_LIMIT) || 30,
-  ),
 };
 const AI_GLOBAL_RATE_LIMITS = {
   room: Math.max(
     1,
     Number(process.env.GLOBAL_ROOM_CREATE_RATE_LIMIT) || 200,
   ),
-  critique: Math.max(
-    1,
-    Number(process.env.AI_GLOBAL_CRITIQUE_RATE_LIMIT) || 240,
-  ),
   awards: Math.max(
     1,
     Number(process.env.AI_GLOBAL_AWARDS_RATE_LIMIT) || 40,
-  ),
-  masterpiece: Math.max(
-    1,
-    Number(process.env.AI_GLOBAL_MASTERPIECE_RATE_LIMIT) || 60,
   ),
 };
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -141,21 +132,10 @@ const io = new Server(httpServer, {
  *  word: string,
  *  drawerNames: string[],
  *  roundType: 'normal' | 'relay' | 'coop' | 'liar',
+ *  constraintLabel: string,
  *  createdAt: number,
  *  gameSeq: number,
- *  isMasterpiece?: boolean,
- *  sourceId?: string,
- *  style?: string,
- *  styleLabel?: string,
- *  masterpieceOwnerId?: string,
- *  masterpieceOwnerName?: string,
- *  aiCritiqueStatus: 'off' | 'pending' | 'ready' | 'error',
- *  aiCritique?: {
- *    title: string,
- *    comment: string,
- *    strength: string,
- *    awardSeed: string,
- *  },
+ *  hasDrawing: boolean,
  * }} GalleryItem
  */
 /**
@@ -179,6 +159,12 @@ const io = new Server(httpServer, {
  *  seenWordIds: Set<string>,
  *  roundsSinceSpecial: number,
  *  lastWasSpecial: boolean,
+ *  constraint: import('./constraints.js').Constraint | null,
+ *  strokeCounts: Map<string, number>,
+ *  blockedDrawers: Set<string>,
+ *  roundsSinceConstraint: number,
+ *  recentConstraints: string[],
+ *  lastReplayAt: number,
  *  gallery: GalleryItem[],
  *  strokes: object[],
  *  recentWords: string[],
@@ -196,19 +182,6 @@ const io = new Server(httpServer, {
  *  aiAwardsError: string,
  *  aiAwardsAttempts: number,
  *  aiAwardsToken: number,
- *  aiMasterpieceEligibleIds: Set<string>,
- *  aiMasterpieces: Map<string, {
- *    status: 'idle' | 'generating' | 'ready' | 'error' | 'used',
- *    masterpiece: null | {
- *      galleryItemId: string,
- *      sourceId: string,
- *      style: string,
- *      styleLabel: string,
- *    },
- *    error: string,
- *    attempts: number,
- *    token: number,
- *  }>,
  * }} Room
  */
 
@@ -286,33 +259,16 @@ function totalGalleryDataUrlLength() {
   return total;
 }
 
-function hasGalleryStorageFor(
-  room,
-  imageDataUrl,
-  { masterpiece = false } = {},
-) {
-  return hasGalleryStorageForLength(room, imageDataUrl.length, {
-    masterpiece,
-  });
-}
-
-function hasGalleryStorageForLength(
-  room,
-  imageDataUrlLength,
-  { masterpiece = false } = {},
-) {
-  const limit = masterpiece
-    ? MAX_TOTAL_GALLERY_DATA_URL_LEN
-    : MAX_TOTAL_GALLERY_DATA_URL_LEN - MASTERPIECE_STORAGE_RESERVE;
+function hasGalleryStorageFor(room, imageDataUrl) {
   const evictedLength =
     room.gallery.length >= GALLERY_MAX
       ? room.gallery[0]?.imageDataUrl?.length || 0
       : 0;
   return (
     totalGalleryDataUrlLength() +
-      imageDataUrlLength -
+      imageDataUrl.length -
       evictedLength <=
-    limit
+    MAX_TOTAL_GALLERY_DATA_URL_LEN
   );
 }
 
@@ -413,94 +369,34 @@ function emitGallery(room, targetSocketId = null) {
 }
 
 function currentGameGallery(room) {
-  return room.gallery.filter(
-    (item) => item.gameSeq === room.gameSeq && !item.isMasterpiece,
-  );
+  return room.gallery.filter((item) => item.gameSeq === room.gameSeq);
 }
 
-function createMasterpieceState() {
+/** 授賞式の候補は「線が引かれている絵」だけ（白紙は選ばせない） */
+function awardCandidates(room) {
+  return currentGameGallery(room).filter((item) => item.hasDrawing);
+}
+
+function buildAiState(room) {
   return {
-    status: "idle",
-    masterpiece: null,
-    error: "",
-    attempts: 0,
-    token: 0,
-  };
-}
-
-function getMasterpieceState(room, playerId) {
-  let state = room.aiMasterpieces.get(playerId);
-  if (!state) {
-    state = createMasterpieceState();
-    room.aiMasterpieces.set(playerId, state);
-  }
-  return state;
-}
-
-function generatingMasterpieceEntry(room) {
-  for (const [playerId, state] of room.aiMasterpieces) {
-    if (state.status === "generating") {
-      return { playerId, state };
-    }
-  }
-  return null;
-}
-
-function buildAiState(room, playerId = "") {
-  const capabilities = publicAiCapabilities();
-  const currentItems = currentGameGallery(room);
-  const masterpieceState = playerId
-    ? getMasterpieceState(room, playerId)
-    : createMasterpieceState();
-  const generatingEntry = generatingMasterpieceEntry(room);
-  return {
-    ...capabilities,
+    ...publicAiCapabilities(),
     gameSeq: room.gameSeq,
-    currentGalleryCount: currentItems.length,
-    pendingCritiques: currentItems.filter(
-      (item) => item.aiCritiqueStatus === "pending",
-    ).length,
-    readyCritiques: currentItems.filter(
-      (item) => item.aiCritiqueStatus === "ready",
-    ).length,
+    currentGalleryCount: currentGameGallery(room).length,
+    awardCandidateCount: awardCandidates(room).length,
     awardsStatus: room.aiAwardsStatus,
     awards: room.aiAwards,
     awardsError: room.aiAwardsError,
     canRetryAwards: room.aiAwardsAttempts < 2,
-    masterpieceEligible: room.aiMasterpieceEligibleIds.has(playerId),
-    masterpieceStatus: masterpieceState.status,
-    masterpiece: masterpieceState.masterpiece,
-    masterpieceError: masterpieceState.error,
-    canRetryMasterpiece: masterpieceState.attempts < 2,
-    anyMasterpieceGenerating: Boolean(generatingEntry),
-    masterpieceGeneratingOwnerName: generatingEntry
-      ? room.players.get(generatingEntry.playerId)?.name || "ほかの参加者"
-      : "",
   };
 }
 
 function emitAiState(room, targetSocketId = null) {
+  const payload = buildAiState(room);
   if (targetSocketId) {
-    const playerId = socketPlayer.get(targetSocketId) || "";
-    io.to(targetSocketId).emit("aiStateUpdate", buildAiState(room, playerId));
+    io.to(targetSocketId).emit("aiStateUpdate", payload);
     return;
   }
-  for (const player of room.players.values()) {
-    if (!player.socketId) continue;
-    io.to(player.socketId).emit(
-      "aiStateUpdate",
-      buildAiState(room, player.id),
-    );
-  }
-}
-
-function emitGalleryItemAiUpdate(room, item) {
-  io.to(room.code).emit("galleryItemAiUpdate", {
-    id: item.id,
-    gameSeq: item.gameSeq,
-    aiCritiqueStatus: item.aiCritiqueStatus,
-    aiCritique: item.aiCritique || null,
-  });
+  io.to(room.code).emit("aiStateUpdate", payload);
 }
 
 function resetAiForNewGame(room) {
@@ -509,8 +405,6 @@ function resetAiForNewGame(room) {
   room.aiAwards = null;
   room.aiAwardsError = "";
   room.aiAwardsAttempts = 0;
-  room.aiMasterpieces = new Map();
-  room.aiMasterpieceEligibleIds = new Set();
 }
 
 function resetAwardsForExtension(room) {
@@ -526,16 +420,11 @@ function resetAiWhenReturningToLobby(room) {
   room.aiAwardsStatus = "idle";
   room.aiAwards = null;
   room.aiAwardsError = "";
-  room.aiMasterpieces = new Map();
-  room.aiMasterpieceEligibleIds = new Set();
 }
 
 function friendlyAiError(error, fallback) {
   const code = String(error?.code || "");
-  if (
-    code === "moderation_blocked" ||
-    code === "image_generation_user_error"
-  ) {
+  if (code === "moderation_blocked") {
     return "この絵はAIで処理できませんでした";
   }
   if (error?.status === 401 || error?.status === 403) {
@@ -560,7 +449,7 @@ function friendlyAiError(error, fallback) {
     String(error?.message || "").includes("moderation") ||
     String(error?.message || "").includes("refused")
   ) {
-    return "この絵は名画化できませんでした";
+    return "この絵はAIで処理できませんでした";
   }
   return fallback;
 }
@@ -732,6 +621,69 @@ function chooseRoundType(room, playerCount = activePlayers(room).length) {
   return eligible[Math.floor(Math.random() * eligible.length)];
 }
 
+/**
+ * しばりを引くかどうか決める。
+ * ふつうのラウンド専用（リレー・協力・うそつきには重ねない）。
+ */
+function chooseConstraint(room) {
+  const forced = process.env.FORCE_CONSTRAINT;
+  if (forced) {
+    if (forced === "none") return null;
+    if (forced === "random") return randomConstraint();
+    return findConstraint(forced);
+  }
+
+  if (room.roundsSinceConstraint < CONSTRAINT_MIN_GAP) return null;
+  const roll =
+    room.roundsSinceConstraint >= CONSTRAINT_FORCE_GAP
+      ? true
+      : Math.random() < CONSTRAINT_CHANCE;
+  if (!roll) return null;
+  return randomConstraint(new Set(room.recentConstraints));
+}
+
+function applyConstraint(room, roundType) {
+  const constraint = roundType === "normal" ? chooseConstraint(room) : null;
+  room.constraint = constraint;
+  if (!constraint) {
+    room.roundsSinceConstraint += 1;
+    return;
+  }
+  room.roundsSinceConstraint = 0;
+  room.recentConstraints.push(constraint.id);
+  if (room.recentConstraints.length > RECENT_CONSTRAINTS_MAX) {
+    room.recentConstraints = room.recentConstraints.slice(
+      -RECENT_CONSTRAINTS_MAX,
+    );
+  }
+}
+
+/**
+ * 本数しばりの残量チェック。使い切ったら、その線はまるごと捨てる
+ * （start だけ捨てると move がつながって変な線になるため）。
+ */
+function allowConstrainedStroke(room, playerId, type) {
+  const limit = room.constraint?.kind === "strokes" ? room.constraint.value : 0;
+  if (!limit) return true;
+
+  if (type === "start") {
+    const used = room.strokeCounts.get(playerId) || 0;
+    if (used >= limit) {
+      room.blockedDrawers.add(playerId);
+      return false;
+    }
+    room.strokeCounts.set(playerId, used + 1);
+    room.blockedDrawers.delete(playerId);
+    return true;
+  }
+
+  if (room.blockedDrawers.has(playerId)) {
+    if (type === "end") room.blockedDrawers.delete(playerId);
+    return false;
+  }
+  return true;
+}
+
 function canPlayerDraw(room, playerId) {
   if (room.phase !== "playing" || room.drawPhase !== "drawing") return false;
   if (room.roundType === "coop" || room.roundType === "liar") {
@@ -819,7 +771,13 @@ function buildRoundPayload(room, playerId) {
           ? Math.round(COOP_DURATION_MS / 1000)
           : room.roundType === "liar" && room.drawPhase === "drawing"
             ? Math.round(LIAR_DURATION_MS / 1000)
-            : null,
+            : room.constraint?.kind === "time" &&
+                room.drawPhase === "drawing"
+              ? room.constraint.value
+              : null,
+    // しばりは全員に見せる（見ている側が知らないと、ただ下手な人になってしまう）
+    constraint: room.constraint,
+    constraintStrokesUsed: room.strokeCounts.get(playerId) || 0,
     relayIndex:
       room.roundType === "relay" ? room.relayIndex : null,
     relayTotal:
@@ -845,8 +803,10 @@ function emitRoundStart(room, { clear = false, fanfare = false } = {}) {
   }
 
   if (fanfare) {
-    const message =
-      room.roundType === "relay"
+    const constraint = room.constraint;
+    const message = constraint
+      ? "🎲 しばりルーレット！"
+      : room.roundType === "relay"
         ? "⚡ リレー！"
         : room.roundType === "coop"
           ? "🤝 協力！"
@@ -859,9 +819,10 @@ function emitRoundStart(room, { clear = false, fanfare = false } = {}) {
           ? playerNames(room, room.drawerIds)
           : [];
       io.to(room.code).emit("roundFanfare", {
-        roundType: room.roundType,
+        roundType: constraint ? "constraint" : room.roundType,
         message,
         names,
+        constraint: constraint || null,
       });
     }
   }
@@ -939,14 +900,16 @@ function advanceRelay(room) {
   beginRelayTurn(room);
 }
 
-/** 協力・うそつき用: 一定時間で自動的にあてっこタイムへ */
+/** 協力・うそつき・時間しばり用: 一定時間で自動的にあてっこタイムへ */
 function scheduleTimedDrawing(room, ms) {
   clearTurnTimer(room);
   room.turnEndsAt = Date.now() + ms;
   room.turnTimer = setTimeout(() => {
     room.turnTimer = null;
     if (
-      (room.roundType === "coop" || room.roundType === "liar") &&
+      (room.roundType === "coop" ||
+        room.roundType === "liar" ||
+        room.constraint?.kind === "time") &&
       room.drawPhase === "drawing"
     ) {
       enterGuessing(room);
@@ -965,6 +928,9 @@ function resetRoundFields(room) {
   room.turnDurations = [];
   room.seenWordIds = new Set();
   room.strokes = [];
+  room.constraint = null;
+  room.strokeCounts = new Map();
+  room.blockedDrawers = new Set();
   room.liarId = null;
   room.liarName = "";
 }
@@ -986,9 +952,6 @@ function buildFinishedPayload(room) {
 
 function finishGame(room) {
   room.phase = "finished";
-  for (const playerId of room.players.keys()) {
-    room.aiMasterpieceEligibleIds.add(playerId);
-  }
   resetRoundFields(room);
   io.to(room.code).emit("clearCanvas");
   emitLobby(room);
@@ -1015,6 +978,7 @@ function startRound(room) {
   room.phase = "playing";
   room.roundType = roundType;
   room.word = pickWord(room);
+  applyConstraint(room, roundType);
 
   if (roundType === "relay") {
     room.lastWasSpecial = true;
@@ -1042,7 +1006,7 @@ function startRound(room) {
       room.relayIndex += 1;
     }
     if (room.relayIndex >= room.drawerIds.length) {
-      // fallback
+      // fallback（しばりなしのふつうのラウンドとして始め直す）
       room.roundType = "normal";
       room.lastWasSpecial = false;
       const drawer = pickDrawer(room);
@@ -1113,7 +1077,10 @@ function startRound(room) {
   room.drawerIds = [drawer.id];
   room.seenWordIds = new Set([drawer.id]);
   room.drawPhase = "drawing";
-  emitRoundStart(room, { clear: true, fanfare: false });
+  if (room.constraint?.kind === "time") {
+    scheduleTimedDrawing(room, room.constraint.value * 1000);
+  }
+  emitRoundStart(room, { clear: true, fanfare: Boolean(room.constraint) });
 }
 
 function syncPlayerState(socket, room, playerId) {
@@ -1182,8 +1149,7 @@ function removePlayer(room, playerId) {
   if (
     room.phase === "finished" &&
     room.players.size === 1 &&
-    (room.aiAwardsStatus === "generating" ||
-      generatingMasterpieceEntry(room))
+    room.aiAwardsStatus === "generating"
   ) {
     emitLobby(room);
     emitAiState(room);
@@ -1325,19 +1291,6 @@ function reconcileRemovedGalleryItems(
       }
     }
   }
-
-  for (const state of room.aiMasterpieces.values()) {
-    if (
-      state.masterpiece?.galleryItemId &&
-      idSet.has(state.masterpiece.galleryItemId)
-    ) {
-      state.status = "used";
-      state.masterpiece = null;
-      state.error = automatic
-        ? "保存上限のため、古い名画がギャラリーから整理されました"
-        : "作成した名画はギャラリーから削除されました";
-    }
-  }
 }
 
 function trimGallery(room) {
@@ -1352,69 +1305,6 @@ function trimGallery(room) {
   return [];
 }
 
-function queueDrawingCritique(room, item, safetyIdentifier) {
-  if (!isAiConfigured() || item.aiCritiqueStatus !== "pending") return;
-
-  const roomCode = room.code;
-  const itemId = item.id;
-  const gameSeq = item.gameSeq;
-  const isCurrent = () => {
-    const currentRoom = rooms.get(roomCode);
-    const currentItem = currentRoom?.gallery.find(
-      (galleryItem) =>
-        galleryItem.id === itemId && galleryItem.gameSeq === gameSeq,
-    );
-    return (
-      currentRoom === room &&
-      currentRoom.gameSeq === gameSeq &&
-      currentItem?.aiCritiqueStatus === "pending"
-    );
-  };
-
-  void (async () => {
-    const queuedRoom = rooms.get(roomCode);
-    const queuedItem = queuedRoom?.gallery.find(
-      (galleryItem) =>
-        galleryItem.id === itemId && galleryItem.gameSeq === gameSeq,
-    );
-    if (!queuedRoom || queuedRoom !== room || !queuedItem) return;
-
-    try {
-      const critique = await critiqueDrawing({
-        imageDataUrl: queuedItem.imageDataUrl,
-        word: queuedItem.word,
-        roundType: queuedItem.roundType,
-        safetyIdentifier,
-        isCurrent,
-      });
-      const currentRoom = rooms.get(roomCode);
-      const currentItem = currentRoom?.gallery.find(
-        (galleryItem) =>
-          galleryItem.id === itemId && galleryItem.gameSeq === gameSeq,
-      );
-      if (!currentRoom || currentRoom !== room || !currentItem) return;
-
-      currentItem.aiCritiqueStatus = "ready";
-      currentItem.aiCritique = critique;
-      emitGalleryItemAiUpdate(currentRoom, currentItem);
-      emitAiState(currentRoom);
-    } catch (error) {
-      if (!String(error?.message || "").includes("cancelled")) {
-        logAiFailure("critique", error);
-      }
-      const currentRoom = rooms.get(roomCode);
-      const currentItem = currentRoom?.gallery.find(
-        (galleryItem) =>
-          galleryItem.id === itemId && galleryItem.gameSeq === gameSeq,
-      );
-      if (!currentRoom || currentRoom !== room || !currentItem) return;
-      currentItem.aiCritiqueStatus = "error";
-      emitGalleryItemAiUpdate(currentRoom, currentItem);
-      emitAiState(currentRoom);
-    }
-  })();
-}
-
 function addGalleryItem(
   room,
   {
@@ -1422,7 +1312,8 @@ function addGalleryItem(
     word,
     drawerNames,
     roundType,
-    allowAiCritique = () => false,
+    constraintLabel = "",
+    hasDrawing = false,
   },
 ) {
   if (
@@ -1434,10 +1325,6 @@ function addGalleryItem(
     return null;
   }
 
-  const aiCritiqueAllowed =
-    isAiConfigured() &&
-    typeof allowAiCritique === "function" &&
-    allowAiCritique();
   const item = {
     id: randomUUID(),
     imageDataUrl,
@@ -1446,9 +1333,10 @@ function addGalleryItem(
       ? drawerNames.map((n) => String(n).slice(0, 12)).slice(0, 8)
       : [],
     roundType: roundType || "normal",
+    constraintLabel: String(constraintLabel || "").slice(0, 24),
     createdAt: Date.now(),
     gameSeq: room.gameSeq,
-    aiCritiqueStatus: aiCritiqueAllowed ? "pending" : "off",
+    hasDrawing: Boolean(hasDrawing),
   };
   room.gallery.push(item);
   trimGallery(room);
@@ -1477,6 +1365,12 @@ function createEmptyRoom(code, hostId) {
     seenWordIds: new Set(),
     roundsSinceSpecial: 0,
     lastWasSpecial: false,
+    constraint: null,
+    strokeCounts: new Map(),
+    blockedDrawers: new Set(),
+    roundsSinceConstraint: 0,
+    recentConstraints: [],
+    lastReplayAt: 0,
     gallery: [],
     strokes: [],
     recentWords: [],
@@ -1493,8 +1387,6 @@ function createEmptyRoom(code, hostId) {
     aiAwardsError: "",
     aiAwardsAttempts: 0,
     aiAwardsToken: 0,
-    aiMasterpieceEligibleIds: new Set(),
-    aiMasterpieces: new Map(),
   };
 }
 
@@ -1693,6 +1585,8 @@ io.on("connection", (socket) => {
     room.drawerStreak = null;
     room.roundsSinceSpecial = 0;
     room.lastWasSpecial = false;
+    // 最初の2問はしばりなし（先にゲームそのものに慣れてもらう）
+    room.roundsSinceConstraint = 0;
     room.gameSeq += 1;
     resetAiForNewGame(room);
     room.totalRounds = chooseTotalRounds(activeCount);
@@ -1723,8 +1617,14 @@ io.on("connection", (socket) => {
       event.y = y;
       event.color =
         typeof data.color === "string" ? data.color.slice(0, 24) : "#1a1a1a";
-      event.width = Math.min(40, Math.max(1, safeNumber(data.width) || 4));
+      event.width =
+        room.constraint?.kind === "pen"
+          ? room.constraint.value
+          : Math.min(40, Math.max(1, safeNumber(data.width) || 4));
     }
+
+    // 本数しばりを使い切っていたら、ここで捨てる
+    if (!allowConstrainedStroke(room, playerId, type)) return;
 
     room.strokes.push(event);
     if (room.strokes.length > MAX_STROKES) {
@@ -1741,6 +1641,23 @@ io.on("connection", (socket) => {
 
   onSocket(socket, "timeSync", (cb) => {
     reply(cb, { now: Date.now() });
+  });
+
+  // 爆笑リプレイ: 線そのものは各端末が持っているので、合図だけ配る
+  onSocket(socket, "broadcastReplay", (cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { code, room } = ctx;
+    if (room.phase !== "playing") {
+      return reply(cb, { ok: false, error: "いまはリプレイできません" });
+    }
+    const now = Date.now();
+    if (now - room.lastReplayAt < REPLAY_COOLDOWN_MS) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    room.lastReplayAt = now;
+    io.to(code).emit("replayStart");
+    reply(cb, { ok: true });
   });
 
   onSocket(socket, "revealLiar", (cb) => {
@@ -1801,22 +1718,22 @@ io.on("connection", (socket) => {
     const drawerNames = playerNames(room, room.drawerIds);
     const word = room.word;
     const roundType = room.roundType;
-    const shouldCritiqueDrawing = hasVisibleDrawing(room.strokes);
+    const constraint = room.constraint;
+    const constraintLabel = constraint
+      ? `${constraint.emoji} ${constraint.label}`
+      : "";
+    // 白紙は授賞式の候補から外す
+    const drawn = hasVisibleDrawing(room.strokes);
 
-    let galleryItem = null;
-    let critiqueSafetyIdentifier = "";
     if (imageDataUrl) {
-      galleryItem = addGalleryItem(room, {
+      addGalleryItem(room, {
         imageDataUrl,
         word,
         drawerNames,
         roundType,
-        allowAiCritique: () =>
-          shouldCritiqueDrawing && consumeAiQuota(socket, "critique"),
+        constraintLabel,
+        hasDrawing: drawn,
       });
-      if (galleryItem?.aiCritiqueStatus === "pending") {
-        critiqueSafetyIdentifier = aiSafetyIdentifier(playerId);
-      }
     }
 
     recordDrawers(
@@ -1827,17 +1744,11 @@ io.on("connection", (socket) => {
     room.completedRounds += 1;
     if (room.completedRounds >= room.totalRounds) {
       finishGame(room);
-      if (galleryItem) {
-        queueDrawingCritique(room, galleryItem, critiqueSafetyIdentifier);
-      }
       reply(cb, { ok: true, finished: true });
       return;
     }
 
     startRound(room);
-    if (galleryItem) {
-      queueDrawingCritique(room, galleryItem, critiqueSafetyIdentifier);
-    }
     reply(cb, { ok: true });
   });
 
@@ -1858,12 +1769,6 @@ io.on("connection", (socket) => {
       return reply(cb, {
         ok: false,
         error: "AI授賞式が完成してから延長できます",
-      });
-    }
-    if (generatingMasterpieceEntry(room)) {
-      return reply(cb, {
-        ok: false,
-        error: "AI名画が完成してから延長できます",
       });
     }
 
@@ -1889,12 +1794,6 @@ io.on("connection", (socket) => {
       return reply(cb, {
         ok: false,
         error: "AI授賞式が完成してからロビーへ戻れます",
-      });
-    }
-    if (generatingMasterpieceEntry(room)) {
-      return reply(cb, {
-        ok: false,
-        error: "AI名画が完成してからロビーへ戻れます",
       });
     }
     clearTurnTimer(room);
@@ -1937,35 +1836,15 @@ io.on("connection", (socket) => {
       });
     }
 
-    const items = currentGameGallery(room);
-    if (items.length < 2) {
-      return reply(cb, { ok: false, error: "授賞式には絵が2枚以上必要です" });
-    }
-    const pendingCount = items.filter(
-      (item) => item.aiCritiqueStatus === "pending",
-    ).length;
-    if (pendingCount > 0) {
-      return reply(cb, {
-        ok: false,
-        error: `AI画伯があと${pendingCount}枚を鑑賞中です`,
-      });
-    }
-    const candidates = items
-      .filter(
-        (item) =>
-          item.aiCritiqueStatus === "ready" && Boolean(item.aiCritique),
-      )
-      .map((item) => ({
-        id: item.id,
-        word: item.word,
-        roundType: item.roundType,
-        aiCritique: item.aiCritique,
-      }));
+    const candidates = awardCandidates(room).map((item) => ({
+      id: item.id,
+      word: item.word,
+      roundType: item.roundType,
+      constraintLabel: item.constraintLabel,
+      imageDataUrl: item.imageDataUrl,
+    }));
     if (candidates.length < 2) {
-      return reply(cb, {
-        ok: false,
-        error: "講評できた作品が2枚以上あると授賞式を開けます",
-      });
+      return reply(cb, { ok: false, error: "授賞式には絵が2枚以上必要です" });
     }
     if (!consumeAiQuota(socket, "awards")) {
       return reply(cb, {
@@ -2045,240 +1924,12 @@ io.on("connection", (socket) => {
       });
   });
 
-  onSocket(socket, "stylizeGalleryItem", (data, cb) => {
-    const ctx = getContext(socket);
-    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
-    const { room, playerId, player } = ctx;
-    if (!isAiConfigured()) {
-      return reply(cb, { ok: false, error: "AI画伯はまだ準備中です" });
-    }
-    if (room.phase !== "finished") {
-      return reply(cb, { ok: false, error: "ゲーム終了後に名画化できます" });
-    }
-    if (!room.aiMasterpieceEligibleIds.has(playerId)) {
-      return reply(cb, {
-        ok: false,
-        error: "このゲームに参加した人だけ名画化できます",
-      });
-    }
-    const masterpieceState = getMasterpieceState(room, playerId);
-    if (
-      masterpieceState.status === "ready" ||
-      masterpieceState.status === "used"
-    ) {
-      return reply(cb, {
-        ok: false,
-        error: "名画化は一人につき1ゲーム1枚です",
-      });
-    }
-    if (masterpieceState.status === "generating") {
-      return reply(cb, { ok: true, generating: true });
-    }
-    const generatingEntry = generatingMasterpieceEntry(room);
-    if (generatingEntry) {
-      return reply(cb, {
-        ok: false,
-        code: "MASTERPIECE_BUSY",
-        error: `${
-          room.players.get(generatingEntry.playerId)?.name || "ほかの参加者"
-        }さんの名画を制作中です。完成後に試してください`,
-      });
-    }
-    if (masterpieceState.attempts >= 2) {
-      return reply(cb, {
-        ok: false,
-        error: "あなたの名画化はこれ以上やり直せません",
-      });
-    }
-
-    const sourceId = safeString(data?.id);
-    const style = safeString(data?.style);
-    const styleInfo = publicAiCapabilities().styles.find(
-      (candidate) => candidate.id === style,
-    );
-    const source = room.gallery.find(
-      (item) =>
-        item.id === sourceId &&
-        item.gameSeq === room.gameSeq &&
-        !item.isMasterpiece,
-    );
-    if (!source) {
-      return reply(cb, { ok: false, error: "元の絵が見つかりません" });
-    }
-    if (!styleInfo) {
-      return reply(cb, { ok: false, error: "名画のスタイルを選んでください" });
-    }
-    if (
-      !hasGalleryStorageForLength(
-        room,
-        MAX_MASTERPIECE_DATA_URL_LENGTH,
-        { masterpiece: true },
-      )
-    ) {
-      return reply(cb, {
-        ok: false,
-        error: "ギャラリーの保存容量がいっぱいです",
-      });
-    }
-    if (!consumeAiQuota(socket, "masterpiece")) {
-      return reply(cb, {
-        ok: false,
-        error: "名画化の利用上限です。時間をおいて試してください",
-      });
-    }
-
-    const gameSeq = room.gameSeq;
-    const token = masterpieceState.token + 1;
-    const ownerName = player.name;
-    const sourceSnapshot = {
-      id: source.id,
-      imageDataUrl: source.imageDataUrl,
-      word: source.word,
-      drawerNames: [...source.drawerNames],
-      roundType: source.roundType,
-    };
-    masterpieceState.token = token;
-    masterpieceState.status = "generating";
-    masterpieceState.masterpiece = {
-      galleryItemId: "",
-      sourceId,
-      style,
-      styleLabel: styleInfo.label,
-    };
-    masterpieceState.error = "";
-    masterpieceState.attempts += 1;
-    emitAiState(room);
-    reply(cb, { ok: true, generating: true });
-
-    const isCurrent = () => {
-      const currentRoom = rooms.get(room.code);
-      return (
-        currentRoom === room &&
-        currentRoom.gameSeq === gameSeq &&
-        currentRoom.aiMasterpieces.get(playerId) === masterpieceState &&
-        masterpieceState.token === token &&
-        masterpieceState.status === "generating" &&
-        currentRoom.phase === "finished" &&
-        currentRoom.gallery.some(
-          (item) =>
-            item.id === sourceId &&
-            item.gameSeq === gameSeq &&
-            !item.isMasterpiece,
-        )
-      );
-    };
-
-    void stylizeDrawing({
-      imageDataUrl: sourceSnapshot.imageDataUrl,
-      word: sourceSnapshot.word,
-      style,
-      isCurrent,
-    })
-      .then((imageDataUrl) => {
-        const currentRoom = rooms.get(room.code);
-        if (
-          !currentRoom ||
-          currentRoom !== room ||
-          currentRoom.gameSeq !== gameSeq ||
-          currentRoom.aiMasterpieces.get(playerId) !== masterpieceState ||
-          masterpieceState.token !== token ||
-          currentRoom.phase !== "finished"
-        ) {
-          return;
-        }
-        const currentSource = currentRoom.gallery.find(
-          (item) =>
-            item.id === sourceId &&
-            item.gameSeq === gameSeq &&
-            !item.isMasterpiece,
-        );
-        if (!currentSource) {
-          throw new Error("Masterpiece source drawing was removed");
-        }
-        if (
-          !hasGalleryStorageFor(room, imageDataUrl, { masterpiece: true })
-        ) {
-          throw new Error("Gallery storage is full");
-        }
-
-        const masterpieceItem = {
-          id: randomUUID(),
-          imageDataUrl,
-          word: sourceSnapshot.word,
-          drawerNames: sourceSnapshot.drawerNames,
-          roundType: sourceSnapshot.roundType,
-          createdAt: Date.now(),
-          gameSeq,
-          isMasterpiece: true,
-          sourceId,
-          style,
-          styleLabel: styleInfo.label,
-          masterpieceOwnerId: playerId,
-          masterpieceOwnerName: ownerName,
-          aiCritiqueStatus: "off",
-        };
-        currentRoom.gallery.push(masterpieceItem);
-        const removedIds = trimGallery(currentRoom);
-        masterpieceState.status = "ready";
-        masterpieceState.masterpiece = {
-          galleryItemId: masterpieceItem.id,
-          sourceId,
-          style,
-          styleLabel: styleInfo.label,
-        };
-        masterpieceState.error = "";
-        io.to(currentRoom.code).emit("galleryItemAdded", {
-          item: masterpieceItem,
-          removedIds,
-        });
-        emitAiState(currentRoom);
-        io.to(currentRoom.code).emit("aiMasterpieceReady", {
-          gameSeq,
-          galleryItemId: masterpieceItem.id,
-          styleLabel: styleInfo.label,
-          playerId,
-          playerName: ownerName,
-        });
-      })
-      .catch((error) => {
-        logAiFailure("masterpiece", error);
-        const currentRoom = rooms.get(room.code);
-        if (
-          !currentRoom ||
-          currentRoom !== room ||
-          currentRoom.gameSeq !== gameSeq ||
-          currentRoom.aiMasterpieces.get(playerId) !== masterpieceState ||
-          masterpieceState.token !== token
-        ) {
-          return;
-        }
-        const message = String(error?.message || "");
-        const mayHaveReachedProvider =
-          error?.status == null &&
-          !message.includes("queue") &&
-          !message.includes("cancelled");
-        masterpieceState.status = mayHaveReachedProvider ? "used" : "error";
-        masterpieceState.masterpiece = null;
-        const friendlyError = friendlyAiError(
-          error,
-          "名画化できませんでした。もう一度試してください",
-        );
-        masterpieceState.error = mayHaveReachedProvider
-          ? `${friendlyError}。重複生成を避けるため、このゲームでは再試行しません`
-          : friendlyError;
-        emitAiState(currentRoom);
-      });
-  });
-
   onSocket(socket, "deleteGalleryItems", (data, cb) => {
     const { ids } = data || {};
     const ctx = getContext(socket);
     if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
-    const { room, playerId } = ctx;
-    if (
-      room.aiAwardsStatus === "generating" ||
-      generatingMasterpieceEntry(room)
-    ) {
+    const { room } = ctx;
+    if (room.aiAwardsStatus === "generating") {
       return reply(cb, {
         ok: false,
         error: "AI画伯が作業中です。完成してから削除してください",
@@ -2289,20 +1940,6 @@ io.on("connection", (socket) => {
     );
     if (idSet.size === 0) {
       return reply(cb, { ok: false, error: "削除する絵がありません" });
-    }
-    const protectedMasterpiece = room.gallery.find(
-      (item) =>
-        idSet.has(item.id) &&
-        item.isMasterpiece &&
-        item.masterpieceOwnerId &&
-        item.masterpieceOwnerId !== playerId &&
-        room.hostId !== playerId,
-    );
-    if (protectedMasterpiece) {
-      return reply(cb, {
-        ok: false,
-        error: "ほかの人が作った名画は、本人かホストだけが削除できます",
-      });
     }
     room.gallery = room.gallery.filter((g) => !idSet.has(g.id));
     reconcileRemovedGalleryItems(room, idSet);
@@ -2318,10 +1955,7 @@ io.on("connection", (socket) => {
     if (room.hostId !== playerId) {
       return reply(cb, { ok: false, error: "ホストだけが全部消せます" });
     }
-    if (
-      room.aiAwardsStatus === "generating" ||
-      generatingMasterpieceEntry(room)
-    ) {
+    if (room.aiAwardsStatus === "generating") {
       return reply(cb, {
         ok: false,
         error: "AI画伯が作業中です。完成してから削除してください",
@@ -2332,14 +1966,6 @@ io.on("connection", (socket) => {
     room.aiAwardsStatus = "idle";
     room.aiAwards = null;
     room.aiAwardsError = "";
-    for (const state of room.aiMasterpieces.values()) {
-      if (state.status !== "idle") {
-        state.token += 1;
-        state.status = "used";
-        state.masterpiece = null;
-        state.error = "ギャラリーが空になったため名画化は終了しました";
-      }
-    }
     emitGallery(room);
     emitAiState(room);
     reply(cb, { ok: true });

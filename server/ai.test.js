@@ -1,12 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  critiqueDrawing,
+  createAwards,
   extractResponseText,
   normalizeAwards,
   parseImageDataUrl,
   publicAiCapabilities,
-  stylizeDrawing,
 } from "./ai.js";
 
 function dataUrl(mimeType, bytes) {
@@ -104,13 +103,10 @@ test("normalizeAwards keeps only unique known gallery IDs", () => {
   );
 });
 
-test("OpenAI requests stay server-side and use strict structured output", async () => {
+test("createAwards sends the drawings themselves and stays server-side", async () => {
   const originalFetch = globalThis.fetch;
   const originalKey = process.env.OPENAI_API_KEY;
   const requests = [];
-  const longComment =
-    "元気な丸が画面いっぱいに踊り、足の勢いに対して顔だけが冷静です。\n" +
-    "少ない線なのに今にも走り出しそうな雰囲気があります。";
   process.env.OPENAI_API_KEY = "test-key-never-send-to-client";
   globalThis.fetch = async (url, options) => {
     requests.push({ url, options });
@@ -124,10 +120,11 @@ test("OpenAI requests stay server-side and use strict structured output", async 
               {
                 type: "output_text",
                 text: JSON.stringify({
-                  title: "まるの魔術師",
-                  comment: longComment,
-                  strength: "勢いのある丸い線",
-                  awardSeed: "まるが踊るで賞",
+                  intro: "第1回おえかき大賞、開幕！",
+                  awards: [
+                    { galleryItemId: "a", title: "線の魔術賞", reason: "線が楽しい" },
+                    { galleryItemId: "b", title: "余白名人賞", reason: "構図が愉快" },
+                  ],
                 }),
               },
             ],
@@ -139,29 +136,47 @@ test("OpenAI requests stay server-side and use strict structured output", async 
   };
 
   try {
-    const critique = await critiqueDrawing({
-      imageDataUrl: tinyJpeg,
-      word: "りんご",
-      roundType: "normal",
-      safetyIdentifier: "safe-test-user",
-    });
-    assert.equal(critique.title, "まるの魔術師");
-    assert.equal(critique.comment.length, 40);
-    assert.equal(critique.comment.includes("\n"), false);
+    const awards = await createAwards(
+      [
+        {
+          id: "a",
+          word: "りんご",
+          roundType: "normal",
+          constraintLabel: "🖐️ 5本しばり",
+          imageDataUrl: tinyJpeg,
+        },
+        { id: "b", word: "ねこ", roundType: "coop", imageDataUrl: tinyPng },
+        // 画像として読めないものは候補に入れない
+        { id: "c", word: "いぬ", roundType: "normal", imageDataUrl: "nope" },
+      ],
+      { safetyIdentifier: "safe-test-user" },
+    );
+    assert.equal(awards.awards.length, 2);
     assert.equal(requests.length, 1);
     assert.equal(
       requests[0].options.headers.Authorization,
       "Bearer test-key-never-send-to-client",
     );
+
     const body = JSON.parse(requests[0].options.body);
     assert.equal(body.store, false);
-    assert.equal(body.reasoning.effort, "none");
-    assert.equal(body.text.verbosity, "low");
-    assert.equal(body.safety_identifier, "safe-test-user");
     assert.equal(body.text.format.type, "json_schema");
     assert.equal(body.text.format.strict, true);
-    assert.equal(body.input[0].content[1].detail, "low");
-    assert.match(body.instructions, /40字以内/);
+    assert.equal(body.safety_identifier, "safe-test-user");
+
+    const content = body.input[0].content;
+    const images = content.filter((part) => part.type === "input_image");
+    assert.equal(images.length, 2);
+    assert.equal(images[0].image_url, tinyJpeg);
+    assert.equal(images.every((part) => part.detail === "low"), true);
+    assert.equal(
+      content.some((part) => part.text?.includes("🖐️ 5本しばり")),
+      true,
+    );
+    assert.equal(
+      JSON.stringify(content).includes("nope"),
+      false,
+    );
     assert.equal(
       JSON.stringify(publicAiCapabilities()).includes(
         "test-key-never-send-to-client",
@@ -175,45 +190,9 @@ test("OpenAI requests stay server-side and use strict structured output", async 
   }
 });
 
-test("stylizeDrawing validates styles and requests compressed WebP", async () => {
+test("createAwards needs at least two usable drawings", async () => {
   await assert.rejects(
-    stylizeDrawing({
-      imageDataUrl: tinyJpeg,
-      word: "りんご",
-      style: "arbitrary-user-prompt",
-    }),
-    /Invalid masterpiece style/,
+    createAwards([{ id: "a", word: "りんご", imageDataUrl: tinyJpeg }]),
+    /Not enough drawings/,
   );
-
-  const originalFetch = globalThis.fetch;
-  const originalKey = process.env.OPENAI_API_KEY;
-  let form;
-  process.env.OPENAI_API_KEY = "test-key";
-  globalThis.fetch = async (_url, options) => {
-    form = options.body;
-    return new Response(
-      JSON.stringify({
-        data: [{ b64_json: tinyWebp.split(",")[1] }],
-      }),
-      { status: 200 },
-    );
-  };
-
-  try {
-    const result = await stylizeDrawing({
-      imageDataUrl: tinyJpeg,
-      word: "りんご",
-      style: "storybook",
-    });
-    assert.equal(result, tinyWebp);
-    assert.equal(form.get("size"), "816x816");
-    assert.equal(form.get("quality"), "low");
-    assert.equal(form.get("output_format"), "webp");
-    assert.equal(form.get("output_compression"), "60");
-    assert.match(form.get("prompt"), /Do not add captions/);
-  } finally {
-    globalThis.fetch = originalFetch;
-    if (originalKey === undefined) delete process.env.OPENAI_API_KEY;
-    else process.env.OPENAI_API_KEY = originalKey;
-  }
 });
