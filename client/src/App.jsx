@@ -17,10 +17,13 @@ const EMPTY_AI_STATE = {
   awards: null,
   awardsError: "",
   canRetryAwards: true,
+  masterpieceEligible: false,
   masterpieceStatus: "idle",
   masterpiece: null,
   masterpieceError: "",
   canRetryMasterpiece: true,
+  anyMasterpieceGenerating: false,
+  masterpieceGeneratingOwnerName: "",
 };
 
 function createSocket() {
@@ -140,6 +143,7 @@ export default function App() {
   const canvasApiRef = useRef(null);
   const styleDialogRef = useRef(null);
   const stylizeReturnFocusRef = useRef(null);
+  const playerIdRef = useRef("");
   /** サーバー時刻 - 端末時刻（タイマー表示のずれ補正用） */
   const serverOffsetRef = useRef(0);
   const [initialInviteCode] = useState(readInviteRoomCode);
@@ -195,8 +199,11 @@ export default function App() {
   const [stylizeTargetId, setStylizeTargetId] = useState("");
 
   const isHost = playerId && playerId === hostId;
-  const isMasterpieceGenerating =
+  const isOwnMasterpieceGenerating =
     aiState.masterpieceStatus === "generating";
+  const isAiFinishBusy =
+    aiState.anyMasterpieceGenerating ||
+    aiState.awardsStatus === "generating";
   const modeClass = `mode-${roundType || "normal"}`;
   const inviteUrl = useMemo(() => buildInviteUrl(roomCode), [roomCode]);
   const stylizeTarget = useMemo(
@@ -288,6 +295,10 @@ export default function App() {
     setReturnScreen("finished");
     setScreen((prev) => (prev === "gallery" ? "gallery" : "finished"));
   }
+
+  useEffect(() => {
+    playerIdRef.current = playerId;
+  }, [playerId]);
 
   useEffect(() => {
     if (!toast) return;
@@ -515,6 +526,21 @@ export default function App() {
       setGallery(data.gallery || []);
     });
 
+    socket.on("galleryItemAdded", (data) => {
+      const item = data?.item;
+      if (!item?.id) return;
+      const removedIds = new Set(
+        Array.isArray(data?.removedIds) ? data.removedIds : []
+      );
+      setGallery((items) => {
+        const remaining = items.filter(
+          (current) =>
+            current.id !== item.id && !removedIds.has(current.id)
+        );
+        return [...remaining, item];
+      });
+    });
+
     socket.on("galleryItemAiUpdate", (data) => {
       if (!data?.id) return;
       setGallery((items) =>
@@ -537,7 +563,7 @@ export default function App() {
         styles: Array.isArray(data?.styles) ? data.styles : [],
       });
       if (data?.masterpieceStatus === "ready") {
-        closeStylizeDialog();
+        closeStylizeDialog({ restoreFocus: false });
       }
     });
 
@@ -551,8 +577,14 @@ export default function App() {
     });
 
     socket.on("aiMasterpieceReady", (data) => {
-      closeStylizeDialog();
-      setToast(`✨ ${data?.styleLabel || "名画"}が完成しました！`);
+      if (data?.playerId === playerIdRef.current) {
+        closeStylizeDialog({ restoreFocus: false });
+        setToast(`✨ あなたの${data?.styleLabel || "名画"}が完成しました！`);
+      } else {
+        setToast(
+          `✨ ${data?.playerName || "参加者"}さんの名画が完成しました！`
+        );
+      }
     });
 
     socket.on("strokeHistory", (data) => {
@@ -804,7 +836,14 @@ export default function App() {
   }
 
   function requestMasterpiece(style) {
-    if (!stylizeTarget || aiState.masterpieceStatus === "generating") return;
+    if (
+      !stylizeTarget ||
+      !aiState.masterpieceEligible ||
+      aiState.anyMasterpieceGenerating ||
+      aiState.masterpieceStatus === "generating"
+    ) {
+      return;
+    }
     setError("");
     socketRef.current?.emit(
       "stylizeGalleryItem",
@@ -814,7 +853,7 @@ export default function App() {
           setError(res?.error || "名画化できません");
           return;
         }
-        closeStylizeDialog();
+        closeStylizeDialog({ restoreFocus: false });
         setToast("✨ AI画伯が名画を制作中です。少し待ってね");
       }
     );
@@ -1295,6 +1334,8 @@ export default function App() {
             role="dialog"
             aria-modal="true"
             aria-labelledby="ai-style-title"
+            aria-describedby="ai-style-description"
+            aria-busy={aiState.anyMasterpieceGenerating}
           >
             <div className="ai-dialog-head">
               <div>
@@ -1315,9 +1356,17 @@ export default function App() {
               src={stylizeTarget.imageDataUrl}
               alt={`名画化する「${stylizeTarget.word || "絵"}」`}
             />
-            <p className="hint">
-              元の楽しい線を残したまま変身します。名画化は1ゲームに1枚です。
+            <p className="hint" id="ai-style-description">
+              元の楽しい線を残したまま変身します。名画化は一人につき、1ゲーム1枚です。
             </p>
+            {aiState.anyMasterpieceGenerating &&
+              !isOwnMasterpieceGenerating && (
+                <p className="ai-dialog-busy" role="status">
+                  {aiState.masterpieceGeneratingOwnerName
+                    ? `${aiState.masterpieceGeneratingOwnerName}さんの名画を制作中です。完成後に選べます`
+                    : "ほかの参加者の名画を制作中です。完成後に選べます"}
+                </p>
+              )}
             <div className="ai-style-options">
               {(aiState.styles || []).map((style, index) => (
                 <button
@@ -1325,6 +1374,7 @@ export default function App() {
                   type="button"
                   className="ai-style-option"
                   onClick={() => requestMasterpiece(style.id)}
+                  disabled={aiState.anyMasterpieceGenerating}
                   autoFocus={index === 0}
                 >
                   <span aria-hidden="true">{style.emoji}</span>
@@ -1576,6 +1626,8 @@ export default function App() {
                               <img
                                 src={item.imageDataUrl}
                                 alt={item.word || "受賞作品"}
+                                loading="lazy"
+                                decoding="async"
                               />
                             )}
                             <div>
@@ -1594,7 +1646,7 @@ export default function App() {
                       })}
                     </ol>
                     <p className="hint">
-                      ギャラリーから、お気に入りの1枚をAI名画にもできます
+                      参加者それぞれが、ギャラリーから1枚をAI名画にできます
                     </p>
                   </>
                 )}
@@ -1649,9 +1701,13 @@ export default function App() {
             </section>
           )}
 
-          {isMasterpieceGenerating && (
+          {isAiFinishBusy && (
             <p className="finish-wait" role="status">
-              AI名画を制作中です。完成すると延長・ロビーへ戻る操作ができます
+              {aiState.awardsStatus === "generating"
+                ? "AI授賞式を準備中です。完成すると延長・ロビーへ戻る操作ができます"
+                : aiState.masterpieceGeneratingOwnerName
+                  ? `${aiState.masterpieceGeneratingOwnerName}さんのAI名画を制作中です。完成すると延長・ロビーへ戻る操作ができます`
+                  : "AI名画を制作中です。完成すると延長・ロビーへ戻る操作ができます"}
             </p>
           )}
 
@@ -1661,7 +1717,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={extendGame}
-                  disabled={finishBusy || isMasterpieceGenerating}
+                  disabled={finishBusy || isAiFinishBusy}
                 >
                   あと{extensionRounds}問だけ延長！
                 </button>
@@ -1669,7 +1725,7 @@ export default function App() {
                   type="button"
                   className="secondary"
                   onClick={endGame}
-                  disabled={finishBusy || isMasterpieceGenerating}
+                  disabled={finishBusy || isAiFinishBusy}
                 >
                   ロビーへ戻る
                 </button>
@@ -1724,13 +1780,28 @@ export default function App() {
           </p>
 
           {aiState.enabled &&
-            aiState.masterpieceStatus === "generating" && (
+            returnScreen === "finished" &&
+            aiState.masterpieceEligible &&
+            !aiState.anyMasterpieceGenerating &&
+            (aiState.masterpieceStatus === "idle" ||
+              (aiState.masterpieceStatus === "error" &&
+                aiState.canRetryMasterpiece)) && (
+              <p className="ai-masterpiece-available" role="status">
+                ✨ あなたはこのゲームで、あと1枚を名画化できます
+              </p>
+            )}
+
+          {aiState.enabled && aiState.anyMasterpieceGenerating && (
               <section className="ai-masterpiece ai-masterpiece-busy">
                 <div className="ai-busy" role="status">
                   <span className="ai-busy-icon" aria-hidden="true">
                     🖌️
                   </span>
-                  AI画伯が名画を制作中…完成まで少しかかります
+                  {isOwnMasterpieceGenerating
+                    ? "あなたの名画を制作中…完成まで少しかかります"
+                    : aiState.masterpieceGeneratingOwnerName
+                      ? `${aiState.masterpieceGeneratingOwnerName}さんの名画を制作中…完成後にあなたも作れます`
+                      : "ほかの参加者の名画を制作中…完成後にあなたも作れます"}
                 </div>
               </section>
             )}
@@ -1750,6 +1821,8 @@ export default function App() {
                 <img
                   src={masterpieceItem.imageDataUrl}
                   alt={`${masterpieceItem.word || "絵"}のAI名画`}
+                  loading="lazy"
+                  decoding="async"
                 />
                 <button
                   type="button"
@@ -1838,10 +1911,25 @@ export default function App() {
                     </span>
                   )}
                   <div className="gallery-image-wrap">
-                    <img src={item.imageDataUrl} alt={item.word || "絵"} />
+                    <img
+                      src={item.imageDataUrl}
+                      alt={item.word || "絵"}
+                      loading="lazy"
+                      decoding="async"
+                    />
                     {item.isMasterpiece && (
-                      <span className="gallery-masterpiece-badge">
+                      <span
+                        className="gallery-masterpiece-badge"
+                        title={
+                          item.masterpieceOwnerName
+                            ? `${item.masterpieceOwnerName}さんが名画化`
+                            : undefined
+                        }
+                      >
                         ✨ {item.styleLabel || "AI名画"}
+                        {item.masterpieceOwnerName
+                          ? `・${item.masterpieceOwnerName}さん`
+                          : ""}
                       </span>
                     )}
                   </div>
@@ -1883,9 +1971,9 @@ export default function App() {
                   </div>
                   {!gallerySelectMode &&
                     !item.isMasterpiece &&
-                    isHost &&
                     returnScreen === "finished" &&
                     aiState.enabled &&
+                    aiState.masterpieceEligible &&
                     item.gameSeq === aiState.gameSeq &&
                     (aiState.masterpieceStatus === "idle" ||
                       (aiState.masterpieceStatus === "error" &&
@@ -1895,13 +1983,17 @@ export default function App() {
                         className="gallery-masterpiece-button"
                         onClick={(event) => {
                           event.stopPropagation();
+                          if (aiState.anyMasterpieceGenerating) return;
                           setError("");
                           stylizeReturnFocusRef.current =
                             event.currentTarget;
                           setStylizeTargetId(item.id);
                         }}
+                        disabled={aiState.anyMasterpieceGenerating}
                       >
-                        ✨ この絵を名画化
+                        {aiState.anyMasterpieceGenerating
+                          ? "🖌️ ただいま制作中"
+                          : "✨ この絵を名画化"}
                       </button>
                     )}
                 </div>

@@ -200,9 +200,10 @@ test("stylizeDrawing validates styles and requests compressed WebP", async () =>
       style: "storybook",
     });
     assert.equal(result, tinyWebp);
-    assert.equal(form.get("quality"), "medium");
+    assert.equal(form.get("size"), "816x816");
+    assert.equal(form.get("quality"), "low");
     assert.equal(form.get("output_format"), "webp");
-    assert.equal(form.get("output_compression"), "50");
+    assert.equal(form.get("output_compression"), "60");
     assert.match(form.get("prompt"), /Do not add captions/);
   } finally {
     globalThis.fetch = originalFetch;

@@ -12,6 +12,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { Server } from "socket.io";
 import {
+  MAX_MASTERPIECE_DATA_URL_LENGTH,
   aiErrorLogDetails,
   createAwards,
   critiqueDrawing,
@@ -39,7 +40,7 @@ const COOP_DURATION_MS = 40_000;
 const LIAR_MIN_PLAYERS = 4;
 const LIAR_MAX_DRAWERS = 3;
 const LIAR_DURATION_MS = 40_000;
-const GALLERY_MAX = 30;
+const GALLERY_MAX = 60;
 const EVENT_MIN_GAP = 3;
 const EVENT_FORCE_GAP = 6;
 const EVENT_CHANCE = 0.3;
@@ -56,7 +57,7 @@ const AI_RATE_LIMITS = {
   awards: Math.max(1, Number(process.env.AI_AWARDS_RATE_LIMIT) || 12),
   masterpiece: Math.max(
     1,
-    Number(process.env.AI_MASTERPIECE_RATE_LIMIT) || 4,
+    Number(process.env.AI_MASTERPIECE_RATE_LIMIT) || 30,
   ),
 };
 const AI_GLOBAL_RATE_LIMITS = {
@@ -74,7 +75,7 @@ const AI_GLOBAL_RATE_LIMITS = {
   ),
   masterpiece: Math.max(
     1,
-    Number(process.env.AI_GLOBAL_MASTERPIECE_RATE_LIMIT) || 12,
+    Number(process.env.AI_GLOBAL_MASTERPIECE_RATE_LIMIT) || 60,
   ),
 };
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -145,6 +146,8 @@ const io = new Server(httpServer, {
  *  sourceId?: string,
  *  style?: string,
  *  styleLabel?: string,
+ *  masterpieceOwnerId?: string,
+ *  masterpieceOwnerName?: string,
  *  aiCritiqueStatus: 'off' | 'pending' | 'ready' | 'error',
  *  aiCritique?: {
  *    title: string,
@@ -192,16 +195,19 @@ const io = new Server(httpServer, {
  *  aiAwardsError: string,
  *  aiAwardsAttempts: number,
  *  aiAwardsToken: number,
- *  aiMasterpieceStatus: 'idle' | 'generating' | 'ready' | 'error' | 'used',
- *  aiMasterpiece: null | {
- *    galleryItemId: string,
- *    sourceId: string,
- *    style: string,
- *    styleLabel: string,
- *  },
- *  aiMasterpieceError: string,
- *  aiMasterpieceAttempts: number,
- *  aiMasterpieceToken: number,
+ *  aiMasterpieceEligibleIds: Set<string>,
+ *  aiMasterpieces: Map<string, {
+ *    status: 'idle' | 'generating' | 'ready' | 'error' | 'used',
+ *    masterpiece: null | {
+ *      galleryItemId: string,
+ *      sourceId: string,
+ *      style: string,
+ *      styleLabel: string,
+ *    },
+ *    error: string,
+ *    attempts: number,
+ *    token: number,
+ *  }>,
  * }} Room
  */
 
@@ -284,6 +290,16 @@ function hasGalleryStorageFor(
   imageDataUrl,
   { masterpiece = false } = {},
 ) {
+  return hasGalleryStorageForLength(room, imageDataUrl.length, {
+    masterpiece,
+  });
+}
+
+function hasGalleryStorageForLength(
+  room,
+  imageDataUrlLength,
+  { masterpiece = false } = {},
+) {
   const limit = masterpiece
     ? MAX_TOTAL_GALLERY_DATA_URL_LEN
     : MAX_TOTAL_GALLERY_DATA_URL_LEN - MASTERPIECE_STORAGE_RESERVE;
@@ -293,7 +309,7 @@ function hasGalleryStorageFor(
       : 0;
   return (
     totalGalleryDataUrlLength() +
-      imageDataUrl.length -
+      imageDataUrlLength -
       evictedLength <=
     limit
   );
@@ -401,9 +417,41 @@ function currentGameGallery(room) {
   );
 }
 
-function buildAiState(room) {
+function createMasterpieceState() {
+  return {
+    status: "idle",
+    masterpiece: null,
+    error: "",
+    attempts: 0,
+    token: 0,
+  };
+}
+
+function getMasterpieceState(room, playerId) {
+  let state = room.aiMasterpieces.get(playerId);
+  if (!state) {
+    state = createMasterpieceState();
+    room.aiMasterpieces.set(playerId, state);
+  }
+  return state;
+}
+
+function generatingMasterpieceEntry(room) {
+  for (const [playerId, state] of room.aiMasterpieces) {
+    if (state.status === "generating") {
+      return { playerId, state };
+    }
+  }
+  return null;
+}
+
+function buildAiState(room, playerId = "") {
   const capabilities = publicAiCapabilities();
   const currentItems = currentGameGallery(room);
+  const masterpieceState = playerId
+    ? getMasterpieceState(room, playerId)
+    : createMasterpieceState();
+  const generatingEntry = generatingMasterpieceEntry(room);
   return {
     ...capabilities,
     gameSeq: room.gameSeq,
@@ -418,19 +466,30 @@ function buildAiState(room) {
     awards: room.aiAwards,
     awardsError: room.aiAwardsError,
     canRetryAwards: room.aiAwardsAttempts < 2,
-    masterpieceStatus: room.aiMasterpieceStatus,
-    masterpiece: room.aiMasterpiece,
-    masterpieceError: room.aiMasterpieceError,
-    canRetryMasterpiece: room.aiMasterpieceAttempts < 2,
+    masterpieceEligible: room.aiMasterpieceEligibleIds.has(playerId),
+    masterpieceStatus: masterpieceState.status,
+    masterpiece: masterpieceState.masterpiece,
+    masterpieceError: masterpieceState.error,
+    canRetryMasterpiece: masterpieceState.attempts < 2,
+    anyMasterpieceGenerating: Boolean(generatingEntry),
+    masterpieceGeneratingOwnerName: generatingEntry
+      ? room.players.get(generatingEntry.playerId)?.name || "ほかの参加者"
+      : "",
   };
 }
 
 function emitAiState(room, targetSocketId = null) {
-  const payload = buildAiState(room);
   if (targetSocketId) {
-    io.to(targetSocketId).emit("aiStateUpdate", payload);
-  } else {
-    io.to(room.code).emit("aiStateUpdate", payload);
+    const playerId = socketPlayer.get(targetSocketId) || "";
+    io.to(targetSocketId).emit("aiStateUpdate", buildAiState(room, playerId));
+    return;
+  }
+  for (const player of room.players.values()) {
+    if (!player.socketId) continue;
+    io.to(player.socketId).emit(
+      "aiStateUpdate",
+      buildAiState(room, player.id),
+    );
   }
 }
 
@@ -449,11 +508,8 @@ function resetAiForNewGame(room) {
   room.aiAwards = null;
   room.aiAwardsError = "";
   room.aiAwardsAttempts = 0;
-  room.aiMasterpieceToken += 1;
-  room.aiMasterpieceStatus = "idle";
-  room.aiMasterpiece = null;
-  room.aiMasterpieceError = "";
-  room.aiMasterpieceAttempts = 0;
+  room.aiMasterpieces = new Map();
+  room.aiMasterpieceEligibleIds = new Set();
 }
 
 function resetAwardsForExtension(room) {
@@ -469,12 +525,8 @@ function resetAiWhenReturningToLobby(room) {
   room.aiAwardsStatus = "idle";
   room.aiAwards = null;
   room.aiAwardsError = "";
-  if (room.aiMasterpieceStatus === "generating") {
-    room.aiMasterpieceToken += 1;
-    room.aiMasterpieceStatus = "idle";
-    room.aiMasterpiece = null;
-    room.aiMasterpieceError = "";
-  }
+  room.aiMasterpieces = new Map();
+  room.aiMasterpieceEligibleIds = new Set();
 }
 
 function friendlyAiError(error, fallback) {
@@ -933,6 +985,9 @@ function buildFinishedPayload(room) {
 
 function finishGame(room) {
   room.phase = "finished";
+  for (const playerId of room.players.keys()) {
+    room.aiMasterpieceEligibleIds.add(playerId);
+  }
   resetRoundFields(room);
   io.to(room.code).emit("clearCanvas");
   emitLobby(room);
@@ -1122,6 +1177,18 @@ function removePlayer(room, playerId) {
     io.to(room.code).emit("hostChanged", { name: nextHost.name });
   }
 
+  // 支払い済みのAI処理は、1人になっても破棄せず完成を待つ。
+  if (
+    room.phase === "finished" &&
+    room.players.size === 1 &&
+    (room.aiAwardsStatus === "generating" ||
+      generatingMasterpieceEntry(room))
+  ) {
+    emitLobby(room);
+    emitAiState(room);
+    return;
+  }
+
   // ひとりだけ残ったらゲームを畳んでロビーへ（部屋コードで再招集できる）
   if (
     (room.phase === "playing" || room.phase === "finished") &&
@@ -1228,10 +1295,60 @@ function scheduleDisconnect(room, player, graceMs = DISCONNECT_GRACE_MS) {
   }, graceMs);
 }
 
+function reconcileRemovedGalleryItems(
+  room,
+  removedIds,
+  { automatic = false } = {},
+) {
+  const idSet =
+    removedIds instanceof Set ? removedIds : new Set(removedIds || []);
+  if (idSet.size === 0) return;
+
+  if (room.aiAwardsStatus === "ready" && room.aiAwards?.awards) {
+    const remainingAwards = room.aiAwards.awards.filter(
+      (award) => !idSet.has(award.galleryItemId),
+    );
+    if (remainingAwards.length !== room.aiAwards.awards.length) {
+      if (remainingAwards.length > 0) {
+        room.aiAwards = {
+          ...room.aiAwards,
+          awards: remainingAwards,
+        };
+      } else {
+        room.aiAwardsStatus = "error";
+        room.aiAwards = null;
+        room.aiAwardsError = automatic
+          ? "保存上限のため、古い受賞作品がギャラリーから整理されました"
+          : "受賞作品がギャラリーから削除されました";
+        room.aiAwardsAttempts = 2;
+      }
+    }
+  }
+
+  for (const state of room.aiMasterpieces.values()) {
+    if (
+      state.masterpiece?.galleryItemId &&
+      idSet.has(state.masterpiece.galleryItemId)
+    ) {
+      state.status = "used";
+      state.masterpiece = null;
+      state.error = automatic
+        ? "保存上限のため、古い名画がギャラリーから整理されました"
+        : "作成した名画はギャラリーから削除されました";
+    }
+  }
+}
+
 function trimGallery(room) {
   if (room.gallery.length > GALLERY_MAX) {
+    const removedIds = room.gallery
+      .slice(0, room.gallery.length - GALLERY_MAX)
+      .map((item) => item.id);
     room.gallery = room.gallery.slice(-GALLERY_MAX);
+    reconcileRemovedGalleryItems(room, removedIds, { automatic: true });
+    return removedIds;
   }
+  return [];
 }
 
 function queueDrawingCritique(room, item, safetyIdentifier) {
@@ -1387,11 +1504,8 @@ function createEmptyRoom(code, hostId) {
     aiAwardsError: "",
     aiAwardsAttempts: 0,
     aiAwardsToken: 0,
-    aiMasterpieceStatus: "idle",
-    aiMasterpiece: null,
-    aiMasterpieceError: "",
-    aiMasterpieceAttempts: 0,
-    aiMasterpieceToken: 0,
+    aiMasterpieceEligibleIds: new Set(),
+    aiMasterpieces: new Map(),
   };
 }
 
@@ -1749,7 +1863,13 @@ io.on("connection", (socket) => {
     if (activePlayers(room).length < 2) {
       return reply(cb, { ok: false, error: "延長には2人以上必要です" });
     }
-    if (room.aiMasterpieceStatus === "generating") {
+    if (room.aiAwardsStatus === "generating") {
+      return reply(cb, {
+        ok: false,
+        error: "AI授賞式が完成してから延長できます",
+      });
+    }
+    if (generatingMasterpieceEntry(room)) {
       return reply(cb, {
         ok: false,
         error: "AI名画が完成してから延長できます",
@@ -1774,7 +1894,13 @@ io.on("connection", (socket) => {
     if (room.hostId !== playerId) {
       return reply(cb, { ok: false, error: "ホストだけが終了できます" });
     }
-    if (room.aiMasterpieceStatus === "generating") {
+    if (room.aiAwardsStatus === "generating") {
+      return reply(cb, {
+        ok: false,
+        error: "AI授賞式が完成してからロビーへ戻れます",
+      });
+    }
+    if (generatingMasterpieceEntry(room)) {
       return reply(cb, {
         ok: false,
         error: "AI名画が完成してからロビーへ戻れます",
@@ -1931,29 +2057,46 @@ io.on("connection", (socket) => {
   onSocket(socket, "stylizeGalleryItem", (data, cb) => {
     const ctx = getContext(socket);
     if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
-    const { room, playerId } = ctx;
+    const { room, playerId, player } = ctx;
     if (!isAiConfigured()) {
       return reply(cb, { ok: false, error: "AI画伯はまだ準備中です" });
-    }
-    if (room.hostId !== playerId) {
-      return reply(cb, { ok: false, error: "ホストだけが名画化できます" });
     }
     if (room.phase !== "finished") {
       return reply(cb, { ok: false, error: "ゲーム終了後に名画化できます" });
     }
-    if (
-      room.aiMasterpieceStatus === "ready" ||
-      room.aiMasterpieceStatus === "used"
-    ) {
-      return reply(cb, { ok: false, error: "名画化は1ゲームに1枚です" });
-    }
-    if (room.aiMasterpieceStatus === "generating") {
-      return reply(cb, { ok: true, generating: true });
-    }
-    if (room.aiMasterpieceAttempts >= 2) {
+    if (!room.aiMasterpieceEligibleIds.has(playerId)) {
       return reply(cb, {
         ok: false,
-        error: "このゲームの名画化はこれ以上やり直せません",
+        error: "このゲームに参加した人だけ名画化できます",
+      });
+    }
+    const masterpieceState = getMasterpieceState(room, playerId);
+    if (
+      masterpieceState.status === "ready" ||
+      masterpieceState.status === "used"
+    ) {
+      return reply(cb, {
+        ok: false,
+        error: "名画化は一人につき1ゲーム1枚です",
+      });
+    }
+    if (masterpieceState.status === "generating") {
+      return reply(cb, { ok: true, generating: true });
+    }
+    const generatingEntry = generatingMasterpieceEntry(room);
+    if (generatingEntry) {
+      return reply(cb, {
+        ok: false,
+        code: "MASTERPIECE_BUSY",
+        error: `${
+          room.players.get(generatingEntry.playerId)?.name || "ほかの参加者"
+        }さんの名画を制作中です。完成後に試してください`,
+      });
+    }
+    if (masterpieceState.attempts >= 2) {
+      return reply(cb, {
+        ok: false,
+        error: "あなたの名画化はこれ以上やり直せません",
       });
     }
 
@@ -1974,6 +2117,18 @@ io.on("connection", (socket) => {
     if (!styleInfo) {
       return reply(cb, { ok: false, error: "名画のスタイルを選んでください" });
     }
+    if (
+      !hasGalleryStorageForLength(
+        room,
+        MAX_MASTERPIECE_DATA_URL_LENGTH,
+        { masterpiece: true },
+      )
+    ) {
+      return reply(cb, {
+        ok: false,
+        error: "ギャラリーの保存容量がいっぱいです",
+      });
+    }
     if (!consumeAiQuota(socket, "masterpiece")) {
       return reply(cb, {
         ok: false,
@@ -1982,7 +2137,8 @@ io.on("connection", (socket) => {
     }
 
     const gameSeq = room.gameSeq;
-    const token = room.aiMasterpieceToken + 1;
+    const token = masterpieceState.token + 1;
+    const ownerName = player.name;
     const sourceSnapshot = {
       id: source.id,
       imageDataUrl: source.imageDataUrl,
@@ -1990,16 +2146,16 @@ io.on("connection", (socket) => {
       drawerNames: [...source.drawerNames],
       roundType: source.roundType,
     };
-    room.aiMasterpieceToken = token;
-    room.aiMasterpieceStatus = "generating";
-    room.aiMasterpiece = {
+    masterpieceState.token = token;
+    masterpieceState.status = "generating";
+    masterpieceState.masterpiece = {
       galleryItemId: "",
       sourceId,
       style,
       styleLabel: styleInfo.label,
     };
-    room.aiMasterpieceError = "";
-    room.aiMasterpieceAttempts += 1;
+    masterpieceState.error = "";
+    masterpieceState.attempts += 1;
     emitAiState(room);
     reply(cb, { ok: true, generating: true });
 
@@ -2008,9 +2164,10 @@ io.on("connection", (socket) => {
       return (
         currentRoom === room &&
         currentRoom.gameSeq === gameSeq &&
-        currentRoom.aiMasterpieceToken === token &&
-        currentRoom.aiMasterpieceStatus === "generating" &&
-        currentRoom.phase !== "lobby" &&
+        currentRoom.aiMasterpieces.get(playerId) === masterpieceState &&
+        masterpieceState.token === token &&
+        masterpieceState.status === "generating" &&
+        currentRoom.phase === "finished" &&
         currentRoom.gallery.some(
           (item) =>
             item.id === sourceId &&
@@ -2032,8 +2189,9 @@ io.on("connection", (socket) => {
           !currentRoom ||
           currentRoom !== room ||
           currentRoom.gameSeq !== gameSeq ||
-          currentRoom.aiMasterpieceToken !== token ||
-          currentRoom.phase === "lobby"
+          currentRoom.aiMasterpieces.get(playerId) !== masterpieceState ||
+          masterpieceState.token !== token ||
+          currentRoom.phase !== "finished"
         ) {
           return;
         }
@@ -2064,24 +2222,31 @@ io.on("connection", (socket) => {
           sourceId,
           style,
           styleLabel: styleInfo.label,
+          masterpieceOwnerId: playerId,
+          masterpieceOwnerName: ownerName,
           aiCritiqueStatus: "off",
         };
         currentRoom.gallery.push(masterpieceItem);
-        trimGallery(currentRoom);
-        currentRoom.aiMasterpieceStatus = "ready";
-        currentRoom.aiMasterpiece = {
+        const removedIds = trimGallery(currentRoom);
+        masterpieceState.status = "ready";
+        masterpieceState.masterpiece = {
           galleryItemId: masterpieceItem.id,
           sourceId,
           style,
           styleLabel: styleInfo.label,
         };
-        currentRoom.aiMasterpieceError = "";
-        emitGallery(currentRoom);
+        masterpieceState.error = "";
+        io.to(currentRoom.code).emit("galleryItemAdded", {
+          item: masterpieceItem,
+          removedIds,
+        });
         emitAiState(currentRoom);
         io.to(currentRoom.code).emit("aiMasterpieceReady", {
           gameSeq,
           galleryItemId: masterpieceItem.id,
           styleLabel: styleInfo.label,
+          playerId,
+          playerName: ownerName,
         });
       })
       .catch((error) => {
@@ -2091,7 +2256,8 @@ io.on("connection", (socket) => {
           !currentRoom ||
           currentRoom !== room ||
           currentRoom.gameSeq !== gameSeq ||
-          currentRoom.aiMasterpieceToken !== token
+          currentRoom.aiMasterpieces.get(playerId) !== masterpieceState ||
+          masterpieceState.token !== token
         ) {
           return;
         }
@@ -2100,15 +2266,13 @@ io.on("connection", (socket) => {
           error?.status == null &&
           !message.includes("queue") &&
           !message.includes("cancelled");
-        currentRoom.aiMasterpieceStatus = mayHaveReachedProvider
-          ? "used"
-          : "error";
-        currentRoom.aiMasterpiece = null;
+        masterpieceState.status = mayHaveReachedProvider ? "used" : "error";
+        masterpieceState.masterpiece = null;
         const friendlyError = friendlyAiError(
           error,
           "名画化できませんでした。もう一度試してください",
         );
-        currentRoom.aiMasterpieceError = mayHaveReachedProvider
+        masterpieceState.error = mayHaveReachedProvider
           ? `${friendlyError}。重複生成を避けるため、このゲームでは再試行しません`
           : friendlyError;
         emitAiState(currentRoom);
@@ -2119,10 +2283,10 @@ io.on("connection", (socket) => {
     const { ids } = data || {};
     const ctx = getContext(socket);
     if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
-    const { room } = ctx;
+    const { room, playerId } = ctx;
     if (
       room.aiAwardsStatus === "generating" ||
-      room.aiMasterpieceStatus === "generating"
+      generatingMasterpieceEntry(room)
     ) {
       return reply(cb, {
         ok: false,
@@ -2135,33 +2299,22 @@ io.on("connection", (socket) => {
     if (idSet.size === 0) {
       return reply(cb, { ok: false, error: "削除する絵がありません" });
     }
+    const protectedMasterpiece = room.gallery.find(
+      (item) =>
+        idSet.has(item.id) &&
+        item.isMasterpiece &&
+        item.masterpieceOwnerId &&
+        item.masterpieceOwnerId !== playerId &&
+        room.hostId !== playerId,
+    );
+    if (protectedMasterpiece) {
+      return reply(cb, {
+        ok: false,
+        error: "ほかの人が作った名画は、本人かホストだけが削除できます",
+      });
+    }
     room.gallery = room.gallery.filter((g) => !idSet.has(g.id));
-    if (room.aiAwardsStatus === "ready" && room.aiAwards?.awards) {
-      const remainingAwards = room.aiAwards.awards.filter(
-        (award) => !idSet.has(award.galleryItemId),
-      );
-      if (remainingAwards.length !== room.aiAwards.awards.length) {
-        if (remainingAwards.length > 0) {
-          room.aiAwards = {
-            ...room.aiAwards,
-            awards: remainingAwards,
-          };
-        } else {
-          room.aiAwardsStatus = "error";
-          room.aiAwards = null;
-          room.aiAwardsError = "受賞作品がギャラリーから削除されました";
-          room.aiAwardsAttempts = 2;
-        }
-      }
-    }
-    if (
-      room.aiMasterpiece?.galleryItemId &&
-      idSet.has(room.aiMasterpiece.galleryItemId)
-    ) {
-      room.aiMasterpieceStatus = "used";
-      room.aiMasterpiece = null;
-      room.aiMasterpieceError = "作成した名画はギャラリーから削除されました";
-    }
+    reconcileRemovedGalleryItems(room, idSet);
     emitGallery(room);
     emitAiState(room);
     reply(cb, { ok: true });
@@ -2176,7 +2329,7 @@ io.on("connection", (socket) => {
     }
     if (
       room.aiAwardsStatus === "generating" ||
-      room.aiMasterpieceStatus === "generating"
+      generatingMasterpieceEntry(room)
     ) {
       return reply(cb, {
         ok: false,
@@ -2188,11 +2341,13 @@ io.on("connection", (socket) => {
     room.aiAwardsStatus = "idle";
     room.aiAwards = null;
     room.aiAwardsError = "";
-    if (room.aiMasterpieceStatus !== "idle") {
-      room.aiMasterpieceToken += 1;
-      room.aiMasterpieceStatus = "used";
-      room.aiMasterpiece = null;
-      room.aiMasterpieceError = "ギャラリーが空になったため名画化は終了しました";
+    for (const state of room.aiMasterpieces.values()) {
+      if (state.status !== "idle") {
+        state.token += 1;
+        state.status = "used";
+        state.masterpiece = null;
+        state.error = "ギャラリーが空になったため名画化は終了しました";
+      }
     }
     emitGallery(room);
     emitAiState(room);

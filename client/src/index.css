@@ -1375,12 +1375,25 @@ input:focus {
 
 .gallery-masterpiece-button {
   width: calc(100% - 0.8rem);
+  min-height: 44px;
   margin: 0 0.4rem 0.45rem;
   padding: 0.42rem 0.3rem;
   border-width: 2px;
   background: linear-gradient(135deg, #7450ae, #b6529f);
   box-shadow: 1px 2px 0 var(--ink);
   font-size: 0.68rem;
+}
+
+.ai-masterpiece-available {
+  margin: 0;
+  padding: 0.65rem;
+  border: 2px dashed rgba(79, 43, 137, 0.48);
+  border-radius: 12px;
+  background: rgba(246, 238, 255, 0.72);
+  color: #4f2b89;
+  font-size: 0.78rem;
+  font-weight: 900;
+  text-align: center;
 }
 
 .ai-masterpiece {
@@ -1495,10 +1508,22 @@ input:focus {
   margin-top: 0.75rem;
 }
 
+.ai-dialog-busy {
+  margin: 0.55rem 0 0;
+  padding: 0.5rem 0.65rem;
+  border-radius: 10px;
+  background: #f6eeff;
+  color: #4f2b89;
+  font-size: 0.74rem;
+  font-weight: 900;
+  text-align: center;
+}
+
 .ai-style-option {
   display: flex;
   align-items: center;
   justify-content: center;
+  min-height: 44px;
   gap: 0.35rem;
   padding: 0.72rem 0.45rem;
   border-width: 2px;

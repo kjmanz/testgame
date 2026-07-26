@@ -6,7 +6,7 @@ const OPENAI_IMAGE_MODEL =
 const TEXT_TIMEOUT_MS = 45_000;
 const IMAGE_TIMEOUT_MS = 180_000;
 const MAX_SOURCE_IMAGE_BYTES = 300_000;
-const MAX_MASTERPIECE_DATA_URL_LENGTH = 1_800_000;
+export const MAX_MASTERPIECE_DATA_URL_LENGTH = 1_800_000;
 
 const STYLE_PROMPTS = Object.freeze({
   storybook:
@@ -94,7 +94,7 @@ function createLimiter(maxConcurrent, maxQueued) {
 }
 
 const runTextJob = createLimiter(2, 50);
-const runImageJob = createLimiter(1, 5);
+const runImageJob = createLimiter(1, 20);
 
 function apiKey() {
   return String(process.env.OPENAI_API_KEY || "").trim();
@@ -463,10 +463,10 @@ export async function stylizeDrawing({
       new Blob([parsedImage.buffer], { type: parsedImage.mimeType }),
       `drawing.${parsedImage.extension}`,
     );
-    form.append("size", "1024x1024");
-    form.append("quality", "medium");
+    form.append("size", "816x816");
+    form.append("quality", "low");
     form.append("output_format", "webp");
-    form.append("output_compression", "50");
+    form.append("output_compression", "60");
 
     const { body, requestId } = await openAiRequest(
       "/images/edits",
@@ -492,7 +492,7 @@ export async function stylizeDrawing({
       );
     }
     return dataUrl;
-  }, { maxWaitMs: 30_000, isCurrent });
+  }, { maxWaitMs: 180_000, isCurrent });
 }
 
 export function aiErrorLogDetails(error) {
