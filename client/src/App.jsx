@@ -6,6 +6,10 @@ import DrawingCanvas from "./DrawingCanvas.jsx";
 const SESSION_KEY = "oekaki-session";
 /** ブラウザを閉じても3時間は同じ部屋に戻れる */
 const SESSION_TTL_MS = 3 * 60 * 60 * 1000;
+/** 今日のハイライト: 1枚あたりの表示時間。枚数が多いときは早送りして全体を収める */
+const HIGHLIGHT_MS_PER_ITEM = 1100;
+const HIGHLIGHT_MIN_MS_PER_ITEM = 500;
+const HIGHLIGHT_TOTAL_MS = 24_000;
 const EMPTY_AI_STATE = {
   enabled: false,
   gameSeq: 0,
@@ -191,6 +195,8 @@ export default function App() {
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [returnScreen, setReturnScreen] = useState("lobby");
   const [aiState, setAiState] = useState(EMPTY_AI_STATE);
+  /** 今日のハイライト: { ids: string[], index: number } */
+  const [highlight, setHighlight] = useState(null);
 
   const isHost = playerId && playerId === hostId;
   const isAiFinishBusy = aiState.awardsStatus === "generating";
@@ -269,6 +275,7 @@ export default function App() {
     setTotalRounds(0);
     setExtensionRounds(3);
     setFinishBusy(false);
+    setHighlight(null);
   }
 
   function showFinished(data, { resetBusy = true } = {}) {
@@ -297,6 +304,27 @@ export default function App() {
     const t = setTimeout(() => setFanfare(null), 2200);
     return () => clearTimeout(t);
   }, [fanfare]);
+
+  // 今日のハイライト: 1枚ずつめくって、最後まで来たら閉じる
+  useEffect(() => {
+    if (!highlight) return;
+    const perItem = Math.max(
+      HIGHLIGHT_MIN_MS_PER_ITEM,
+      Math.min(
+        HIGHLIGHT_MS_PER_ITEM,
+        Math.round(HIGHLIGHT_TOTAL_MS / Math.max(1, highlight.ids.length))
+      )
+    );
+    const t = setTimeout(() => {
+      setHighlight((current) => {
+        if (!current) return null;
+        const next = current.index + 1;
+        if (next >= current.ids.length) return null;
+        return { ...current, index: next };
+      });
+    }, perItem);
+    return () => clearTimeout(t);
+  }, [highlight]);
 
   useEffect(() => {
     window.scrollTo(0, 0);
@@ -501,6 +529,13 @@ export default function App() {
       setToast("🏆 AI画伯の授賞式がはじまるよ！");
     });
 
+    // 今日のハイライト: 順番だけ届くので、絵は手元のギャラリーから引く
+    socket.on("highlightStart", (data) => {
+      const ids = Array.isArray(data?.ids) ? data.ids : [];
+      if (ids.length === 0) return;
+      setHighlight({ ids, index: 0 });
+    });
+
     socket.on("strokeHistory", (data) => {
       const strokes = data?.strokes || [];
       setHistorySeed((prev) => ({
@@ -668,6 +703,7 @@ export default function App() {
       setGallery([]);
       setSelectedIds(new Set());
       setAiState(EMPTY_AI_STATE);
+      setHighlight(null);
       setHistorySeed({ token: 0, strokes: [] });
       resetPlayState();
       resetGameProgress();
@@ -756,6 +792,13 @@ export default function App() {
       if (!res?.ok) {
         setError(res?.error || "授賞式を始められません");
       }
+    });
+  }
+
+  function startHighlight() {
+    setError("");
+    socketRef.current?.emit("startHighlight", (res) => {
+      if (!res?.ok) setError(res?.error || "ハイライトを始められません");
     });
   }
 
@@ -963,6 +1006,52 @@ export default function App() {
             </span>
           </div>
         )}
+      </div>
+    );
+  }
+
+  /** 今日のハイライト: 全員の画面で同時に、今日の絵を1枚ずつめくる */
+  function renderHighlight() {
+    if (!highlight) return null;
+    const total = highlight.ids.length;
+    const shown = highlight.index + 1;
+    const item = gallery.find((g) => g.id === highlight.ids[highlight.index]);
+    const drawers = (item?.drawerNames || []).join("・");
+    return (
+      <div className="highlight" role="status" aria-live="polite">
+        <div className="highlight-inner">
+          <div className="highlight-eyebrow">🎬 今日のハイライト</div>
+          <div className="highlight-frame">
+            {item ? (
+              <img
+                key={item.id}
+                src={item.imageDataUrl}
+                alt={item.word || "絵"}
+                decoding="async"
+              />
+            ) : (
+              <div className="highlight-missing">この絵はもうないよ</div>
+            )}
+          </div>
+          <div className="highlight-word">{item?.word || "？？？"}</div>
+          {drawers && <div className="highlight-drawers">{drawers}</div>}
+          <div className="highlight-track">
+            <div
+              className="highlight-fill"
+              style={{ width: `${(shown / total) * 100}%` }}
+            />
+          </div>
+          <div className="highlight-count">
+            {shown} / {total}
+          </div>
+          <button
+            type="button"
+            className="highlight-close"
+            onClick={() => setHighlight(null)}
+          >
+            とじる
+          </button>
+        </div>
       </div>
     );
   }
@@ -1320,6 +1409,8 @@ export default function App() {
         </div>
       )}
 
+      {renderHighlight()}
+
       {fanfare && (
         <div className={`fanfare fanfare-${fanfare.roundType}`} role="status">
           <div className="fanfare-inner">
@@ -1531,6 +1622,30 @@ export default function App() {
           <p className="finish-summary">
             みんなで{totalRounds}このお題を描きました
           </p>
+
+          {aiState.awardCandidateCount >= 2 && (
+            <section className="highlight-panel">
+              {isHost ? (
+                <>
+                  <button
+                    type="button"
+                    className="highlight-btn"
+                    onClick={startHighlight}
+                    disabled={!!highlight}
+                  >
+                    🎬 今日のハイライトを見る（{aiState.awardCandidateCount}枚）
+                  </button>
+                  <p className="hint">
+                    みんなの画面で いっしょに流れます
+                  </p>
+                </>
+              ) : (
+                <p className="hint">
+                  🎬 ホストがハイライトを流せます
+                </p>
+              )}
+            </section>
+          )}
 
           {aiState.enabled && (
             <section className="ai-ceremony" aria-labelledby="ai-awards-title">

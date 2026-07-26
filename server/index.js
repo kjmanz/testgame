@@ -56,6 +56,8 @@ const CONSTRAINT_CHANCE = 0.25;
 const RECENT_CONSTRAINTS_MAX = 4;
 /** リプレイの連打よけ */
 const REPLAY_COOLDOWN_MS = 2_000;
+/** 今日のハイライトの連打よけ（最初の1枚が出るまで少し余裕を取る） */
+const HIGHLIGHT_COOLDOWN_MS = 3_000;
 const EXTENSION_ROUNDS = 3;
 const MAX_GALLERY_DATA_URL_LEN = 400_000;
 const MAX_TOTAL_GALLERY_DATA_URL_LEN = 80_000_000;
@@ -171,6 +173,7 @@ const io = new Server(httpServer, {
  *  roundsSinceConstraint: number,
  *  recentConstraints: string[],
  *  lastReplayAt: number,
+ *  lastHighlightAt: number,
  *  gallery: GalleryItem[],
  *  strokes: object[],
  *  recentWords: string[],
@@ -378,8 +381,11 @@ function currentGameGallery(room) {
   return room.gallery.filter((item) => item.gameSeq === room.gameSeq);
 }
 
-/** 授賞式の候補は「線が引かれている絵」だけ（白紙は選ばせない） */
-function awardCandidates(room) {
+/**
+ * 今のゲームで、実際に線が引かれた絵。
+ * 授賞式の候補にも、今日のハイライトにも、この同じ集合を使う（白紙は出さない）。
+ */
+function drawnThisGame(room) {
   return currentGameGallery(room).filter((item) => item.hasDrawing);
 }
 
@@ -388,7 +394,7 @@ function buildAiState(room) {
     ...publicAiCapabilities(),
     gameSeq: room.gameSeq,
     currentGalleryCount: currentGameGallery(room).length,
-    awardCandidateCount: awardCandidates(room).length,
+    awardCandidateCount: drawnThisGame(room).length,
     awardsStatus: room.aiAwardsStatus,
     awards: room.aiAwards,
     awardsError: room.aiAwardsError,
@@ -1427,6 +1433,7 @@ function createEmptyRoom(code, hostId) {
     roundsSinceConstraint: 0,
     recentConstraints: [],
     lastReplayAt: 0,
+    lastHighlightAt: 0,
     gallery: [],
     strokes: [],
     recentWords: [],
@@ -1725,6 +1732,30 @@ io.on("connection", (socket) => {
     reply(cb, { ok: true });
   });
 
+  // 今日のハイライト: 絵は全員の端末にもう届いているので、順番だけ配る
+  onSocket(socket, "startHighlight", (cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { code, room, playerId } = ctx;
+    if (room.hostId !== playerId) {
+      return reply(cb, { ok: false, error: "ホストだけがハイライトを始められます" });
+    }
+    if (room.phase !== "finished") {
+      return reply(cb, { ok: false, error: "いまはハイライトを見られません" });
+    }
+    const items = drawnThisGame(room);
+    if (items.length < 2) {
+      return reply(cb, { ok: false, error: "ハイライトには絵が2枚以上必要です" });
+    }
+    const now = Date.now();
+    if (now - room.lastHighlightAt < HIGHLIGHT_COOLDOWN_MS) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    room.lastHighlightAt = now;
+    io.to(code).emit("highlightStart", { ids: items.map((item) => item.id) });
+    reply(cb, { ok: true });
+  });
+
   onSocket(socket, "revealLiar", (cb) => {
     const ctx = getContext(socket);
     if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
@@ -1921,7 +1952,7 @@ io.on("connection", (socket) => {
       });
     }
 
-    const candidates = awardCandidates(room).map((item) => ({
+    const candidates = drawnThisGame(room).map((item) => ({
       id: item.id,
       word: item.word,
       roundType: item.roundType,
