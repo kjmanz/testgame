@@ -6,6 +6,22 @@ import DrawingCanvas from "./DrawingCanvas.jsx";
 const SESSION_KEY = "oekaki-session";
 /** ブラウザを閉じても3時間は同じ部屋に戻れる */
 const SESSION_TTL_MS = 3 * 60 * 60 * 1000;
+const EMPTY_AI_STATE = {
+  enabled: false,
+  styles: [],
+  gameSeq: 0,
+  currentGalleryCount: 0,
+  pendingCritiques: 0,
+  readyCritiques: 0,
+  awardsStatus: "idle",
+  awards: null,
+  awardsError: "",
+  canRetryAwards: true,
+  masterpieceStatus: "idle",
+  masterpiece: null,
+  masterpieceError: "",
+  canRetryMasterpiece: true,
+};
 
 function createSocket() {
   const url = import.meta.env.VITE_SOCKET_URL || undefined;
@@ -27,7 +43,14 @@ function readSessionRaw() {
 
 function loadSession() {
   const data = readSessionRaw();
-  if (!data?.playerId || !data?.roomCode || !data?.name) return null;
+  if (
+    !data?.playerId ||
+    !data?.resumeToken ||
+    !data?.roomCode ||
+    !data?.name
+  ) {
+    return null;
+  }
   if (!data.savedAt || Date.now() - data.savedAt > SESSION_TTL_MS) return null;
   return data;
 }
@@ -115,6 +138,8 @@ export default function App() {
   const socketRef = useRef(null);
   const wakeLockRef = useRef(null);
   const canvasApiRef = useRef(null);
+  const styleDialogRef = useRef(null);
+  const stylizeReturnFocusRef = useRef(null);
   /** サーバー時刻 - 端末時刻（タイマー表示のずれ補正用） */
   const serverOffsetRef = useRef(0);
   const [initialInviteCode] = useState(readInviteRoomCode);
@@ -165,12 +190,35 @@ export default function App() {
   const [gallerySelectMode, setGallerySelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [returnScreen, setReturnScreen] = useState("lobby");
+  const [aiState, setAiState] = useState(EMPTY_AI_STATE);
+  const [aiCritiqueSpotlight, setAiCritiqueSpotlight] = useState(null);
+  const [stylizeTargetId, setStylizeTargetId] = useState("");
 
   const isHost = playerId && playerId === hostId;
+  const isMasterpieceGenerating =
+    aiState.masterpieceStatus === "generating";
   const modeClass = `mode-${roundType || "normal"}`;
   const inviteUrl = useMemo(() => buildInviteUrl(roomCode), [roomCode]);
+  const stylizeTarget = useMemo(
+    () => gallery.find((item) => item.id === stylizeTargetId) || null,
+    [gallery, stylizeTargetId]
+  );
+  const masterpieceItem = useMemo(
+    () =>
+      gallery.find(
+        (item) => item.id === aiState.masterpiece?.galleryItemId
+      ) || null,
+    [gallery, aiState.masterpiece]
+  );
   const canShareInvite =
     typeof navigator !== "undefined" && typeof navigator.share === "function";
+
+  function closeStylizeDialog({ restoreFocus = true } = {}) {
+    setStylizeTargetId("");
+    if (restoreFocus) {
+      window.setTimeout(() => stylizeReturnFocusRef.current?.focus(), 0);
+    }
+  }
 
   function applyRoundPayload(data, { forcePlay = true } = {}) {
     setError("");
@@ -252,6 +300,59 @@ export default function App() {
     const t = setTimeout(() => setFanfare(null), 2200);
     return () => clearTimeout(t);
   }, [fanfare]);
+
+  useEffect(() => {
+    if (!aiCritiqueSpotlight) return;
+    const t = setTimeout(() => setAiCritiqueSpotlight(null), 7000);
+    return () => clearTimeout(t);
+  }, [aiCritiqueSpotlight]);
+
+  useEffect(() => {
+    if (!stylizeTargetId) return;
+    if (!gallery.some((item) => item.id === stylizeTargetId)) {
+      closeStylizeDialog({ restoreFocus: false });
+    }
+  }, [gallery, stylizeTargetId]);
+
+  useEffect(() => {
+    if (!stylizeTargetId) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    function handleDialogKeys(event) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeStylizeDialog();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = [
+        ...(styleDialogRef.current?.querySelectorAll(
+          'button:not(:disabled), [href], input:not(:disabled), [tabindex]:not([tabindex="-1"])'
+        ) || []),
+      ];
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+
+    window.addEventListener("keydown", handleDialogKeys);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", handleDialogKeys);
+    };
+  }, [stylizeTargetId]);
+
+  useEffect(() => {
+    window.scrollTo(0, 0);
+  }, [screen]);
 
   useEffect(() => {
     if (!turnEndsAt) {
@@ -340,6 +441,8 @@ export default function App() {
       setScreen((prev) => (prev === "gallery" ? "gallery" : "lobby"));
       resetPlayState();
       resetGameProgress();
+      setAiCritiqueSpotlight(null);
+      closeStylizeDialog({ restoreFocus: false });
       setClearToken((n) => n + 1);
       if (data?.reason === "alone") {
         setToast("みんな出ちゃったのでロビーにもどったよ");
@@ -353,6 +456,7 @@ export default function App() {
     socket.on("gameExtended", (data) => {
       setTotalRounds(data?.totalRounds ?? 0);
       setFinishBusy(false);
+      closeStylizeDialog({ restoreFocus: false });
       setToast(`あと${data?.addedRounds || 3}問、延長！`);
     });
 
@@ -411,6 +515,46 @@ export default function App() {
       setGallery(data.gallery || []);
     });
 
+    socket.on("galleryItemAiUpdate", (data) => {
+      if (!data?.id) return;
+      setGallery((items) =>
+        items.map((item) =>
+          item.id === data.id
+            ? {
+                ...item,
+                aiCritiqueStatus: data.aiCritiqueStatus,
+                aiCritique: data.aiCritique || null,
+              }
+            : item
+        )
+      );
+    });
+
+    socket.on("aiStateUpdate", (data) => {
+      setAiState({
+        ...EMPTY_AI_STATE,
+        ...data,
+        styles: Array.isArray(data?.styles) ? data.styles : [],
+      });
+      if (data?.masterpieceStatus === "ready") {
+        closeStylizeDialog();
+      }
+    });
+
+    socket.on("aiCritiqueReady", (data) => {
+      if (!data?.critique) return;
+      setAiCritiqueSpotlight(data);
+    });
+
+    socket.on("aiAwardsReady", () => {
+      setToast("🏆 AI画伯の授賞式がはじまるよ！");
+    });
+
+    socket.on("aiMasterpieceReady", (data) => {
+      closeStylizeDialog();
+      setToast(`✨ ${data?.styleLabel || "名画"}が完成しました！`);
+    });
+
     socket.on("strokeHistory", (data) => {
       setHistorySeed((prev) => ({
         token: prev.token + 1,
@@ -446,6 +590,7 @@ export default function App() {
         {
           code: session.roomCode,
           playerId: session.playerId,
+          resumeToken: session.resumeToken,
           name: session.name,
         },
         (res) => {
@@ -463,6 +608,7 @@ export default function App() {
           setHostId(res.hostId || "");
           saveSession({
             playerId: res.playerId,
+            resumeToken: res.resumeToken,
             roomCode: res.code,
             name: session.name,
           });
@@ -506,6 +652,7 @@ export default function App() {
       setHostId(res.hostId || res.playerId);
       saveSession({
         playerId: res.playerId,
+        resumeToken: res.resumeToken,
         roomCode: res.code,
         name: trimmed,
       });
@@ -532,6 +679,7 @@ export default function App() {
         setHostId(res.hostId || "");
         saveSession({
           playerId: res.playerId,
+          resumeToken: res.resumeToken,
           roomCode: res.code,
           name: trimmed,
         });
@@ -561,6 +709,9 @@ export default function App() {
       setHostId("");
       setGallery([]);
       setSelectedIds(new Set());
+      setAiState(EMPTY_AI_STATE);
+      setAiCritiqueSpotlight(null);
+      setStylizeTargetId("");
       setHistorySeed({ token: 0, strokes: [] });
       resetPlayState();
       resetGameProgress();
@@ -643,6 +794,32 @@ export default function App() {
     });
   }
 
+  function requestAiAwards() {
+    setError("");
+    socketRef.current?.emit("requestAiAwards", (res) => {
+      if (!res?.ok) {
+        setError(res?.error || "授賞式を始められません");
+      }
+    });
+  }
+
+  function requestMasterpiece(style) {
+    if (!stylizeTarget || aiState.masterpieceStatus === "generating") return;
+    setError("");
+    socketRef.current?.emit(
+      "stylizeGalleryItem",
+      { id: stylizeTarget.id, style },
+      (res) => {
+        if (!res?.ok) {
+          setError(res?.error || "名画化できません");
+          return;
+        }
+        closeStylizeDialog();
+        setToast("✨ AI画伯が名画を制作中です。少し待ってね");
+      }
+    );
+  }
+
   function revealLiar() {
     setError("");
     socketRef.current?.emit("revealLiar", (res) => {
@@ -659,12 +836,14 @@ export default function App() {
     setReturnScreen(from || screen);
     setGallerySelectMode(false);
     setSelectedIds(new Set());
+    setStylizeTargetId("");
     setScreen("gallery");
   }
 
   function closeGallery() {
     setGallerySelectMode(false);
     setSelectedIds(new Set());
+    setStylizeTargetId("");
     const next =
       returnScreen === "play"
         ? "play"
@@ -723,13 +902,27 @@ export default function App() {
   async function saveImage(item) {
     const word = String(item.word || "").trim();
     const safeWord = (word || "picture").replace(/[\\/:*?"<>|]/g, "_");
-    const title = word ? `おえかき「${word}」` : "おえかき";
-    const filename = `${safeWord}-${item.id.slice(0, 8)}.jpg`;
+    const titlePrefix = item.isMasterpiece ? "AI名画" : "おえかき";
+    const title = word ? `${titlePrefix}「${word}」` : titlePrefix;
+    const mimeType =
+      item.imageDataUrl?.match(/^data:(image\/(?:jpeg|png|webp));/)?.[1] ||
+      "image/jpeg";
+    const extension =
+      { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" }[
+        mimeType
+      ] || "jpg";
+    const styleSuffix = item.isMasterpiece ? `-${item.style || "masterpiece"}` : "";
+    const filename = `${safeWord}${styleSuffix}-${String(item.id || "image").slice(0, 8)}.${extension}`;
     try {
       const res = await fetch(item.imageDataUrl);
       const blob = await res.blob();
-      if (navigator.share && navigator.canShare?.({ files: [new File([blob], filename, { type: blob.type })] })) {
-        const file = new File([blob], filename, { type: blob.type || "image/jpeg" });
+      const file = new File([blob], filename, {
+        type: blob.type || mimeType,
+      });
+      if (
+        navigator.share &&
+        navigator.canShare?.({ files: [file] })
+      ) {
         await navigator.share({ files: [file], title, text: title });
         return;
       }
@@ -1060,6 +1253,24 @@ export default function App() {
         </div>
       )}
 
+      {aiCritiqueSpotlight && screen !== "play" && (
+        <aside
+          className="ai-critique-toast"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          <div className="ai-eyebrow">✨ AI画伯のひとこと</div>
+          <strong>{aiCritiqueSpotlight.critique.title}</strong>
+          <p>{aiCritiqueSpotlight.critique.comment}</p>
+          <span>
+            「{aiCritiqueSpotlight.word}」
+            {(aiCritiqueSpotlight.drawerNames || []).length > 0 &&
+              `／${aiCritiqueSpotlight.drawerNames.join("・")}`}
+          </span>
+        </aside>
+      )}
+
       {fanfare && (
         <div className={`fanfare fanfare-${fanfare.roundType}`} role="status">
           <div className="fanfare-inner">
@@ -1068,6 +1279,65 @@ export default function App() {
               <div className="fanfare-sub">{fanfare.names.join("・")}</div>
             )}
           </div>
+        </div>
+      )}
+
+      {stylizeTarget && (
+        <div
+          className="ai-dialog-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) closeStylizeDialog();
+          }}
+        >
+          <section
+            ref={styleDialogRef}
+            className="ai-style-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="ai-style-title"
+          >
+            <div className="ai-dialog-head">
+              <div>
+                <div className="ai-eyebrow">AI名画化</div>
+                <h2 id="ai-style-title">どんな名画にする？</h2>
+              </div>
+              <button
+                type="button"
+                className="ghost-btn ai-dialog-close"
+                onClick={() => closeStylizeDialog()}
+                aria-label="閉じる"
+              >
+                ×
+              </button>
+            </div>
+            <img
+              className="ai-style-preview"
+              src={stylizeTarget.imageDataUrl}
+              alt={`名画化する「${stylizeTarget.word || "絵"}」`}
+            />
+            <p className="hint">
+              元の楽しい線を残したまま変身します。名画化は1ゲームに1枚です。
+            </p>
+            <div className="ai-style-options">
+              {(aiState.styles || []).map((style, index) => (
+                <button
+                  key={style.id}
+                  type="button"
+                  className="ai-style-option"
+                  onClick={() => requestMasterpiece(style.id)}
+                  autoFocus={index === 0}
+                >
+                  <span aria-hidden="true">{style.emoji}</span>
+                  {style.label}
+                </button>
+              ))}
+            </div>
+            {error && (
+              <p className="error" role="alert">
+                {error}
+              </p>
+            )}
+          </section>
         </div>
       )}
 
@@ -1182,6 +1452,14 @@ export default function App() {
           <div className="label">部屋コード</div>
           <div className="code-big">{roomCode}</div>
           <p className="hint">このコードをみんなに教えて入室してもらおう</p>
+          {aiState.enabled && (
+            <>
+              <div className="ai-enabled-badge">✨ AI画伯が参加します</div>
+              <p className="ai-privacy-note">
+                講評のため絵とお題をOpenAIへ送ります（名前は送りません）
+              </p>
+            </>
+          )}
 
           {isHost && inviteUrl && (
             <section className="invite-panel" aria-labelledby="invite-title">
@@ -1263,17 +1541,135 @@ export default function App() {
             みんなで{totalRounds}このお題を描きました
           </p>
 
+          {aiState.enabled && (
+            <section className="ai-ceremony" aria-labelledby="ai-awards-title">
+              <div className="ai-eyebrow">AI画伯 presents</div>
+              <h2 id="ai-awards-title">みんなの授賞式</h2>
+
+              {aiState.awardsStatus === "generating" && (
+                <div className="ai-busy" role="status">
+                  <span className="ai-busy-icon" aria-hidden="true">
+                    🎨
+                  </span>
+                  作品を見ながら賞を考えています…
+                </div>
+              )}
+
+              {aiState.awardsStatus === "ready" &&
+                aiState.awards?.awards?.length > 0 && (
+                  <>
+                    <p className="ai-ceremony-intro">
+                      {aiState.awards.intro}
+                    </p>
+                    <ol className="ai-award-list">
+                      {aiState.awards.awards.map((award) => {
+                        const item = gallery.find(
+                          (candidate) =>
+                            candidate.id === award.galleryItemId
+                        );
+                        return (
+                          <li
+                            key={`${award.galleryItemId}-${award.title}`}
+                            className={`ai-award-item${item ? "" : " no-image"}`}
+                          >
+                            {item && (
+                              <img
+                                src={item.imageDataUrl}
+                                alt={item.word || "受賞作品"}
+                              />
+                            )}
+                            <div>
+                              <strong>🏆 {award.title}</strong>
+                              {item && (
+                                <span className="ai-award-work">
+                                  「{item.word}」
+                                  {(item.drawerNames || []).length > 0 &&
+                                    `／${item.drawerNames.join("・")}`}
+                                </span>
+                              )}
+                              <p>{award.reason}</p>
+                            </div>
+                          </li>
+                        );
+                      })}
+                    </ol>
+                    <p className="hint">
+                      ギャラリーから、お気に入りの1枚をAI名画にもできます
+                    </p>
+                  </>
+                )}
+
+              {(aiState.awardsStatus === "idle" ||
+                aiState.awardsStatus === "error") && (
+                <>
+                  {aiState.pendingCritiques > 0 ? (
+                    <p className="ai-ceremony-note" role="status">
+                      AI画伯があと{aiState.pendingCritiques}
+                      枚を鑑賞しています…
+                    </p>
+                  ) : aiState.readyCritiques < 2 ? (
+                    <p className="ai-ceremony-note">
+                      講評できた作品が2枚以上あると授賞式を開けます
+                    </p>
+                  ) : (
+                    <p className="ai-ceremony-note">
+                      それぞれ違う魅力を、楽しい賞にして発表します
+                    </p>
+                  )}
+                  {aiState.awardsError && (
+                    <p className="error" role="alert">
+                      {aiState.awardsError}
+                    </p>
+                  )}
+                  {isHost &&
+                  (aiState.awardsStatus === "idle" ||
+                    aiState.canRetryAwards) ? (
+                    <button
+                      type="button"
+                      className="ai-awards-button"
+                      onClick={requestAiAwards}
+                      disabled={
+                        aiState.pendingCritiques > 0 ||
+                        aiState.readyCritiques < 2
+                      }
+                    >
+                      {aiState.awardsStatus === "error"
+                        ? "授賞式をもう一度ためす"
+                        : "AI授賞式をはじめる"}
+                    </button>
+                  ) : !isHost ? (
+                    <p className="hint">ホストが授賞式を始められます</p>
+                  ) : (
+                    <p className="hint">
+                      このゲームの授賞式は終了しました
+                    </p>
+                  )}
+                </>
+              )}
+            </section>
+          )}
+
+          {isMasterpieceGenerating && (
+            <p className="finish-wait" role="status">
+              AI名画を制作中です。完成すると延長・ロビーへ戻る操作ができます
+            </p>
+          )}
+
           <div className="actions">
             {isHost ? (
               <>
-                <button type="button" onClick={extendGame} disabled={finishBusy}>
+                <button
+                  type="button"
+                  onClick={extendGame}
+                  disabled={finishBusy || isMasterpieceGenerating}
+                >
                   あと{extensionRounds}問だけ延長！
                 </button>
                 <button
                   type="button"
                   className="secondary"
                   onClick={endGame}
-                  disabled={finishBusy}
+                  disabled={finishBusy || isMasterpieceGenerating}
                 >
                   ロビーへ戻る
                 </button>
@@ -1327,6 +1723,53 @@ export default function App() {
               : "まだ絵がありません。ラウンドを進めるとここに残ります"}
           </p>
 
+          {aiState.enabled &&
+            aiState.masterpieceStatus === "generating" && (
+              <section className="ai-masterpiece ai-masterpiece-busy">
+                <div className="ai-busy" role="status">
+                  <span className="ai-busy-icon" aria-hidden="true">
+                    🖌️
+                  </span>
+                  AI画伯が名画を制作中…完成まで少しかかります
+                </div>
+              </section>
+            )}
+
+          {aiState.enabled &&
+            aiState.masterpieceStatus === "ready" &&
+            masterpieceItem && (
+              <section
+                className="ai-masterpiece"
+                aria-labelledby="masterpiece-title"
+              >
+                <div className="ai-eyebrow">✨ AI名画が完成！</div>
+                <h2 id="masterpiece-title">
+                  {aiState.masterpiece?.styleLabel || "名画"}になった「
+                  {masterpieceItem.word}」
+                </h2>
+                <img
+                  src={masterpieceItem.imageDataUrl}
+                  alt={`${masterpieceItem.word || "絵"}のAI名画`}
+                />
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => saveImage(masterpieceItem)}
+                >
+                  名画を保存・共有
+                </button>
+              </section>
+            )}
+
+          {aiState.enabled &&
+            (aiState.masterpieceStatus === "error" ||
+              aiState.masterpieceStatus === "used") &&
+            aiState.masterpieceError && (
+              <p className="ai-masterpiece-error" role="status">
+                {aiState.masterpieceError}
+              </p>
+            )}
+
           {gallery.length > 0 && (
             <div className="gallery-toolbar">
               <button
@@ -1368,7 +1811,7 @@ export default function App() {
               .map((item) => (
                 <div
                   key={item.id}
-                  className={`gallery-item${selectedIds.has(item.id) ? " selected" : ""}`}
+                  className={`gallery-item${selectedIds.has(item.id) ? " selected" : ""}${item.isMasterpiece ? " is-masterpiece" : ""}`}
                   onClick={() => {
                     if (gallerySelectMode) toggleSelect(item.id);
                   }}
@@ -1396,10 +1839,31 @@ export default function App() {
                   )}
                   <div className="gallery-image-wrap">
                     <img src={item.imageDataUrl} alt={item.word || "絵"} />
+                    {item.isMasterpiece && (
+                      <span className="gallery-masterpiece-badge">
+                        ✨ {item.styleLabel || "AI名画"}
+                      </span>
+                    )}
                   </div>
                   <div className="gallery-meta">
                     <span className="gallery-word">{item.word}</span>
                   </div>
+                  {!item.isMasterpiece &&
+                    aiState.enabled &&
+                    item.aiCritiqueStatus === "pending" && (
+                      <div className="gallery-ai-pending" role="status">
+                        🎨 AI画伯が鑑賞中…
+                      </div>
+                    )}
+                  {!item.isMasterpiece &&
+                    aiState.enabled &&
+                    item.aiCritiqueStatus === "ready" &&
+                    item.aiCritique && (
+                      <div className="gallery-ai-critique">
+                        <strong>✨ {item.aiCritique.title}</strong>
+                        <p>{item.aiCritique.comment}</p>
+                      </div>
+                    )}
                   <div className="gallery-foot">
                     <div className="gallery-drawers">
                       {(item.drawerNames || []).join("・")}
@@ -1417,6 +1881,29 @@ export default function App() {
                       </button>
                     )}
                   </div>
+                  {!gallerySelectMode &&
+                    !item.isMasterpiece &&
+                    isHost &&
+                    returnScreen === "finished" &&
+                    aiState.enabled &&
+                    item.gameSeq === aiState.gameSeq &&
+                    (aiState.masterpieceStatus === "idle" ||
+                      (aiState.masterpieceStatus === "error" &&
+                        aiState.canRetryMasterpiece)) && (
+                      <button
+                        type="button"
+                        className="gallery-masterpiece-button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setError("");
+                          stylizeReturnFocusRef.current =
+                            event.currentTarget;
+                          setStylizeTargetId(item.id);
+                        }}
+                      >
+                        ✨ この絵を名画化
+                      </button>
+                    )}
                 </div>
               ))}
           </div>
@@ -1429,6 +1916,17 @@ export default function App() {
         <>
           <div className={`card play-header tape-yellow ${modeClass}`}>
             {renderPlayHeader()}
+            {aiCritiqueSpotlight && (
+              <div
+                className="ai-critique-inline"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+              >
+                <strong>✨ {aiCritiqueSpotlight.critique.title}</strong>
+                <span>{aiCritiqueSpotlight.critique.comment}</span>
+              </div>
+            )}
           </div>
 
           <div className={`easel ${modeClass}`}>

@@ -1,4 +1,9 @@
-import { randomUUID } from "crypto";
+import {
+  createHash,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+} from "crypto";
 import cors from "cors";
 import express from "express";
 import { existsSync } from "fs";
@@ -6,9 +11,19 @@ import { createServer } from "http";
 import path from "path";
 import { fileURLToPath } from "url";
 import { Server } from "socket.io";
+import {
+  aiErrorLogDetails,
+  createAwards,
+  critiqueDrawing,
+  isAiConfigured,
+  parseImageDataUrl,
+  publicAiCapabilities,
+  stylizeDrawing,
+} from "./ai.js";
 import { randomWord } from "./words.js";
 
 const PORT = process.env.PORT || 3001;
+const MAX_ROOMS = 100;
 const MAX_PLAYERS = 20;
 const DISCONNECT_GRACE_MS = 45_000;
 /** 通常ラウンドの描き手が切断したときは短めに見切る（全員が待たされるため） */
@@ -30,18 +45,80 @@ const EVENT_FORCE_GAP = 6;
 const EVENT_CHANCE = 0.3;
 const EXTENSION_ROUNDS = 3;
 const MAX_GALLERY_DATA_URL_LEN = 400_000;
+const MAX_TOTAL_GALLERY_DATA_URL_LEN = 80_000_000;
+const MASTERPIECE_STORAGE_RESERVE = 10_000_000;
 const MAX_STROKES = 20_000;
 const RECENT_WORDS_MAX = 20;
+const AI_RATE_WINDOW_MS = 60 * 60 * 1000;
+const AI_RATE_LIMITS = {
+  room: Math.max(1, Number(process.env.ROOM_CREATE_RATE_LIMIT) || 10),
+  critique: Math.max(1, Number(process.env.AI_CRITIQUE_RATE_LIMIT) || 90),
+  awards: Math.max(1, Number(process.env.AI_AWARDS_RATE_LIMIT) || 12),
+  masterpiece: Math.max(
+    1,
+    Number(process.env.AI_MASTERPIECE_RATE_LIMIT) || 4,
+  ),
+};
+const AI_GLOBAL_RATE_LIMITS = {
+  room: Math.max(
+    1,
+    Number(process.env.GLOBAL_ROOM_CREATE_RATE_LIMIT) || 200,
+  ),
+  critique: Math.max(
+    1,
+    Number(process.env.AI_GLOBAL_CRITIQUE_RATE_LIMIT) || 240,
+  ),
+  awards: Math.max(
+    1,
+    Number(process.env.AI_GLOBAL_AWARDS_RATE_LIMIT) || 40,
+  ),
+  masterpiece: Math.max(
+    1,
+    Number(process.env.AI_GLOBAL_MASTERPIECE_RATE_LIMIT) || 12,
+  ),
+};
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const clientDist = path.join(__dirname, "../client/dist");
 
+function normalizeOrigin(value) {
+  try {
+    return new URL(String(value || "").trim()).origin;
+  } catch {
+    return "";
+  }
+}
+
+const allowedOrigins = new Set(
+  [
+    process.env.APP_ORIGIN,
+    process.env.RENDER_EXTERNAL_URL,
+    ...String(process.env.ALLOWED_ORIGINS || "").split(","),
+  ]
+    .map(normalizeOrigin)
+    .filter(Boolean),
+);
+
+function isOriginAllowed(origin) {
+  if (!origin || process.env.NODE_ENV !== "production") {
+    return true;
+  }
+  return allowedOrigins.has(normalizeOrigin(origin));
+}
+
+function allowCorsOrigin(origin, callback) {
+  callback(null, isOriginAllowed(origin));
+}
+
 const app = express();
-app.use(cors());
+app.use(cors({ origin: allowCorsOrigin }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
-  cors: { origin: true, methods: ["GET", "POST"] },
+  cors: { origin: allowCorsOrigin, methods: ["GET", "POST"] },
+  allowRequest: (req, callback) => {
+    callback(null, isOriginAllowed(req.headers.origin));
+  },
   maxHttpBufferSize: 1e6,
 });
 
@@ -50,6 +127,7 @@ const io = new Server(httpServer, {
  *  id: string,
  *  name: string,
  *  isHost: boolean,
+ *  resumeToken: string,
  *  socketId: string | null,
  *  disconnectTimer?: ReturnType<typeof setTimeout>,
  * }} Player
@@ -62,6 +140,18 @@ const io = new Server(httpServer, {
  *  drawerNames: string[],
  *  roundType: 'normal' | 'relay' | 'coop' | 'liar',
  *  createdAt: number,
+ *  gameSeq: number,
+ *  isMasterpiece?: boolean,
+ *  sourceId?: string,
+ *  style?: string,
+ *  styleLabel?: string,
+ *  aiCritiqueStatus: 'off' | 'pending' | 'ready' | 'error',
+ *  aiCritique?: {
+ *    title: string,
+ *    comment: string,
+ *    strength: string,
+ *    awardSeed: string,
+ *  },
  * }} GalleryItem
  */
 /**
@@ -93,6 +183,25 @@ const io = new Server(httpServer, {
  *  completedRounds: number,
  *  drawCounts: Map<string, number>,
  *  lastCompletedRoundSeq: number | null,
+ *  gameSeq: number,
+ *  aiAwardsStatus: 'idle' | 'generating' | 'ready' | 'error',
+ *  aiAwards: null | {
+ *    intro: string,
+ *    awards: { galleryItemId: string, title: string, reason: string }[],
+ *  },
+ *  aiAwardsError: string,
+ *  aiAwardsAttempts: number,
+ *  aiAwardsToken: number,
+ *  aiMasterpieceStatus: 'idle' | 'generating' | 'ready' | 'error' | 'used',
+ *  aiMasterpiece: null | {
+ *    galleryItemId: string,
+ *    sourceId: string,
+ *    style: string,
+ *    styleLabel: string,
+ *  },
+ *  aiMasterpieceError: string,
+ *  aiMasterpieceAttempts: number,
+ *  aiMasterpieceToken: number,
  * }} Room
  */
 
@@ -102,6 +211,8 @@ const rooms = new Map();
 const socketRoom = new Map();
 /** socketId -> playerId */
 const socketPlayer = new Map();
+/** client address + AI action -> { startedAt, count } */
+const aiRateWindows = new Map();
 
 function generateCode() {
   for (let i = 0; i < 50; i++) {
@@ -113,10 +224,41 @@ function generateCode() {
 
 /** 全角数字なども半角4桁に正規化 */
 function normalizeRoomCode(code) {
-  return String(code || "")
+  return safeString(code)
     .normalize("NFKC")
     .replace(/\D/g, "")
     .slice(0, 4);
+}
+
+function safeString(value) {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  return "";
+}
+
+function safeNumber(value) {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : Number.NaN;
+  }
+  if (typeof value !== "string" || !value.trim()) return Number.NaN;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : Number.NaN;
+}
+
+function createResumeToken() {
+  return randomBytes(32).toString("base64url");
+}
+
+function resumeTokenMatches(player, candidate) {
+  const token = safeString(candidate);
+  if (!/^[A-Za-z0-9_-]{43}$/.test(token)) return false;
+  const expectedHash = createHash("sha256")
+    .update(player.resumeToken)
+    .digest();
+  const candidateHash = createHash("sha256").update(token).digest();
+  return timingSafeEqual(expectedHash, candidateHash);
 }
 
 function publicPlayers(room) {
@@ -125,6 +267,93 @@ function publicPlayers(room) {
     name: p.name,
     isHost: p.isHost,
   }));
+}
+
+function totalGalleryDataUrlLength() {
+  let total = 0;
+  for (const room of rooms.values()) {
+    for (const item of room.gallery) {
+      total += item.imageDataUrl?.length || 0;
+    }
+  }
+  return total;
+}
+
+function hasGalleryStorageFor(
+  room,
+  imageDataUrl,
+  { masterpiece = false } = {},
+) {
+  const limit = masterpiece
+    ? MAX_TOTAL_GALLERY_DATA_URL_LEN
+    : MAX_TOTAL_GALLERY_DATA_URL_LEN - MASTERPIECE_STORAGE_RESERVE;
+  const evictedLength =
+    room.gallery.length >= GALLERY_MAX
+      ? room.gallery[0]?.imageDataUrl?.length || 0
+      : 0;
+  return (
+    totalGalleryDataUrlLength() +
+      imageDataUrl.length -
+      evictedLength <=
+    limit
+  );
+}
+
+function aiClientAddress(socket) {
+  const forwarded = socket.handshake.headers["x-forwarded-for"];
+  const forwardedText = Array.isArray(forwarded)
+    ? forwarded.join(",")
+    : String(forwarded || "");
+  const lastForwarded = forwardedText.split(",").at(-1);
+  return String(lastForwarded || socket.handshake.address || "unknown")
+    .trim()
+    .slice(0, 96);
+}
+
+function aiSafetyIdentifier(playerId) {
+  return createHash("sha256")
+    .update(String(playerId || "unknown-player"))
+    .digest("hex");
+}
+
+function consumeAiQuota(socket, kind) {
+  const now = Date.now();
+  const clientKey = `${kind}:${aiClientAddress(socket)}`;
+  const globalKey = `global:${kind}`;
+  const clientEntry = aiRateWindows.get(clientKey);
+  const globalEntry = aiRateWindows.get(globalKey);
+  const limit = AI_RATE_LIMITS[kind];
+  const globalLimit = AI_GLOBAL_RATE_LIMITS[kind];
+  if (!limit || !globalLimit) return false;
+
+  if (!clientEntry && aiRateWindows.size >= 5_000) {
+    for (const [entryKey, entry] of aiRateWindows) {
+      if (now - entry.startedAt >= AI_RATE_WINDOW_MS) {
+        aiRateWindows.delete(entryKey);
+      }
+    }
+    if (aiRateWindows.size >= 5_000) return false;
+  }
+
+  const clientCount =
+    clientEntry && now - clientEntry.startedAt < AI_RATE_WINDOW_MS
+      ? clientEntry.count
+      : 0;
+  const globalCount =
+    globalEntry && now - globalEntry.startedAt < AI_RATE_WINDOW_MS
+      ? globalEntry.count
+      : 0;
+  if (clientCount >= limit || globalCount >= globalLimit) return false;
+
+  aiRateWindows.set(clientKey, {
+    startedAt: clientCount === 0 ? now : clientEntry.startedAt,
+    count: clientCount + 1,
+  });
+  aiRateWindows.set(globalKey, {
+    startedAt: globalCount === 0 ? now : globalEntry.startedAt,
+    count: globalCount + 1,
+  });
+  return true;
 }
 
 function activePlayers(room) {
@@ -166,6 +395,127 @@ function emitGallery(room, targetSocketId = null) {
   }
 }
 
+function currentGameGallery(room) {
+  return room.gallery.filter(
+    (item) => item.gameSeq === room.gameSeq && !item.isMasterpiece,
+  );
+}
+
+function buildAiState(room) {
+  const capabilities = publicAiCapabilities();
+  const currentItems = currentGameGallery(room);
+  return {
+    ...capabilities,
+    gameSeq: room.gameSeq,
+    currentGalleryCount: currentItems.length,
+    pendingCritiques: currentItems.filter(
+      (item) => item.aiCritiqueStatus === "pending",
+    ).length,
+    readyCritiques: currentItems.filter(
+      (item) => item.aiCritiqueStatus === "ready",
+    ).length,
+    awardsStatus: room.aiAwardsStatus,
+    awards: room.aiAwards,
+    awardsError: room.aiAwardsError,
+    canRetryAwards: room.aiAwardsAttempts < 2,
+    masterpieceStatus: room.aiMasterpieceStatus,
+    masterpiece: room.aiMasterpiece,
+    masterpieceError: room.aiMasterpieceError,
+    canRetryMasterpiece: room.aiMasterpieceAttempts < 2,
+  };
+}
+
+function emitAiState(room, targetSocketId = null) {
+  const payload = buildAiState(room);
+  if (targetSocketId) {
+    io.to(targetSocketId).emit("aiStateUpdate", payload);
+  } else {
+    io.to(room.code).emit("aiStateUpdate", payload);
+  }
+}
+
+function emitGalleryItemAiUpdate(room, item) {
+  io.to(room.code).emit("galleryItemAiUpdate", {
+    id: item.id,
+    gameSeq: item.gameSeq,
+    aiCritiqueStatus: item.aiCritiqueStatus,
+    aiCritique: item.aiCritique || null,
+  });
+}
+
+function resetAiForNewGame(room) {
+  room.aiAwardsToken += 1;
+  room.aiAwardsStatus = "idle";
+  room.aiAwards = null;
+  room.aiAwardsError = "";
+  room.aiAwardsAttempts = 0;
+  room.aiMasterpieceToken += 1;
+  room.aiMasterpieceStatus = "idle";
+  room.aiMasterpiece = null;
+  room.aiMasterpieceError = "";
+  room.aiMasterpieceAttempts = 0;
+}
+
+function resetAwardsForExtension(room) {
+  room.aiAwardsToken += 1;
+  room.aiAwardsStatus = "idle";
+  room.aiAwards = null;
+  room.aiAwardsError = "";
+  room.aiAwardsAttempts = 0;
+}
+
+function resetAiWhenReturningToLobby(room) {
+  room.aiAwardsToken += 1;
+  room.aiAwardsStatus = "idle";
+  room.aiAwards = null;
+  room.aiAwardsError = "";
+  if (room.aiMasterpieceStatus === "generating") {
+    room.aiMasterpieceToken += 1;
+    room.aiMasterpieceStatus = "idle";
+    room.aiMasterpiece = null;
+    room.aiMasterpieceError = "";
+  }
+}
+
+function friendlyAiError(error, fallback) {
+  const code = String(error?.code || "");
+  if (
+    code === "moderation_blocked" ||
+    code === "image_generation_user_error"
+  ) {
+    return "この絵はAIで処理できませんでした";
+  }
+  if (error?.status === 401 || error?.status === 403) {
+    return "AIの設定を確認してください";
+  }
+  if (error?.status === 429) {
+    if (
+      code === "insufficient_quota" ||
+      code === "billing_hard_limit_reached"
+    ) {
+      return "AIの利用上限に達しました";
+    }
+    return "AI画伯が混み合っています。少し待って試してください";
+  }
+  if (
+    error?.name === "TimeoutError" ||
+    String(error?.message || "").includes("timed out")
+  ) {
+    return "AI画伯の返事に時間がかかりました";
+  }
+  if (
+    String(error?.message || "").includes("moderation") ||
+    String(error?.message || "").includes("refused")
+  ) {
+    return "この絵は名画化できませんでした";
+  }
+  return fallback;
+}
+
+function logAiFailure(kind, error) {
+  console.error(`[ai] ${kind} failed`, aiErrorLogDetails(error));
+}
+
 function bindSocket(socket, room, player) {
   if (player.disconnectTimer) {
     clearTimeout(player.disconnectTimer);
@@ -174,6 +524,7 @@ function bindSocket(socket, room, player) {
   if (player.socketId && player.socketId !== socket.id) {
     socketRoom.delete(player.socketId);
     socketPlayer.delete(player.socketId);
+    io.sockets.sockets.get(player.socketId)?.leave(room.code);
   }
   player.socketId = socket.id;
   socketRoom.set(socket.id, room.code);
@@ -202,6 +553,39 @@ function shuffle(arr) {
 
 function randomInt(min, max) {
   return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+function reply(callback, payload) {
+  if (typeof callback === "function") {
+    callback(payload);
+  }
+}
+
+function onSocket(socket, event, handler) {
+  socket.on(event, (...args) => {
+    const handleError = (error) => {
+      const message =
+        error instanceof Error ? error.message.slice(0, 160) : "Unknown error";
+      console.error("[socket] event failed", { event, message });
+      const callback = args.at(-1);
+      if (typeof callback === "function") {
+        try {
+          callback({ ok: false, error: "入力を処理できませんでした" });
+        } catch {
+          // A broken acknowledgement must not terminate the process.
+        }
+      }
+    };
+
+    try {
+      const result = handler(...args);
+      if (result && typeof result.then === "function") {
+        result.catch(handleError);
+      }
+    } catch (error) {
+      handleError(error);
+    }
+  });
 }
 
 function chooseTotalRounds(playerCount) {
@@ -553,6 +937,7 @@ function finishGame(room) {
   io.to(room.code).emit("clearCanvas");
   emitLobby(room);
   io.to(room.code).emit("gameFinished", buildFinishedPayload(room));
+  emitAiState(room);
 }
 
 function pickWord(room) {
@@ -678,6 +1063,7 @@ function startRound(room) {
 function syncPlayerState(socket, room, playerId) {
   const players = publicPlayers(room);
   emitGallery(room, socket.id);
+  emitAiState(room, socket.id);
   if (room.phase === "playing" && room.word) {
     io.to(socket.id).emit("roundStart", buildRoundPayload(room, playerId));
     io.to(socket.id).emit("strokeHistory", { strokes: room.strokes });
@@ -746,9 +1132,11 @@ function removePlayer(room, playerId) {
     resetRoundFields(room);
     resetGameProgress(room);
     room.drawerStreak = null;
+    resetAiWhenReturningToLobby(room);
     io.to(room.code).emit("clearCanvas");
     io.to(room.code).emit("gameEnded", { reason: "alone" });
     emitLobby(room);
+    emitAiState(room);
     return;
   }
 
@@ -840,12 +1228,111 @@ function scheduleDisconnect(room, player, graceMs = DISCONNECT_GRACE_MS) {
   }, graceMs);
 }
 
-function addGalleryItem(room, { imageDataUrl, word, drawerNames, roundType }) {
-  if (!imageDataUrl || typeof imageDataUrl !== "string") return;
-  if (!imageDataUrl.startsWith("data:image/")) return;
-  if (imageDataUrl.length > MAX_GALLERY_DATA_URL_LEN) return;
+function trimGallery(room) {
+  if (room.gallery.length > GALLERY_MAX) {
+    room.gallery = room.gallery.slice(-GALLERY_MAX);
+  }
+}
 
-  room.gallery.push({
+function queueDrawingCritique(room, item, safetyIdentifier) {
+  if (!isAiConfigured() || item.aiCritiqueStatus !== "pending") return;
+
+  const roomCode = room.code;
+  const itemId = item.id;
+  const gameSeq = item.gameSeq;
+  const isCurrent = () => {
+    const currentRoom = rooms.get(roomCode);
+    const currentItem = currentRoom?.gallery.find(
+      (galleryItem) =>
+        galleryItem.id === itemId && galleryItem.gameSeq === gameSeq,
+    );
+    return (
+      currentRoom === room &&
+      currentRoom.gameSeq === gameSeq &&
+      currentItem?.aiCritiqueStatus === "pending"
+    );
+  };
+
+  void (async () => {
+    const queuedRoom = rooms.get(roomCode);
+    const queuedItem = queuedRoom?.gallery.find(
+      (galleryItem) =>
+        galleryItem.id === itemId && galleryItem.gameSeq === gameSeq,
+    );
+    if (!queuedRoom || queuedRoom !== room || !queuedItem) return;
+
+    try {
+      const critique = await critiqueDrawing({
+        imageDataUrl: queuedItem.imageDataUrl,
+        word: queuedItem.word,
+        roundType: queuedItem.roundType,
+        safetyIdentifier,
+        isCurrent,
+      });
+      const currentRoom = rooms.get(roomCode);
+      const currentItem = currentRoom?.gallery.find(
+        (galleryItem) =>
+          galleryItem.id === itemId && galleryItem.gameSeq === gameSeq,
+      );
+      if (!currentRoom || currentRoom !== room || !currentItem) return;
+
+      currentItem.aiCritiqueStatus = "ready";
+      currentItem.aiCritique = critique;
+      emitGalleryItemAiUpdate(currentRoom, currentItem);
+      emitAiState(currentRoom);
+      if (
+        currentRoom.gameSeq === gameSeq &&
+        currentRoom.phase !== "lobby"
+      ) {
+        io.to(roomCode).emit("aiCritiqueReady", {
+          id: currentItem.id,
+          gameSeq,
+          word: currentItem.word,
+          drawerNames: currentItem.drawerNames,
+          critique,
+        });
+      }
+    } catch (error) {
+      if (!String(error?.message || "").includes("cancelled")) {
+        logAiFailure("critique", error);
+      }
+      const currentRoom = rooms.get(roomCode);
+      const currentItem = currentRoom?.gallery.find(
+        (galleryItem) =>
+          galleryItem.id === itemId && galleryItem.gameSeq === gameSeq,
+      );
+      if (!currentRoom || currentRoom !== room || !currentItem) return;
+      currentItem.aiCritiqueStatus = "error";
+      emitGalleryItemAiUpdate(currentRoom, currentItem);
+      emitAiState(currentRoom);
+    }
+  })();
+}
+
+function addGalleryItem(
+  room,
+  {
+    imageDataUrl,
+    word,
+    drawerNames,
+    roundType,
+    allowAiCritique = () => false,
+  },
+) {
+  if (
+    typeof imageDataUrl !== "string" ||
+    imageDataUrl.length > MAX_GALLERY_DATA_URL_LEN ||
+    !parseImageDataUrl(imageDataUrl) ||
+    !hasGalleryStorageFor(room, imageDataUrl)
+  ) {
+    return null;
+  }
+
+  const aiCritiqueAllowed =
+    isAiConfigured() &&
+    typeof allowAiCritique === "function" &&
+    allowAiCritique();
+  const item = {
     id: randomUUID(),
     imageDataUrl,
     word: String(word || "").slice(0, 40),
@@ -854,11 +1341,14 @@ function addGalleryItem(room, { imageDataUrl, word, drawerNames, roundType }) {
       : [],
     roundType: roundType || "normal",
     createdAt: Date.now(),
-  });
-  if (room.gallery.length > GALLERY_MAX) {
-    room.gallery = room.gallery.slice(-GALLERY_MAX);
-  }
+    gameSeq: room.gameSeq,
+    aiCritiqueStatus: aiCritiqueAllowed ? "pending" : "off",
+  };
+  room.gallery.push(item);
+  trimGallery(room);
   emitGallery(room);
+  emitAiState(room);
+  return item;
 }
 
 function createEmptyRoom(code, hostId) {
@@ -891,14 +1381,41 @@ function createEmptyRoom(code, hostId) {
     completedRounds: 0,
     drawCounts: new Map(),
     lastCompletedRoundSeq: null,
+    gameSeq: 0,
+    aiAwardsStatus: "idle",
+    aiAwards: null,
+    aiAwardsError: "",
+    aiAwardsAttempts: 0,
+    aiAwardsToken: 0,
+    aiMasterpieceStatus: "idle",
+    aiMasterpiece: null,
+    aiMasterpieceError: "",
+    aiMasterpieceAttempts: 0,
+    aiMasterpieceToken: 0,
   };
 }
 
 io.on("connection", (socket) => {
-  socket.on("createRoom", ({ name }, cb) => {
+  onSocket(socket, "createRoom", (data, cb) => {
+    const { name } = data || {};
     try {
-      const trimmed = String(name || "").trim().slice(0, 12);
-      if (!trimmed) return cb?.({ ok: false, error: "名前を入力してください" });
+      if (getContext(socket)) {
+        return reply(cb, { ok: false, error: "すでに部屋に入っています" });
+      }
+      const trimmed = safeString(name).trim().slice(0, 12);
+      if (!trimmed) return reply(cb, { ok: false, error: "名前を入力してください" });
+      if (!consumeAiQuota(socket, "room")) {
+        return reply(cb, {
+          ok: false,
+          error: "部屋を続けて作りすぎています。少し待ってください",
+        });
+      }
+      if (rooms.size >= MAX_ROOMS) {
+        return reply(cb, {
+          ok: false,
+          error: "ただいま満室です。少し待って試してください",
+        });
+      }
 
       const code = generateCode();
       const playerId = randomUUID();
@@ -907,16 +1424,18 @@ io.on("connection", (socket) => {
         id: playerId,
         name: trimmed,
         isHost: true,
+        resumeToken: createResumeToken(),
         socketId: null,
       };
       room.players.set(playerId, player);
       rooms.set(code, room);
       bindSocket(socket, room, player);
 
-      cb?.({
+      reply(cb, {
         ok: true,
         code,
         playerId,
+        resumeToken: player.resumeToken,
         hostId: room.hostId,
         players: publicPlayers(room),
         phase: room.phase,
@@ -926,23 +1445,28 @@ io.on("connection", (socket) => {
       });
       emitLobby(room);
       emitGallery(room, socket.id);
+      emitAiState(room, socket.id);
     } catch (e) {
-      cb?.({ ok: false, error: e.message || "部屋を作成できませんでした" });
+      reply(cb, { ok: false, error: e.message || "部屋を作成できませんでした" });
     }
   });
 
-  socket.on("joinRoom", ({ code, name }, cb) => {
-    const trimmed = String(name || "").trim().slice(0, 12);
+  onSocket(socket, "joinRoom", (data, cb) => {
+    const { code, name } = data || {};
+    if (getContext(socket)) {
+      return reply(cb, { ok: false, error: "すでに部屋に入っています" });
+    }
+    const trimmed = safeString(name).trim().slice(0, 12);
     const roomCode = normalizeRoomCode(code);
-    if (!trimmed) return cb?.({ ok: false, error: "名前を入力してください" });
+    if (!trimmed) return reply(cb, { ok: false, error: "名前を入力してください" });
     if (!/^\d{4}$/.test(roomCode)) {
-      return cb?.({ ok: false, error: "部屋コードは4桁です" });
+      return reply(cb, { ok: false, error: "部屋コードは4桁です" });
     }
 
     const room = rooms.get(roomCode);
-    if (!room) return cb?.({ ok: false, error: "部屋が見つかりません" });
+    if (!room) return reply(cb, { ok: false, error: "部屋が見つかりません" });
     if (room.players.size >= MAX_PLAYERS) {
-      return cb?.({ ok: false, error: `部屋が満員です（最大${MAX_PLAYERS}人）` });
+      return reply(cb, { ok: false, error: `部屋が満員です（最大${MAX_PLAYERS}人）` });
     }
 
     const playerId = randomUUID();
@@ -950,15 +1474,17 @@ io.on("connection", (socket) => {
       id: playerId,
       name: trimmed,
       isHost: false,
+      resumeToken: createResumeToken(),
       socketId: null,
     };
     room.players.set(playerId, player);
     bindSocket(socket, room, player);
 
-    cb?.({
+    reply(cb, {
       ok: true,
       code: roomCode,
       playerId,
+      resumeToken: player.resumeToken,
       hostId: room.hostId,
       players: publicPlayers(room),
       phase: room.phase,
@@ -968,31 +1494,49 @@ io.on("connection", (socket) => {
     });
 
     socket.to(roomCode).emit("playerJoined", { name: trimmed });
-    emitGallery(room, socket.id);
 
     if (room.phase !== "lobby") {
       syncPlayerState(socket, room, playerId);
+    } else {
+      emitGallery(room, socket.id);
+      emitAiState(room, socket.id);
     }
     emitLobby(room);
   });
 
-  socket.on("rejoinRoom", ({ code, playerId, name }, cb) => {
+  onSocket(socket, "rejoinRoom", (data, cb) => {
+    const { code, playerId, resumeToken, name } = data || {};
     const roomCode = normalizeRoomCode(code);
-    const id = String(playerId || "").trim();
-    const trimmed = String(name || "").trim().slice(0, 12);
+    const id = safeString(playerId).trim();
+    const trimmed = safeString(name).trim().slice(0, 12);
 
-    if (!/^\d{4}$/.test(roomCode) || !id) {
-      return cb?.({ ok: false, error: "再入室できません", expired: true });
+    if (
+      !/^\d{4}$/.test(roomCode) ||
+      !id ||
+      !/^[A-Za-z0-9_-]{43}$/.test(safeString(resumeToken))
+    ) {
+      return reply(cb, { ok: false, error: "再入室できません", expired: true });
+    }
+    const existingContext = getContext(socket);
+    if (
+      existingContext &&
+      (existingContext.code !== roomCode || existingContext.playerId !== id)
+    ) {
+      return reply(cb, {
+        ok: false,
+        error: "別の部屋に入っています",
+        expired: false,
+      });
     }
 
     const room = rooms.get(roomCode);
     if (!room) {
-      return cb?.({ ok: false, error: "部屋が見つかりません", expired: true });
+      return reply(cb, { ok: false, error: "部屋が見つかりません", expired: true });
     }
 
     const player = room.players.get(id);
-    if (!player) {
-      return cb?.({
+    if (!player || !resumeTokenMatches(player, resumeToken)) {
+      return reply(cb, {
         ok: false,
         error: "セッションが切れました。もう一度入室してください",
         expired: true,
@@ -1003,10 +1547,11 @@ io.on("connection", (socket) => {
     const wasDisconnected = !player.socketId;
     bindSocket(socket, room, player);
 
-    cb?.({
+    reply(cb, {
       ok: true,
       code: roomCode,
       playerId: player.id,
+      resumeToken: player.resumeToken,
       hostId: room.hostId,
       players: publicPlayers(room),
       phase: room.phase,
@@ -1021,39 +1566,42 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("leaveRoom", (cb) => {
+  onSocket(socket, "leaveRoom", (cb) => {
     const ctx = getContext(socket);
-    if (!ctx) return cb?.({ ok: true });
+    if (!ctx) return reply(cb, { ok: true });
     removePlayer(ctx.room, ctx.playerId);
-    cb?.({ ok: true });
+    reply(cb, { ok: true });
   });
 
-  socket.on("startGame", (cb) => {
+  onSocket(socket, "startGame", (cb) => {
     const ctx = getContext(socket);
-    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
     const { room, playerId } = ctx;
     if (room.hostId !== playerId) {
-      return cb?.({ ok: false, error: "ホストだけが開始できます" });
+      return reply(cb, { ok: false, error: "ホストだけが開始できます" });
     }
     if (room.phase !== "lobby") {
-      return cb?.({ ok: false, error: "すでにゲームが始まっています" });
+      return reply(cb, { ok: false, error: "すでにゲームが始まっています" });
     }
     const activeCount = activePlayers(room).length;
     if (activeCount < 2) {
-      return cb?.({ ok: false, error: "2人以上必要です" });
+      return reply(cb, { ok: false, error: "2人以上必要です" });
     }
     room.drawerStreak = null;
     room.roundsSinceSpecial = 0;
     room.lastWasSpecial = false;
+    room.gameSeq += 1;
+    resetAiForNewGame(room);
     room.totalRounds = chooseTotalRounds(activeCount);
     room.completedRounds = 0;
     room.drawCounts = new Map();
     room.lastCompletedRoundSeq = null;
     startRound(room);
-    cb?.({ ok: true, totalRounds: room.totalRounds });
+    emitAiState(room);
+    reply(cb, { ok: true, totalRounds: room.totalRounds });
   });
 
-  socket.on("stroke", (data) => {
+  onSocket(socket, "stroke", (data) => {
     const ctx = getContext(socket);
     if (!ctx) return;
     const { code, room, playerId } = ctx;
@@ -1065,14 +1613,14 @@ io.on("connection", (socket) => {
     /** @type {Record<string, unknown>} */
     const event = { type, playerId };
     if (type !== "end") {
-      const x = Number(data.x);
-      const y = Number(data.y);
+      const x = safeNumber(data.x);
+      const y = safeNumber(data.y);
       if (!Number.isFinite(x) || !Number.isFinite(y)) return;
       event.x = x;
       event.y = y;
       event.color =
         typeof data.color === "string" ? data.color.slice(0, 24) : "#1a1a1a";
-      event.width = Math.min(40, Math.max(1, Number(data.width) || 4));
+      event.width = Math.min(40, Math.max(1, safeNumber(data.width) || 4));
     }
 
     room.strokes.push(event);
@@ -1082,19 +1630,19 @@ io.on("connection", (socket) => {
     socket.to(code).emit("stroke", event);
   });
 
-  socket.on("requestStrokeHistory", (cb) => {
+  onSocket(socket, "requestStrokeHistory", (cb) => {
     const ctx = getContext(socket);
-    if (!ctx) return cb?.({ ok: false, strokes: [] });
-    cb?.({ ok: true, strokes: ctx.room.strokes });
+    if (!ctx) return reply(cb, { ok: false, strokes: [] });
+    reply(cb, { ok: true, strokes: ctx.room.strokes });
   });
 
-  socket.on("timeSync", (cb) => {
-    cb?.({ now: Date.now() });
+  onSocket(socket, "timeSync", (cb) => {
+    reply(cb, { now: Date.now() });
   });
 
-  socket.on("revealLiar", (cb) => {
+  onSocket(socket, "revealLiar", (cb) => {
     const ctx = getContext(socket);
-    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
     const { code, room, playerId } = ctx;
     // すでに発表済みなら同時押しでもエラーにしない
     if (
@@ -1102,10 +1650,10 @@ io.on("connection", (socket) => {
       room.roundType === "liar" &&
       room.drawPhase === "reveal"
     ) {
-      return cb?.({ ok: true });
+      return reply(cb, { ok: true });
     }
     if (!canRevealLiar(room, playerId)) {
-      return cb?.({ ok: false, error: "こたえあわせできません" });
+      return reply(cb, { ok: false, error: "こたえあわせできません" });
     }
     room.drawPhase = "reveal";
     io.to(code).emit("liarReveal", {
@@ -1113,50 +1661,57 @@ io.on("connection", (socket) => {
       word: room.word,
     });
     emitRoundSync(room);
-    cb?.({ ok: true });
+    reply(cb, { ok: true });
   });
 
-  socket.on("nextRound", (data, cb) => {
+  onSocket(socket, "nextRound", (data, cb) => {
     if (typeof data === "function") {
       cb = data;
       data = {};
     }
-    const imageDataUrl = data?.imageDataUrl;
+    const imageDataUrl =
+      typeof data?.imageDataUrl === "string" ? data.imageDataUrl : "";
     const ctx = getContext(socket);
-    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
     const { room, playerId } = ctx;
     const clientRoundId = data?.roundId;
     if (!Number.isInteger(clientRoundId)) {
-      return cb?.({ ok: false, error: "ラウンド情報がありません" });
+      return reply(cb, { ok: false, error: "ラウンド情報がありません" });
     }
     if (clientRoundId === room.lastCompletedRoundSeq) {
-      return cb?.({ ok: true, stale: true });
+      return reply(cb, { ok: true, stale: true });
     }
     if (room.phase === "finished") {
-      return cb?.({ ok: true, finished: true });
+      return reply(cb, { ok: true, finished: true });
     }
     if (room.phase !== "playing") {
-      return cb?.({ ok: false, error: "プレイ中ではありません" });
+      return reply(cb, { ok: false, error: "プレイ中ではありません" });
     }
     // 同時押し対策: 別のラウンドに対する「つぎへ」は黙って無視する
     if (clientRoundId !== room.roundSeq) {
-      return cb?.({ ok: true, stale: true });
+      return reply(cb, { ok: true, stale: true });
     }
     if (!canPlayerNextRound(room, playerId)) {
-      return cb?.({ ok: false, error: "つぎへ進めません" });
+      return reply(cb, { ok: false, error: "つぎへ進めません" });
     }
 
     const drawerNames = playerNames(room, room.drawerIds);
     const word = room.word;
     const roundType = room.roundType;
 
+    let galleryItem = null;
+    let critiqueSafetyIdentifier = "";
     if (imageDataUrl) {
-      addGalleryItem(room, {
+      galleryItem = addGalleryItem(room, {
         imageDataUrl,
         word,
         drawerNames,
         roundType,
+        allowAiCritique: () => consumeAiQuota(socket, "critique"),
       });
+      if (galleryItem?.aiCritiqueStatus === "pending") {
+        critiqueSafetyIdentifier = aiSafetyIdentifier(playerId);
+      }
     }
 
     recordDrawers(
@@ -1167,84 +1722,484 @@ io.on("connection", (socket) => {
     room.completedRounds += 1;
     if (room.completedRounds >= room.totalRounds) {
       finishGame(room);
-      cb?.({ ok: true, finished: true });
+      if (galleryItem) {
+        queueDrawingCritique(room, galleryItem, critiqueSafetyIdentifier);
+      }
+      reply(cb, { ok: true, finished: true });
       return;
     }
 
     startRound(room);
-    cb?.({ ok: true });
+    if (galleryItem) {
+      queueDrawingCritique(room, galleryItem, critiqueSafetyIdentifier);
+    }
+    reply(cb, { ok: true });
   });
 
-  socket.on("extendGame", (cb) => {
+  onSocket(socket, "extendGame", (cb) => {
     const ctx = getContext(socket);
-    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
     const { code, room, playerId } = ctx;
     if (room.hostId !== playerId) {
-      return cb?.({ ok: false, error: "ホストだけが延長できます" });
+      return reply(cb, { ok: false, error: "ホストだけが延長できます" });
     }
     if (room.phase !== "finished") {
-      return cb?.({ ok: false, error: "いまは延長できません" });
+      return reply(cb, { ok: false, error: "いまは延長できません" });
     }
     if (activePlayers(room).length < 2) {
-      return cb?.({ ok: false, error: "延長には2人以上必要です" });
+      return reply(cb, { ok: false, error: "延長には2人以上必要です" });
+    }
+    if (room.aiMasterpieceStatus === "generating") {
+      return reply(cb, {
+        ok: false,
+        error: "AI名画が完成してから延長できます",
+      });
     }
 
     room.totalRounds += EXTENSION_ROUNDS;
+    resetAwardsForExtension(room);
     io.to(code).emit("gameExtended", {
       addedRounds: EXTENSION_ROUNDS,
       totalRounds: room.totalRounds,
     });
     startRound(room);
-    cb?.({ ok: true, totalRounds: room.totalRounds });
+    emitAiState(room);
+    reply(cb, { ok: true, totalRounds: room.totalRounds });
   });
 
-  socket.on("endGame", (cb) => {
+  onSocket(socket, "endGame", (cb) => {
     const ctx = getContext(socket);
-    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
     const { code, room, playerId } = ctx;
     if (room.hostId !== playerId) {
-      return cb?.({ ok: false, error: "ホストだけが終了できます" });
+      return reply(cb, { ok: false, error: "ホストだけが終了できます" });
+    }
+    if (room.aiMasterpieceStatus === "generating") {
+      return reply(cb, {
+        ok: false,
+        error: "AI名画が完成してからロビーへ戻れます",
+      });
     }
     clearTurnTimer(room);
     room.phase = "lobby";
     resetRoundFields(room);
     resetGameProgress(room);
     room.drawerStreak = null;
+    resetAiWhenReturningToLobby(room);
     io.to(code).emit("clearCanvas");
     io.to(code).emit("gameEnded");
     emitLobby(room);
+    emitAiState(room);
     // gallery is kept for room lifetime
-    cb?.({ ok: true });
+    reply(cb, { ok: true });
   });
 
-  socket.on("deleteGalleryItems", ({ ids }, cb) => {
+  onSocket(socket, "requestAiAwards", (cb) => {
     const ctx = getContext(socket);
-    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { room, playerId } = ctx;
+    if (!isAiConfigured()) {
+      return reply(cb, { ok: false, error: "AI画伯はまだ準備中です" });
+    }
+    if (room.hostId !== playerId) {
+      return reply(cb, { ok: false, error: "ホストだけが授賞式を始められます" });
+    }
+    if (room.phase !== "finished") {
+      return reply(cb, { ok: false, error: "ゲーム終了後に授賞式を始められます" });
+    }
+    if (room.aiAwardsStatus === "ready") {
+      return reply(cb, { ok: true, ready: true });
+    }
+    if (room.aiAwardsStatus === "generating") {
+      return reply(cb, { ok: true, generating: true });
+    }
+    if (room.aiAwardsAttempts >= 2) {
+      return reply(cb, {
+        ok: false,
+        error: "このゲームの授賞式はこれ以上やり直せません",
+      });
+    }
+
+    const items = currentGameGallery(room);
+    if (items.length < 2) {
+      return reply(cb, { ok: false, error: "授賞式には絵が2枚以上必要です" });
+    }
+    const pendingCount = items.filter(
+      (item) => item.aiCritiqueStatus === "pending",
+    ).length;
+    if (pendingCount > 0) {
+      return reply(cb, {
+        ok: false,
+        error: `AI画伯があと${pendingCount}枚を鑑賞中です`,
+      });
+    }
+    const candidates = items
+      .filter(
+        (item) =>
+          item.aiCritiqueStatus === "ready" && Boolean(item.aiCritique),
+      )
+      .map((item) => ({
+        id: item.id,
+        word: item.word,
+        roundType: item.roundType,
+        aiCritique: item.aiCritique,
+      }));
+    if (candidates.length < 2) {
+      return reply(cb, {
+        ok: false,
+        error: "講評できた作品が2枚以上あると授賞式を開けます",
+      });
+    }
+    if (!consumeAiQuota(socket, "awards")) {
+      return reply(cb, {
+        ok: false,
+        error: "授賞式の利用上限です。時間をおいて試してください",
+      });
+    }
+
+    const gameSeq = room.gameSeq;
+    const token = room.aiAwardsToken + 1;
+    const safetyIdentifier = aiSafetyIdentifier(playerId);
+    room.aiAwardsToken = token;
+    room.aiAwardsStatus = "generating";
+    room.aiAwards = null;
+    room.aiAwardsError = "";
+    room.aiAwardsAttempts += 1;
+    emitAiState(room);
+    reply(cb, { ok: true, generating: true });
+
+    const isCurrent = () => {
+      const currentRoom = rooms.get(room.code);
+      return (
+        currentRoom === room &&
+        currentRoom.gameSeq === gameSeq &&
+        currentRoom.aiAwardsToken === token &&
+        currentRoom.aiAwardsStatus === "generating" &&
+        currentRoom.phase === "finished"
+      );
+    };
+
+    void createAwards(candidates, { safetyIdentifier, isCurrent })
+      .then((awards) => {
+        const currentRoom = rooms.get(room.code);
+        if (
+          !currentRoom ||
+          currentRoom !== room ||
+          currentRoom.gameSeq !== gameSeq ||
+          currentRoom.aiAwardsToken !== token ||
+          currentRoom.phase !== "finished"
+        ) {
+          return;
+        }
+        const currentIds = new Set(
+          currentGameGallery(currentRoom).map((item) => item.id),
+        );
+        if (
+          awards.awards.some(
+            (award) => !currentIds.has(award.galleryItemId),
+          )
+        ) {
+          throw new Error("Award source drawing was removed");
+        }
+        currentRoom.aiAwardsStatus = "ready";
+        currentRoom.aiAwards = awards;
+        currentRoom.aiAwardsError = "";
+        emitAiState(currentRoom);
+        io.to(currentRoom.code).emit("aiAwardsReady", { gameSeq });
+      })
+      .catch((error) => {
+        logAiFailure("awards", error);
+        const currentRoom = rooms.get(room.code);
+        if (
+          !currentRoom ||
+          currentRoom !== room ||
+          currentRoom.gameSeq !== gameSeq ||
+          currentRoom.aiAwardsToken !== token
+        ) {
+          return;
+        }
+        currentRoom.aiAwardsStatus = "error";
+        currentRoom.aiAwards = null;
+        currentRoom.aiAwardsError = friendlyAiError(
+          error,
+          "授賞式を開けませんでした。もう一度試してください",
+        );
+        emitAiState(currentRoom);
+      });
+  });
+
+  onSocket(socket, "stylizeGalleryItem", (data, cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { room, playerId } = ctx;
+    if (!isAiConfigured()) {
+      return reply(cb, { ok: false, error: "AI画伯はまだ準備中です" });
+    }
+    if (room.hostId !== playerId) {
+      return reply(cb, { ok: false, error: "ホストだけが名画化できます" });
+    }
+    if (room.phase !== "finished") {
+      return reply(cb, { ok: false, error: "ゲーム終了後に名画化できます" });
+    }
+    if (
+      room.aiMasterpieceStatus === "ready" ||
+      room.aiMasterpieceStatus === "used"
+    ) {
+      return reply(cb, { ok: false, error: "名画化は1ゲームに1枚です" });
+    }
+    if (room.aiMasterpieceStatus === "generating") {
+      return reply(cb, { ok: true, generating: true });
+    }
+    if (room.aiMasterpieceAttempts >= 2) {
+      return reply(cb, {
+        ok: false,
+        error: "このゲームの名画化はこれ以上やり直せません",
+      });
+    }
+
+    const sourceId = safeString(data?.id);
+    const style = safeString(data?.style);
+    const styleInfo = publicAiCapabilities().styles.find(
+      (candidate) => candidate.id === style,
+    );
+    const source = room.gallery.find(
+      (item) =>
+        item.id === sourceId &&
+        item.gameSeq === room.gameSeq &&
+        !item.isMasterpiece,
+    );
+    if (!source) {
+      return reply(cb, { ok: false, error: "元の絵が見つかりません" });
+    }
+    if (!styleInfo) {
+      return reply(cb, { ok: false, error: "名画のスタイルを選んでください" });
+    }
+    if (!consumeAiQuota(socket, "masterpiece")) {
+      return reply(cb, {
+        ok: false,
+        error: "名画化の利用上限です。時間をおいて試してください",
+      });
+    }
+
+    const gameSeq = room.gameSeq;
+    const token = room.aiMasterpieceToken + 1;
+    const sourceSnapshot = {
+      id: source.id,
+      imageDataUrl: source.imageDataUrl,
+      word: source.word,
+      drawerNames: [...source.drawerNames],
+      roundType: source.roundType,
+    };
+    room.aiMasterpieceToken = token;
+    room.aiMasterpieceStatus = "generating";
+    room.aiMasterpiece = {
+      galleryItemId: "",
+      sourceId,
+      style,
+      styleLabel: styleInfo.label,
+    };
+    room.aiMasterpieceError = "";
+    room.aiMasterpieceAttempts += 1;
+    emitAiState(room);
+    reply(cb, { ok: true, generating: true });
+
+    const isCurrent = () => {
+      const currentRoom = rooms.get(room.code);
+      return (
+        currentRoom === room &&
+        currentRoom.gameSeq === gameSeq &&
+        currentRoom.aiMasterpieceToken === token &&
+        currentRoom.aiMasterpieceStatus === "generating" &&
+        currentRoom.phase !== "lobby" &&
+        currentRoom.gallery.some(
+          (item) =>
+            item.id === sourceId &&
+            item.gameSeq === gameSeq &&
+            !item.isMasterpiece,
+        )
+      );
+    };
+
+    void stylizeDrawing({
+      imageDataUrl: sourceSnapshot.imageDataUrl,
+      word: sourceSnapshot.word,
+      style,
+      isCurrent,
+    })
+      .then((imageDataUrl) => {
+        const currentRoom = rooms.get(room.code);
+        if (
+          !currentRoom ||
+          currentRoom !== room ||
+          currentRoom.gameSeq !== gameSeq ||
+          currentRoom.aiMasterpieceToken !== token ||
+          currentRoom.phase === "lobby"
+        ) {
+          return;
+        }
+        const currentSource = currentRoom.gallery.find(
+          (item) =>
+            item.id === sourceId &&
+            item.gameSeq === gameSeq &&
+            !item.isMasterpiece,
+        );
+        if (!currentSource) {
+          throw new Error("Masterpiece source drawing was removed");
+        }
+        if (
+          !hasGalleryStorageFor(room, imageDataUrl, { masterpiece: true })
+        ) {
+          throw new Error("Gallery storage is full");
+        }
+
+        const masterpieceItem = {
+          id: randomUUID(),
+          imageDataUrl,
+          word: sourceSnapshot.word,
+          drawerNames: sourceSnapshot.drawerNames,
+          roundType: sourceSnapshot.roundType,
+          createdAt: Date.now(),
+          gameSeq,
+          isMasterpiece: true,
+          sourceId,
+          style,
+          styleLabel: styleInfo.label,
+          aiCritiqueStatus: "off",
+        };
+        currentRoom.gallery.push(masterpieceItem);
+        trimGallery(currentRoom);
+        currentRoom.aiMasterpieceStatus = "ready";
+        currentRoom.aiMasterpiece = {
+          galleryItemId: masterpieceItem.id,
+          sourceId,
+          style,
+          styleLabel: styleInfo.label,
+        };
+        currentRoom.aiMasterpieceError = "";
+        emitGallery(currentRoom);
+        emitAiState(currentRoom);
+        io.to(currentRoom.code).emit("aiMasterpieceReady", {
+          gameSeq,
+          galleryItemId: masterpieceItem.id,
+          styleLabel: styleInfo.label,
+        });
+      })
+      .catch((error) => {
+        logAiFailure("masterpiece", error);
+        const currentRoom = rooms.get(room.code);
+        if (
+          !currentRoom ||
+          currentRoom !== room ||
+          currentRoom.gameSeq !== gameSeq ||
+          currentRoom.aiMasterpieceToken !== token
+        ) {
+          return;
+        }
+        const message = String(error?.message || "");
+        const mayHaveReachedProvider =
+          error?.status == null &&
+          !message.includes("queue") &&
+          !message.includes("cancelled");
+        currentRoom.aiMasterpieceStatus = mayHaveReachedProvider
+          ? "used"
+          : "error";
+        currentRoom.aiMasterpiece = null;
+        const friendlyError = friendlyAiError(
+          error,
+          "名画化できませんでした。もう一度試してください",
+        );
+        currentRoom.aiMasterpieceError = mayHaveReachedProvider
+          ? `${friendlyError}。重複生成を避けるため、このゲームでは再試行しません`
+          : friendlyError;
+        emitAiState(currentRoom);
+      });
+  });
+
+  onSocket(socket, "deleteGalleryItems", (data, cb) => {
+    const { ids } = data || {};
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
     const { room } = ctx;
+    if (
+      room.aiAwardsStatus === "generating" ||
+      room.aiMasterpieceStatus === "generating"
+    ) {
+      return reply(cb, {
+        ok: false,
+        error: "AI画伯が作業中です。完成してから削除してください",
+      });
+    }
     const idSet = new Set(
-      Array.isArray(ids) ? ids.map((id) => String(id)) : []
+      Array.isArray(ids) ? ids.map(safeString).filter(Boolean) : [],
     );
     if (idSet.size === 0) {
-      return cb?.({ ok: false, error: "削除する絵がありません" });
+      return reply(cb, { ok: false, error: "削除する絵がありません" });
     }
     room.gallery = room.gallery.filter((g) => !idSet.has(g.id));
+    if (room.aiAwardsStatus === "ready" && room.aiAwards?.awards) {
+      const remainingAwards = room.aiAwards.awards.filter(
+        (award) => !idSet.has(award.galleryItemId),
+      );
+      if (remainingAwards.length !== room.aiAwards.awards.length) {
+        if (remainingAwards.length > 0) {
+          room.aiAwards = {
+            ...room.aiAwards,
+            awards: remainingAwards,
+          };
+        } else {
+          room.aiAwardsStatus = "error";
+          room.aiAwards = null;
+          room.aiAwardsError = "受賞作品がギャラリーから削除されました";
+          room.aiAwardsAttempts = 2;
+        }
+      }
+    }
+    if (
+      room.aiMasterpiece?.galleryItemId &&
+      idSet.has(room.aiMasterpiece.galleryItemId)
+    ) {
+      room.aiMasterpieceStatus = "used";
+      room.aiMasterpiece = null;
+      room.aiMasterpieceError = "作成した名画はギャラリーから削除されました";
+    }
     emitGallery(room);
-    cb?.({ ok: true });
+    emitAiState(room);
+    reply(cb, { ok: true });
   });
 
-  socket.on("clearGallery", (cb) => {
+  onSocket(socket, "clearGallery", (cb) => {
     const ctx = getContext(socket);
-    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
     const { room, playerId } = ctx;
     if (room.hostId !== playerId) {
-      return cb?.({ ok: false, error: "ホストだけが全部消せます" });
+      return reply(cb, { ok: false, error: "ホストだけが全部消せます" });
+    }
+    if (
+      room.aiAwardsStatus === "generating" ||
+      room.aiMasterpieceStatus === "generating"
+    ) {
+      return reply(cb, {
+        ok: false,
+        error: "AI画伯が作業中です。完成してから削除してください",
+      });
     }
     room.gallery = [];
+    room.aiAwardsToken += 1;
+    room.aiAwardsStatus = "idle";
+    room.aiAwards = null;
+    room.aiAwardsError = "";
+    if (room.aiMasterpieceStatus !== "idle") {
+      room.aiMasterpieceToken += 1;
+      room.aiMasterpieceStatus = "used";
+      room.aiMasterpiece = null;
+      room.aiMasterpieceError = "ギャラリーが空になったため名画化は終了しました";
+    }
     emitGallery(room);
-    cb?.({ ok: true });
+    emitAiState(room);
+    reply(cb, { ok: true });
   });
 
-  socket.on("disconnect", () => {
+  onSocket(socket, "disconnect", () => {
     const code = socketRoom.get(socket.id);
     const playerId = socketPlayer.get(socket.id);
     socketRoom.delete(socket.id);

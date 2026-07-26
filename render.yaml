@@ -10,3 +10,11 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: APP_ORIGIN
+        value: https://draw-guess-bwjm.onrender.com
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_TEXT_MODEL
+        value: gpt-5.6-luna
+      - key: OPENAI_IMAGE_MODEL
+        value: gpt-image-2
