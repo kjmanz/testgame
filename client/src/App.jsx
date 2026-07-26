@@ -174,6 +174,7 @@ export default function App() {
   const [isLiar, setIsLiar] = useState(false);
   const [canReveal, setCanReveal] = useState(false);
   const [liarName, setLiarName] = useState("");
+  const [canFinishGradual, setCanFinishGradual] = useState(false);
   const [constraint, setConstraint] = useState(null);
   const [strokesUsed, setStrokesUsed] = useState(0);
   const [hasDrawing, setHasDrawing] = useState(false);
@@ -228,6 +229,7 @@ export default function App() {
     setIsLiar(!!data.isLiar);
     setCanReveal(!!data.canReveal);
     setLiarName(data.liarName || "");
+    setCanFinishGradual(!!data.canFinishGradual);
     setConstraint(data.constraint || null);
     setStrokesUsed(data.constraintStrokesUsed ?? 0);
     setRoundId(data.roundId ?? null);
@@ -254,6 +256,7 @@ export default function App() {
     setIsLiar(false);
     setCanReveal(false);
     setLiarName("");
+    setCanFinishGradual(false);
     setConstraint(null);
     setStrokesUsed(0);
     markDrawing(false);
@@ -410,6 +413,13 @@ export default function App() {
 
     socket.on("replayStart", () => {
       canvasApiRef.current?.playReplay();
+    });
+
+    // だんだん見える: サーバーから線が届いたら、ゆっくり公開再生する
+    socket.on("gradualReveal", (data) => {
+      const strokes = data?.strokes || [];
+      canvasApiRef.current?.playGradualReveal(strokes);
+      markDrawing(strokes.some((ev) => ev?.type === "move"));
     });
 
     socket.on("playerJoined", (data) => {
@@ -753,6 +763,13 @@ export default function App() {
     setError("");
     socketRef.current?.emit("revealLiar", (res) => {
       if (!res?.ok) setError(res?.error || "こたえあわせできません");
+    });
+  }
+
+  function finishGradualDrawing() {
+    setError("");
+    socketRef.current?.emit("finishGradualDrawing", (res) => {
+      if (!res?.ok) setError(res?.error || "公開できません");
     });
   }
 
@@ -1180,6 +1197,71 @@ export default function App() {
           )}
           {drawPhase === "guessing" && (
             <p className="hint">あてっこタイム！</p>
+          )}
+        </>
+      );
+    }
+
+    if (roundType === "gradual") {
+      return (
+        <>
+          <div className="meta row-meta">
+            <span>部屋 {roomCode}</span>
+            {renderRoundProgress()}
+            <span className="mode-pill gradual-pill">だんだん</span>
+          </div>
+          {drawPhase === "drawing" ? (
+            word ? (
+              <>
+                <div className="info-block info-prompt">
+                  <div className="info-label">あなたのお題</div>
+                  <div className="prompt-value">{word}</div>
+                </div>
+                <p className="hint">
+                  みんなには まだ見えてないよ。描きおわったら「できた！」を押そう
+                </p>
+              </>
+            ) : (
+              <div className="info-block info-drawer">
+                <div className="info-label">🤫 こっそり おえかき中</div>
+                <div className="drawer-value">{drawerName}</div>
+                <p className="hint">
+                  できあがると、絵が だんだん見えてくるよ…！
+                </p>
+              </div>
+            )
+          ) : word ? (
+            <>
+              <div className="info-block info-prompt">
+                <div className="info-label">あなたのお題</div>
+                <div className="prompt-value">{word}</div>
+              </div>
+              <p className="hint">
+                みんなの画面に じわじわ出てるよ。当たったら「つぎのお題へ」！
+              </p>
+            </>
+          ) : (
+            <div className="info-block info-drawer">
+              <div className="info-label">👀 だんだん見えてくる…</div>
+              <div className="drawer-value">わかったら さけぼう！</div>
+              <p className="hint">はやく当てた人の勝ち！</p>
+            </div>
+          )}
+          {remainSec != null && drawPhase === "drawing" && (
+            <div className="timer-bar" aria-live="polite">
+              <div className="timer-label">のこり {remainSec}びょう</div>
+              <div className="timer-track">
+                <div
+                  className="timer-fill gradual"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      (remainSec / Math.max(1, turnDurationSec || 40)) * 100
+                    )}%`,
+                  }}
+                />
+              </div>
+            </div>
           )}
         </>
       );
@@ -1761,6 +1843,11 @@ export default function App() {
                 うそつき
               </div>
             )}
+            {roundType === "gradual" && (
+              <div className="easel-badge gradual-badge" aria-hidden="true">
+                だんだん
+              </div>
+            )}
             <div className={`canvas-wrap ${modeClass}`}>
               <DrawingCanvas
                 ref={canvasApiRef}
@@ -1783,6 +1870,17 @@ export default function App() {
                   <span className="canvas-blind-text">見ないで描こう！</span>
                 </div>
               )}
+              {/* だんだん見える: 公開までは見ている側に幕をかける */}
+              {roundType === "gradual" &&
+                drawPhase === "drawing" &&
+                !canDraw && (
+                  <div className="canvas-curtain" aria-hidden="true">
+                    <span className="canvas-curtain-face">🤫</span>
+                    <span className="canvas-curtain-text">
+                      こっそり おえかき中…
+                    </span>
+                  </div>
+                )}
               {replaying && (
                 <div className="canvas-replay" aria-hidden="true">
                   ▶ リプレイ
@@ -1805,21 +1903,27 @@ export default function App() {
                 こたえあわせ
               </button>
             )}
+            {canFinishGradual && (
+              <button type="button" onClick={finishGradualDrawing}>
+                できた！みんなに見せる
+              </button>
+            )}
             {canNextRound && (
               <button type="button" onClick={nextRound} disabled={advancing}>
                 {roundNumber >= totalRounds ? "けっかを見る" : "つぎのお題へ"}
               </button>
             )}
-            {hasDrawing && (
-              <button
-                type="button"
-                className="quiet replay-btn"
-                onClick={requestReplay}
-                disabled={replaying}
-              >
-                {replaying ? "▶ さいせい中…" : "▶ 描いた順にリプレイ"}
-              </button>
-            )}
+            {hasDrawing &&
+              !(roundType === "gradual" && drawPhase === "drawing") && (
+                <button
+                  type="button"
+                  className="quiet replay-btn"
+                  onClick={requestReplay}
+                  disabled={replaying}
+                >
+                  {replaying ? "▶ さいせい中…" : "▶ 描いた順にリプレイ"}
+                </button>
+              )}
             <button
               type="button"
               className="secondary"

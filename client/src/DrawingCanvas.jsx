@@ -5,6 +5,10 @@ const MAX_HISTORY = 20000;
 const REPLAY_MS_PER_EVENT = 9;
 const REPLAY_MIN_MS = 1400;
 const REPLAY_MAX_MS = 5000;
+/** だんだん見える: 当てる時間を作るため、リプレイよりずっとゆっくり公開する */
+const GRADUAL_MS_PER_EVENT = 30;
+const GRADUAL_MIN_MS = 8000;
+const GRADUAL_MAX_MS = 22000;
 
 /**
  * 正規化座標 (0-1) で線を送受信するキャンバス。
@@ -52,6 +56,11 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
      * @param {{ maxSize?: number, quality?: number }} [opts]
      */
     exportImage({ maxSize = 640, quality = 0.72 } = {}) {
+      // 再生の途中で保存されないよう、完成した絵に戻してから写す
+      if (replayingRef.current) {
+        stopReplay();
+        redrawFromHistory();
+      }
       const canvas = canvasRef.current;
       if (!canvas) return null;
       const srcW = canvas.width;
@@ -79,6 +88,19 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     /** 描いた順に早送り再生する。再生できたら true */
     playReplay() {
       return startReplay();
+    },
+    /**
+     * だんだん見える: サーバーから受けた線に履歴を差し替えて、
+     * ゆっくり公開する（再生が終わると完成した絵のまま残る）
+     */
+    playGradualReveal(strokes) {
+      stopReplay();
+      historyRef.current = [...(strokes || [])];
+      drawingRef.current = false;
+      lastRef.current = null;
+      if (!startReplay({ slow: true })) {
+        redrawFromHistory();
+      }
     },
   }));
 
@@ -164,7 +186,7 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
   }
 
   /** 履歴を先頭から早送りで描き直す。終わったら本来の状態に戻す */
-  function startReplay() {
+  function startReplay({ slow = false } = {}) {
     const events = historyRef.current.slice();
     if (events.length < 2) return false;
 
@@ -174,10 +196,15 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     replayingRef.current = true;
     onReplayChangeRef.current?.(true);
 
-    const duration = Math.min(
-      REPLAY_MAX_MS,
-      Math.max(REPLAY_MIN_MS, events.length * REPLAY_MS_PER_EVENT)
-    );
+    const duration = slow
+      ? Math.min(
+          GRADUAL_MAX_MS,
+          Math.max(GRADUAL_MIN_MS, events.length * GRADUAL_MS_PER_EVENT)
+        )
+      : Math.min(
+          REPLAY_MAX_MS,
+          Math.max(REPLAY_MIN_MS, events.length * REPLAY_MS_PER_EVENT)
+        );
     const startedAt = performance.now();
     const lastMap = new Map();
     let index = 0;

@@ -671,6 +671,11 @@ input:focus {
   color: #fff;
 }
 
+.gradual-pill {
+  background: linear-gradient(90deg, #2b7de0, #4d8fd9);
+  color: #fff;
+}
+
 .play-header.mode-relay {
   border-color: #c44a2a;
   background:
@@ -760,6 +765,40 @@ input:focus {
 
 .play-header.mode-liar .info-drawer .info-label {
   color: #6d3fa0;
+}
+
+.play-header.mode-gradual {
+  border-color: #2b6ac0;
+  background:
+    linear-gradient(180deg, rgba(77, 143, 217, 0.16), transparent 35%),
+    repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 27px,
+      rgba(77, 143, 217, 0.12) 27px,
+      rgba(77, 143, 217, 0.12) 28px
+    ),
+    #f0f7ff;
+}
+
+.play-header.mode-gradual::before {
+  background: rgba(77, 143, 217, 0.85);
+}
+
+.play-header.mode-gradual .prompt-value {
+  color: #17498f;
+  border-color: rgba(43, 125, 224, 0.4);
+  background: linear-gradient(transparent 62%, rgba(77, 143, 217, 0.24) 62%);
+}
+
+.play-header.mode-gradual .drawer-value {
+  background: rgba(77, 143, 217, 0.12);
+  border-color: #2b7de0;
+  color: #17498f;
+}
+
+.play-header.mode-gradual .info-drawer .info-label {
+  color: #1d5fb8;
 }
 
 /* —— しばりルーレット —— */
@@ -877,6 +916,38 @@ input:focus {
   color: #8a4b06;
 }
 
+/* だんだん見える: 公開までは、見ている側のキャンバスに幕をかける */
+.canvas-curtain {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  pointer-events: none;
+  background:
+    repeating-linear-gradient(
+      -45deg,
+      rgba(77, 143, 217, 0.24) 0 18px,
+      rgba(240, 247, 255, 0.4) 18px 36px
+    ),
+    #f0f7ff;
+}
+
+.canvas-curtain-face {
+  font-size: 3rem;
+  line-height: 1;
+  animation: pulse-urgent 1.6s ease-in-out infinite;
+}
+
+.canvas-curtain-text {
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: 1.05rem;
+  color: #17498f;
+}
+
 /* —— 爆笑リプレイ —— */
 .canvas-replay {
   position: absolute;
@@ -942,6 +1013,10 @@ input:focus {
   background: linear-gradient(90deg, #6d4fc4, #ff7eb6);
 }
 
+.timer-fill.gradual {
+  background: linear-gradient(90deg, #2b7de0, #7fc3ff);
+}
+
 .easel.mode-relay {
   background: linear-gradient(180deg, #ff9a5c 0%, #ff5a2e 55%, #c43a1a 100%);
   border-color: #8b2208;
@@ -965,6 +1040,14 @@ input:focus {
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.35),
     6px 10px 0 rgba(63, 43, 133, 0.25);
+}
+
+.easel.mode-gradual {
+  background: linear-gradient(135deg, #6faef0 0%, #4d8fd9 55%, #1d5fb8 100%);
+  border-color: #143f80;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.35),
+    6px 10px 0 rgba(29, 95, 184, 0.25);
 }
 
 .easel-badge {
@@ -995,6 +1078,12 @@ input:focus {
 .liar-badge {
   background: #f3ecff;
   color: #4a2f96;
+  transform: rotate(-5deg);
+}
+
+.gradual-badge {
+  background: #eaf4ff;
+  color: #17498f;
   transform: rotate(-5deg);
 }
 
@@ -1075,6 +1164,23 @@ input:focus {
     );
 }
 
+.canvas-wrap.mode-gradual {
+  border-color: #143f80;
+  box-shadow:
+    inset 0 0 0 8px #f0f7ff,
+    0 0 0 2px rgba(77, 143, 217, 0.35);
+  background:
+    radial-gradient(circle at 20% 15%, rgba(77, 143, 217, 0.14), transparent 30%),
+    radial-gradient(circle at 85% 80%, rgba(43, 125, 224, 0.1), transparent 28%),
+    repeating-linear-gradient(
+      0deg,
+      #fbf4e4,
+      #fbf4e4 2px,
+      #f7efd8 2px,
+      #f7efd8 4px
+    );
+}
+
 .fanfare {
   position: fixed;
   inset: 0;
@@ -1125,6 +1231,11 @@ input:focus {
 .fanfare-liar .fanfare-text {
   background: linear-gradient(135deg, #ece2ff, #ffd9f2);
   color: #4a2f96;
+}
+
+.fanfare-gradual .fanfare-text {
+  background: linear-gradient(135deg, #ddefff, #c9e4ff);
+  color: #17498f;
 }
 
 .fanfare-constraint .fanfare-text {
