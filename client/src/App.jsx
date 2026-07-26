@@ -179,6 +179,7 @@ export default function App() {
   const [canReveal, setCanReveal] = useState(false);
   const [liarName, setLiarName] = useState("");
   const [canFinishGradual, setCanFinishGradual] = useState(false);
+  const [canRevealAnswer, setCanRevealAnswer] = useState(false);
   const [constraint, setConstraint] = useState(null);
   const [strokesUsed, setStrokesUsed] = useState(0);
   const [hasDrawing, setHasDrawing] = useState(false);
@@ -236,6 +237,7 @@ export default function App() {
     setCanReveal(!!data.canReveal);
     setLiarName(data.liarName || "");
     setCanFinishGradual(!!data.canFinishGradual);
+    setCanRevealAnswer(!!data.canRevealAnswer);
     setConstraint(data.constraint || null);
     setStrokesUsed(data.constraintStrokesUsed ?? 0);
     setRoundId(data.roundId ?? null);
@@ -263,6 +265,7 @@ export default function App() {
     setCanReveal(false);
     setLiarName("");
     setCanFinishGradual(false);
+    setCanRevealAnswer(false);
     setConstraint(null);
     setStrokesUsed(0);
     markDrawing(false);
@@ -468,6 +471,12 @@ export default function App() {
           `${data.constraint.emoji} ${data.constraint.label}：${data.constraint.rule}`
         );
       }
+    });
+
+    // ふつうのラウンドの答え発表。画面は止めず、トーストで知らせる
+    socket.on("answerReveal", (data) => {
+      if (!data?.word) return;
+      setToast(`✅ こたえは「${data.word}」！`);
     });
 
     socket.on("liarReveal", (data) => {
@@ -814,6 +823,13 @@ export default function App() {
     setError("");
     socketRef.current?.emit("finishGradualDrawing", (res) => {
       if (!res?.ok) setError(res?.error || "公開できません");
+    });
+  }
+
+  function revealAnswer() {
+    setError("");
+    socketRef.current?.emit("revealAnswer", (res) => {
+      if (!res?.ok) setError(res?.error || "せいかい発表できません");
     });
   }
 
@@ -1367,11 +1383,22 @@ export default function App() {
             <span className="mode-pill constraint-pill">しばり</span>
           )}
         </div>
-        {word ? (
-          <div className="info-block info-prompt">
-            <div className="info-label">あなたのお題</div>
+        {drawPhase === "reveal" ? (
+          <div className="info-block info-answer">
+            <div className="info-label">✅ こたえ</div>
             <div className="prompt-value">{word}</div>
+            <p className="hint">{drawerName}が描きました</p>
           </div>
+        ) : word ? (
+          <>
+            <div className="info-block info-prompt">
+              <div className="info-label">あなたのお題</div>
+              <div className="prompt-value">{word}</div>
+            </div>
+            <p className="hint">
+              当てられたら「せいかい！」を押してね
+            </p>
+          </>
         ) : (
           <div className="info-block info-drawer">
             <div className="info-label">いま描いている人</div>
@@ -2022,6 +2049,11 @@ export default function App() {
             {canFinishGradual && (
               <button type="button" onClick={finishGradualDrawing}>
                 できた！みんなに見せる
+              </button>
+            )}
+            {canRevealAnswer && (
+              <button type="button" onClick={revealAnswer}>
+                ✅ せいかい！
               </button>
             )}
             {canNextRound && (

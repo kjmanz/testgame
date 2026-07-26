@@ -358,6 +358,31 @@ input:focus {
   color: #1a6f66;
 }
 
+/* ふつうのラウンドの「せいかい！」のあと、全員に出る答え */
+.info-answer {
+  padding: 0.5rem 0.6rem;
+  border: 3px solid #1f8f52;
+  border-radius: 12px;
+  background:
+    repeating-linear-gradient(
+      -45deg,
+      rgba(76, 187, 108, 0.16) 0 10px,
+      transparent 10px 20px
+    ),
+    #f2fff6;
+  animation: fanfare-pop 0.35s ease both;
+}
+
+.info-answer .info-label {
+  color: #14713f;
+}
+
+.info-answer .prompt-value {
+  color: #14713f;
+  border-color: rgba(31, 143, 82, 0.4);
+  background: linear-gradient(transparent 62%, rgba(76, 187, 108, 0.45) 62%);
+}
+
 .prompt-value {
   font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
   font-size: 1.75rem;

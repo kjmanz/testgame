@@ -709,7 +709,12 @@ function canPlayerDraw(room, playerId) {
 
 function canPlayerSeeWord(room, playerId) {
   if (room.phase !== "playing" || !room.word) return false;
-  if (room.roundType === "normal" || room.roundType === "gradual") {
+  if (room.roundType === "normal") {
+    // 「せいかい！」のあとは全員に公開（聞き取れなかった子にも答えが伝わる）
+    if (room.drawPhase === "reveal") return true;
+    return room.drawerId === playerId;
+  }
+  if (room.roundType === "gradual") {
     return room.drawerId === playerId;
   }
   if (room.roundType === "coop") {
@@ -727,6 +732,8 @@ function canPlayerSeeWord(room, playerId) {
 function canPlayerNextRound(room, playerId) {
   if (room.phase !== "playing") return false;
   if (room.roundType === "normal") {
+    // 「せいかい！」で答えを出してから進む
+    if (room.drawPhase !== "reveal") return false;
     return room.drawerId === playerId;
   }
   if (room.roundType === "gradual") {
@@ -747,6 +754,13 @@ function canPlayerNextRound(room, playerId) {
     return room.drawerIds.includes(playerId) || room.hostId === playerId;
   }
   return false;
+}
+
+/** ふつうのラウンドの「せいかい！」。時間しばりであてっこタイムに入っていても押せる */
+function canRevealAnswer(room, playerId) {
+  if (room.phase !== "playing" || room.roundType !== "normal") return false;
+  if (room.drawPhase === "reveal") return false;
+  return room.drawerId === playerId;
 }
 
 function canRevealLiar(room, playerId) {
@@ -819,6 +833,10 @@ function buildRoundPayload(room, playerId) {
   if (room.roundType === "gradual") {
     payload.canFinishGradual =
       room.drawPhase === "drawing" && room.drawerId === playerId;
+  }
+
+  if (room.roundType === "normal") {
+    payload.canRevealAnswer = canRevealAnswer(room, playerId);
   }
 
   return payload;
@@ -1778,6 +1796,30 @@ io.on("connection", (socket) => {
       liarName: room.liarName,
       word: room.word,
     });
+    emitRoundSync(room);
+    reply(cb, { ok: true });
+  });
+
+  // ふつうのラウンド: 描き手の「せいかい！」で答えを全員に出す
+  onSocket(socket, "revealAnswer", (cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { code, room, playerId } = ctx;
+    // 連打や同時押しでもエラーにしない
+    if (
+      room.phase === "playing" &&
+      room.roundType === "normal" &&
+      room.drawPhase === "reveal"
+    ) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    if (!canRevealAnswer(room, playerId)) {
+      return reply(cb, { ok: false, error: "いまは せいかい発表できません" });
+    }
+    // 時間しばりのカウントダウンが残っていても、ここで描く時間は終わり
+    clearTurnTimer(room);
+    room.drawPhase = "reveal";
+    io.to(code).emit("answerReveal", { word: room.word });
     emitRoundSync(room);
     reply(cb, { ok: true });
   });
