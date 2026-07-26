@@ -85,6 +85,13 @@ button.secondary {
   background: var(--paint-teal);
 }
 
+button.quiet {
+  color: var(--ink);
+  background: #fffef8;
+  border-color: rgba(43, 36, 28, 0.55);
+  box-shadow: 2px 3px 0 rgba(43, 36, 28, 0.35);
+}
+
 button.danger {
   background: var(--danger);
 }
@@ -229,6 +236,55 @@ input:focus {
   background:
     linear-gradient(transparent 60%, rgba(255, 201, 60, 0.55) 60%);
   border-radius: 8px;
+}
+
+.invite-join-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.85rem;
+  text-align: center;
+  border: 2px dashed rgba(44, 177, 161, 0.65);
+  border-radius: 16px;
+  background: rgba(44, 177, 161, 0.12);
+}
+
+.invite-room-code {
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: 1.55rem;
+  color: #167a6e;
+}
+
+.invite-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+  padding: 0.9rem;
+  border: 2px dashed rgba(43, 36, 28, 0.32);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.55);
+}
+
+.invite-panel > .label {
+  text-align: center;
+  color: #167a6e;
+}
+
+.qr-frame {
+  align-self: center;
+  padding: 0.65rem;
+  border: 3px solid var(--ink);
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 3px 4px 0 rgba(43, 36, 28, 0.18);
+}
+
+.qr-frame canvas {
+  display: block;
+  width: 184px;
+  height: 184px;
+  max-width: 62vw;
+  max-height: 62vw;
 }
 
 .players {

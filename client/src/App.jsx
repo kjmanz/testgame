@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { QRCodeCanvas } from "qrcode.react";
 import { io } from "socket.io-client";
 import DrawingCanvas from "./DrawingCanvas.jsx";
 
@@ -63,16 +64,65 @@ function normalizeRoomCode(code) {
     .slice(0, 4);
 }
 
+function readInviteRoomCode() {
+  if (typeof window === "undefined") return "";
+  const code = String(
+    new URLSearchParams(window.location.search).get("room") || ""
+  )
+    .normalize("NFKC")
+    .trim();
+  return /^\d{4}$/.test(code) ? code : "";
+}
+
+function buildInviteUrl(code) {
+  if (typeof window === "undefined" || !code) return "";
+  const url = new URL("/", window.location.origin);
+  url.searchParams.set("room", code);
+  return url.toString();
+}
+
+function removeInviteRoomCodeFromUrl() {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has("room")) return;
+  url.searchParams.delete("room");
+  window.history.replaceState(
+    {},
+    "",
+    `${url.pathname}${url.search}${url.hash}`
+  );
+}
+
+async function copyText(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("copy failed");
+}
+
 export default function App() {
   const socketRef = useRef(null);
   const wakeLockRef = useRef(null);
   const canvasApiRef = useRef(null);
   /** サーバー時刻 - 端末時刻（タイマー表示のずれ補正用） */
   const serverOffsetRef = useRef(0);
+  const [initialInviteCode] = useState(readInviteRoomCode);
   const [screen, setScreen] = useState("home"); // home | lobby | play | finished | gallery
   // 期限切れセッションでも名前だけは引き継いで入力の手間を省く
   const [name, setName] = useState(() => readSessionRaw()?.name || "");
-  const [joinCode, setJoinCode] = useState("");
+  const [inviteCode, setInviteCode] = useState(initialInviteCode);
+  const [joinCode, setJoinCode] = useState(initialInviteCode);
   const [error, setError] = useState("");
   const [roomCode, setRoomCode] = useState("");
   const [playerId, setPlayerId] = useState("");
@@ -85,7 +135,13 @@ export default function App() {
   const [clearToken, setClearToken] = useState(0);
   const [toast, setToast] = useState("");
   const [fanfare, setFanfare] = useState(null);
-  const [restoring, setRestoring] = useState(() => !!loadSession());
+  const [restoring, setRestoring] = useState(() => {
+    const session = loadSession();
+    return (
+      !!session &&
+      (!initialInviteCode || session.roomCode === initialInviteCode)
+    );
+  });
   const [roundType, setRoundType] = useState("normal");
   const [drawPhase, setDrawPhase] = useState("drawing");
   const [canDraw, setCanDraw] = useState(false);
@@ -112,6 +168,9 @@ export default function App() {
 
   const isHost = playerId && playerId === hostId;
   const modeClass = `mode-${roundType || "normal"}`;
+  const inviteUrl = useMemo(() => buildInviteUrl(roomCode), [roomCode]);
+  const canShareInvite =
+    typeof navigator !== "undefined" && typeof navigator.share === "function";
 
   function applyRoundPayload(data, { forcePlay = true } = {}) {
     setError("");
@@ -373,6 +432,10 @@ export default function App() {
 
     function tryRejoin() {
       const session = loadSession();
+      if (initialInviteCode && session?.roomCode !== initialInviteCode) {
+        setRestoring(false);
+        return;
+      }
       if (!session) {
         setRestoring(false);
         return;
@@ -472,6 +535,8 @@ export default function App() {
           roomCode: res.code,
           name: trimmed,
         });
+        setInviteCode("");
+        removeInviteRoomCodeFromUrl();
         if (res.phase === "playing") {
           setScreen("play");
         } else if (res.phase === "finished") {
@@ -488,6 +553,8 @@ export default function App() {
     socketRef.current?.emit("leaveRoom", () => {
       clearSession();
       setScreen("home");
+      setInviteCode("");
+      setJoinCode("");
       setRoomCode("");
       setPlayerId("");
       setPlayers([]);
@@ -497,7 +564,42 @@ export default function App() {
       setHistorySeed({ token: 0, strokes: [] });
       resetPlayState();
       resetGameProgress();
+      removeInviteRoomCodeFromUrl();
     });
+  }
+
+  function cancelInvite() {
+    setError("");
+    setInviteCode("");
+    setJoinCode("");
+    removeInviteRoomCodeFromUrl();
+  }
+
+  async function shareInvite() {
+    if (!inviteUrl) return;
+    setError("");
+    const shareData = {
+      title: "おえかきあて",
+      text: `部屋コード ${roomCode} に入って、一緒に遊ぼう！`,
+      url: inviteUrl,
+    };
+
+    if (canShareInvite) {
+      try {
+        await navigator.share(shareData);
+        setToast("招待リンクを共有しました");
+        return;
+      } catch (err) {
+        if (err?.name === "AbortError") return;
+      }
+    }
+
+    try {
+      await copyText(inviteUrl);
+      setToast("招待リンクをコピーしました");
+    } catch {
+      setError("招待リンクをコピーできませんでした");
+    }
   }
 
   function startGame() {
@@ -982,45 +1084,96 @@ export default function App() {
 
       {!restoring && screen === "home" && (
         <div className="card">
+          {inviteCode && (
+            <div className="invite-join-summary">
+              <div className="label">招待された部屋</div>
+              <div className="invite-room-code">部屋 {inviteCode}</div>
+              <p className="hint">なまえを入れるだけで参加できます</p>
+            </div>
+          )}
+
           <div>
-            <div className="label">なまえ</div>
+            <label className="label" htmlFor="player-name">
+              なまえ
+            </label>
             <input
+              id="player-name"
               value={name}
               onChange={(e) => setName(e.target.value)}
+              onKeyDown={(e) => {
+                if (
+                  e.key === "Enter" &&
+                  inviteCode &&
+                  name.trim() &&
+                  !e.nativeEvent.isComposing
+                ) {
+                  e.preventDefault();
+                  joinRoom();
+                }
+              }}
               placeholder="例：たろう"
               maxLength={12}
               autoComplete="off"
+              enterKeyHint={inviteCode ? "go" : "next"}
+              autoFocus={!!inviteCode}
             />
           </div>
 
-          <button type="button" onClick={createRoom} disabled={!name.trim()}>
-            部屋をつくる
-          </button>
+          {inviteCode ? (
+            <>
+              <button
+                type="button"
+                className="secondary"
+                onClick={joinRoom}
+                disabled={!name.trim()}
+              >
+                この部屋にはいる
+              </button>
+              <button type="button" className="quiet" onClick={cancelInvite}>
+                ほかの方法で参加する
+              </button>
+            </>
+          ) : (
+            <>
+              <button type="button" onClick={createRoom} disabled={!name.trim()}>
+                部屋をつくる
+              </button>
 
-          <div className="divider-or">または</div>
+              <div className="divider-or">または</div>
 
-          <div>
-            <div className="label">部屋コード（4桁）</div>
-            <input
-              value={joinCode}
-              onChange={(e) => setJoinCode(normalizeRoomCode(e.target.value))}
-              placeholder="1234"
-              inputMode="numeric"
-              maxLength={4}
-              autoComplete="off"
-            />
-          </div>
+              <div>
+                <label className="label" htmlFor="join-code">
+                  部屋コード（4桁）
+                </label>
+                <input
+                  id="join-code"
+                  value={joinCode}
+                  onChange={(e) =>
+                    setJoinCode(normalizeRoomCode(e.target.value))
+                  }
+                  placeholder="1234"
+                  inputMode="numeric"
+                  maxLength={4}
+                  autoComplete="off"
+                />
+              </div>
 
-          <button
-            type="button"
-            className="secondary"
-            onClick={joinRoom}
-            disabled={!name.trim() || joinCode.length !== 4}
-          >
-            部屋にはいる
-          </button>
+              <button
+                type="button"
+                className="secondary"
+                onClick={joinRoom}
+                disabled={!name.trim() || joinCode.length !== 4}
+              >
+                部屋にはいる
+              </button>
+            </>
+          )}
 
-          {error && <p className="error">{error}</p>}
+          {error && (
+            <p className="error" role="alert">
+              {error}
+            </p>
+          )}
         </div>
       )}
 
@@ -1029,6 +1182,36 @@ export default function App() {
           <div className="label">部屋コード</div>
           <div className="code-big">{roomCode}</div>
           <p className="hint">このコードをみんなに教えて入室してもらおう</p>
+
+          {isHost && inviteUrl && (
+            <section className="invite-panel" aria-labelledby="invite-title">
+              <div className="label" id="invite-title">
+                QRコードで招待
+              </div>
+              <div className="qr-frame">
+                <QRCodeCanvas
+                  value={inviteUrl}
+                  size={184}
+                  level="M"
+                  marginSize={2}
+                  role="img"
+                  aria-label={`部屋 ${roomCode} の招待QRコード`}
+                />
+              </div>
+              <p className="hint">
+                QRを読んだ人は、なまえを入れるだけで参加できます
+              </p>
+              <button
+                type="button"
+                className="secondary"
+                onClick={shareInvite}
+              >
+                {canShareInvite
+                  ? "招待リンクを送る"
+                  : "招待リンクをコピー"}
+              </button>
+            </section>
+          )}
 
           <div className="label">さんかしゃ（{players.length}/20）</div>
           <ul className="players">
@@ -1118,7 +1301,11 @@ export default function App() {
             </button>
           </div>
 
-          {error && <p className="error">{error}</p>}
+          {error && (
+            <p className="error" role="alert">
+              {error}
+            </p>
+          )}
         </div>
       )}
 
