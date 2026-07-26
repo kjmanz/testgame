@@ -1128,81 +1128,6 @@ input:focus {
   font-weight: 900;
 }
 
-.ai-privacy-note {
-  margin: -0.25rem auto 0;
-  max-width: 22rem;
-  color: var(--muted);
-  font-size: 0.66rem;
-  font-weight: 700;
-  line-height: 1.45;
-  text-align: center;
-}
-
-.ai-critique-toast {
-  position: fixed;
-  top: max(0.75rem, env(safe-area-inset-top));
-  left: 50%;
-  z-index: 55;
-  width: min(calc(100vw - 2rem), 30rem);
-  padding: 0.8rem 1rem;
-  transform: translateX(-50%);
-  border: 3px solid var(--ink);
-  border-radius: 16px;
-  background:
-    radial-gradient(circle at 92% 15%, rgba(255, 201, 60, 0.45), transparent 28%),
-    linear-gradient(135deg, #f3eaff, #fff9e8);
-  box-shadow: 5px 7px 0 rgba(43, 36, 28, 0.18);
-  color: var(--ink);
-  overflow-wrap: anywhere;
-  pointer-events: none;
-  animation: ai-toast-in 0.35s ease both;
-}
-
-.ai-critique-inline {
-  display: grid;
-  gap: 0.08rem;
-  padding: 0.35rem 0.48rem;
-  border: 2px solid rgba(89, 55, 145, 0.45);
-  border-radius: 10px;
-  background: linear-gradient(135deg, #f3eaff, #fff8dc);
-  color: #4f2b89;
-  overflow-wrap: anywhere;
-  animation: pop-in 0.25s ease both;
-}
-
-.ai-critique-inline strong {
-  font-size: 0.72rem;
-}
-
-.ai-critique-inline span {
-  color: var(--ink);
-  font-size: 0.65rem;
-  font-weight: 700;
-  line-height: 1.35;
-}
-
-.ai-critique-toast strong {
-  display: block;
-  margin-top: 0.16rem;
-  color: #4f2b89;
-  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
-  font-size: 1.1rem;
-}
-
-.ai-critique-toast p {
-  margin: 0.22rem 0;
-  font-size: 0.86rem;
-  font-weight: 800;
-  line-height: 1.5;
-}
-
-.ai-critique-toast > span {
-  display: block;
-  color: var(--muted);
-  font-size: 0.68rem;
-  font-weight: 800;
-}
-
 .ai-ceremony {
   display: flex;
   flex-direction: column;
@@ -1361,13 +1286,8 @@ input:focus {
   font-weight: 900;
 }
 
-.gallery-ai-critique strong {
-  display: block;
-  font-size: 0.66rem;
-}
-
 .gallery-ai-critique p {
-  margin: 0.16rem 0 0;
+  margin: 0;
   font-size: 0.62rem;
   font-weight: 700;
   line-height: 1.4;
@@ -1536,17 +1456,6 @@ input:focus {
   font-size: 1.15rem;
 }
 
-@keyframes ai-toast-in {
-  from {
-    opacity: 0;
-    transform: translateX(-50%) translateY(-10px) scale(0.97);
-  }
-  to {
-    opacity: 1;
-    transform: translateX(-50%) translateY(0) scale(1);
-  }
-}
-
 @keyframes ai-paint {
   0%,
   100% {
@@ -1666,8 +1575,6 @@ input:focus {
   .relay-pill,
   .fanfare,
   .fanfare-text,
-  .ai-critique-toast,
-  .ai-critique-inline,
   .ai-style-dialog,
   .ai-busy-icon {
     animation: none;

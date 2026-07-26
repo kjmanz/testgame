@@ -108,6 +108,9 @@ test("OpenAI requests stay server-side and use strict structured output", async 
   const originalFetch = globalThis.fetch;
   const originalKey = process.env.OPENAI_API_KEY;
   const requests = [];
+  const longComment =
+    "元気な丸が画面いっぱいに踊り、足の勢いに対して顔だけが冷静です。\n" +
+    "少ない線なのに今にも走り出しそうな雰囲気があります。";
   process.env.OPENAI_API_KEY = "test-key-never-send-to-client";
   globalThis.fetch = async (url, options) => {
     requests.push({ url, options });
@@ -122,7 +125,7 @@ test("OpenAI requests stay server-side and use strict structured output", async 
                 type: "output_text",
                 text: JSON.stringify({
                   title: "まるの魔術師",
-                  comment: "元気な丸が画面いっぱいに踊っています。",
+                  comment: longComment,
                   strength: "勢いのある丸い線",
                   awardSeed: "まるが踊るで賞",
                 }),
@@ -143,6 +146,8 @@ test("OpenAI requests stay server-side and use strict structured output", async 
       safetyIdentifier: "safe-test-user",
     });
     assert.equal(critique.title, "まるの魔術師");
+    assert.equal(critique.comment.length, 40);
+    assert.equal(critique.comment.includes("\n"), false);
     assert.equal(requests.length, 1);
     assert.equal(
       requests[0].options.headers.Authorization,
@@ -156,6 +161,7 @@ test("OpenAI requests stay server-side and use strict structured output", async 
     assert.equal(body.text.format.type, "json_schema");
     assert.equal(body.text.format.strict, true);
     assert.equal(body.input[0].content[1].detail, "low");
+    assert.match(body.instructions, /40字以内/);
     assert.equal(
       JSON.stringify(publicAiCapabilities()).includes(
         "test-key-never-send-to-client",

@@ -21,6 +21,7 @@ import {
   publicAiCapabilities,
   stylizeDrawing,
 } from "./ai.js";
+import { hasVisibleDrawing } from "./drawing.js";
 import { randomWord } from "./words.js";
 
 const PORT = process.env.PORT || 3001;
@@ -1397,18 +1398,6 @@ function queueDrawingCritique(room, item, safetyIdentifier) {
       currentItem.aiCritique = critique;
       emitGalleryItemAiUpdate(currentRoom, currentItem);
       emitAiState(currentRoom);
-      if (
-        currentRoom.gameSeq === gameSeq &&
-        currentRoom.phase !== "lobby"
-      ) {
-        io.to(roomCode).emit("aiCritiqueReady", {
-          id: currentItem.id,
-          gameSeq,
-          word: currentItem.word,
-          drawerNames: currentItem.drawerNames,
-          critique,
-        });
-      }
     } catch (error) {
       if (!String(error?.message || "").includes("cancelled")) {
         logAiFailure("critique", error);
@@ -1812,6 +1801,7 @@ io.on("connection", (socket) => {
     const drawerNames = playerNames(room, room.drawerIds);
     const word = room.word;
     const roundType = room.roundType;
+    const shouldCritiqueDrawing = hasVisibleDrawing(room.strokes);
 
     let galleryItem = null;
     let critiqueSafetyIdentifier = "";
@@ -1821,7 +1811,8 @@ io.on("connection", (socket) => {
         word,
         drawerNames,
         roundType,
-        allowAiCritique: () => consumeAiQuota(socket, "critique"),
+        allowAiCritique: () =>
+          shouldCritiqueDrawing && consumeAiQuota(socket, "critique"),
       });
       if (galleryItem?.aiCritiqueStatus === "pending") {
         critiqueSafetyIdentifier = aiSafetyIdentifier(playerId);

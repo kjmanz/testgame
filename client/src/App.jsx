@@ -195,7 +195,6 @@ export default function App() {
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [returnScreen, setReturnScreen] = useState("lobby");
   const [aiState, setAiState] = useState(EMPTY_AI_STATE);
-  const [aiCritiqueSpotlight, setAiCritiqueSpotlight] = useState(null);
   const [stylizeTargetId, setStylizeTargetId] = useState("");
 
   const isHost = playerId && playerId === hostId;
@@ -311,12 +310,6 @@ export default function App() {
     const t = setTimeout(() => setFanfare(null), 2200);
     return () => clearTimeout(t);
   }, [fanfare]);
-
-  useEffect(() => {
-    if (!aiCritiqueSpotlight) return;
-    const t = setTimeout(() => setAiCritiqueSpotlight(null), 7000);
-    return () => clearTimeout(t);
-  }, [aiCritiqueSpotlight]);
 
   useEffect(() => {
     if (!stylizeTargetId) return;
@@ -452,7 +445,6 @@ export default function App() {
       setScreen((prev) => (prev === "gallery" ? "gallery" : "lobby"));
       resetPlayState();
       resetGameProgress();
-      setAiCritiqueSpotlight(null);
       closeStylizeDialog({ restoreFocus: false });
       setClearToken((n) => n + 1);
       if (data?.reason === "alone") {
@@ -565,11 +557,6 @@ export default function App() {
       if (data?.masterpieceStatus === "ready") {
         closeStylizeDialog({ restoreFocus: false });
       }
-    });
-
-    socket.on("aiCritiqueReady", (data) => {
-      if (!data?.critique) return;
-      setAiCritiqueSpotlight(data);
     });
 
     socket.on("aiAwardsReady", () => {
@@ -742,7 +729,6 @@ export default function App() {
       setGallery([]);
       setSelectedIds(new Set());
       setAiState(EMPTY_AI_STATE);
-      setAiCritiqueSpotlight(null);
       setStylizeTargetId("");
       setHistorySeed({ token: 0, strokes: [] });
       resetPlayState();
@@ -1292,24 +1278,6 @@ export default function App() {
         </div>
       )}
 
-      {aiCritiqueSpotlight && screen !== "play" && (
-        <aside
-          className="ai-critique-toast"
-          role="status"
-          aria-live="polite"
-          aria-atomic="true"
-        >
-          <div className="ai-eyebrow">✨ AI画伯のひとこと</div>
-          <strong>{aiCritiqueSpotlight.critique.title}</strong>
-          <p>{aiCritiqueSpotlight.critique.comment}</p>
-          <span>
-            「{aiCritiqueSpotlight.word}」
-            {(aiCritiqueSpotlight.drawerNames || []).length > 0 &&
-              `／${aiCritiqueSpotlight.drawerNames.join("・")}`}
-          </span>
-        </aside>
-      )}
-
       {fanfare && (
         <div className={`fanfare fanfare-${fanfare.roundType}`} role="status">
           <div className="fanfare-inner">
@@ -1503,12 +1471,7 @@ export default function App() {
           <div className="code-big">{roomCode}</div>
           <p className="hint">このコードをみんなに教えて入室してもらおう</p>
           {aiState.enabled && (
-            <>
-              <div className="ai-enabled-badge">✨ AI画伯が参加します</div>
-              <p className="ai-privacy-note">
-                講評のため絵とお題をOpenAIへ送ります（名前は送りません）
-              </p>
-            </>
+            <div className="ai-enabled-badge">✨ AI画伯が参加します</div>
           )}
 
           {isHost && inviteUrl && (
@@ -1938,6 +1901,7 @@ export default function App() {
                   </div>
                   {!item.isMasterpiece &&
                     aiState.enabled &&
+                    returnScreen !== "play" &&
                     item.aiCritiqueStatus === "pending" && (
                       <div className="gallery-ai-pending" role="status">
                         🎨 AI画伯が鑑賞中…
@@ -1945,11 +1909,11 @@ export default function App() {
                     )}
                   {!item.isMasterpiece &&
                     aiState.enabled &&
+                    returnScreen !== "play" &&
                     item.aiCritiqueStatus === "ready" &&
-                    item.aiCritique && (
+                    item.aiCritique?.comment && (
                       <div className="gallery-ai-critique">
-                        <strong>✨ {item.aiCritique.title}</strong>
-                        <p>{item.aiCritique.comment}</p>
+                        <p>✨ {item.aiCritique.comment}</p>
                       </div>
                     )}
                   <div className="gallery-foot">
@@ -2008,17 +1972,6 @@ export default function App() {
         <>
           <div className={`card play-header tape-yellow ${modeClass}`}>
             {renderPlayHeader()}
-            {aiCritiqueSpotlight && (
-              <div
-                className="ai-critique-inline"
-                role="status"
-                aria-live="polite"
-                aria-atomic="true"
-              >
-                <strong>✨ {aiCritiqueSpotlight.critique.title}</strong>
-                <span>{aiCritiqueSpotlight.critique.comment}</span>
-              </div>
-            )}
           </div>
 
           <div className={`easel ${modeClass}`}>
