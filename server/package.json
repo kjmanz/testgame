@@ -8,7 +8,10 @@
     "dev:relay": "node --watch dev-relay.js",
     "dev:coop": "node --watch dev-coop.js",
     "dev:liar": "node --watch dev-liar.js",
-    "start": "node index.js"
+    "dev:gradual": "node --watch dev-gradual.js",
+    "dev:constraint": "node --watch dev-constraint.js",
+    "start": "node index.js",
+    "test": "node --test"
   },
   "dependencies": {
     "cors": "^2.8.5",

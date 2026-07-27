@@ -85,6 +85,13 @@ button.secondary {
   background: var(--paint-teal);
 }
 
+button.quiet {
+  color: var(--ink);
+  background: #fffef8;
+  border-color: rgba(43, 36, 28, 0.55);
+  box-shadow: 2px 3px 0 rgba(43, 36, 28, 0.35);
+}
+
 button.danger {
   background: var(--danger);
 }
@@ -231,6 +238,55 @@ input:focus {
   border-radius: 8px;
 }
 
+.invite-join-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.85rem;
+  text-align: center;
+  border: 2px dashed rgba(44, 177, 161, 0.65);
+  border-radius: 16px;
+  background: rgba(44, 177, 161, 0.12);
+}
+
+.invite-room-code {
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: 1.55rem;
+  color: #167a6e;
+}
+
+.invite-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+  padding: 0.9rem;
+  border: 2px dashed rgba(43, 36, 28, 0.32);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.55);
+}
+
+.invite-panel > .label {
+  text-align: center;
+  color: #167a6e;
+}
+
+.qr-frame {
+  align-self: center;
+  padding: 0.65rem;
+  border: 3px solid var(--ink);
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 3px 4px 0 rgba(43, 36, 28, 0.18);
+}
+
+.qr-frame canvas {
+  display: block;
+  width: 184px;
+  height: 184px;
+  max-width: 62vw;
+  max-height: 62vw;
+}
+
 .players {
   list-style: none;
   margin: 0;
@@ -302,6 +358,31 @@ input:focus {
   color: #1a6f66;
 }
 
+/* ふつうのラウンドの「せいかい！」のあと、全員に出る答え */
+.info-answer {
+  padding: 0.5rem 0.6rem;
+  border: 3px solid #1f8f52;
+  border-radius: 12px;
+  background:
+    repeating-linear-gradient(
+      -45deg,
+      rgba(76, 187, 108, 0.16) 0 10px,
+      transparent 10px 20px
+    ),
+    #f2fff6;
+  animation: fanfare-pop 0.35s ease both;
+}
+
+.info-answer .info-label {
+  color: #14713f;
+}
+
+.info-answer .prompt-value {
+  color: #14713f;
+  border-color: rgba(31, 143, 82, 0.4);
+  background: linear-gradient(transparent 62%, rgba(76, 187, 108, 0.45) 62%);
+}
+
 .prompt-value {
   font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
   font-size: 1.75rem;
@@ -332,38 +413,39 @@ input:focus {
 }
 
 .relay-order {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(var(--relay-total, 1), minmax(0, 1fr));
   align-items: center;
-  gap: 0.2rem 0.15rem;
-  padding: 0.45rem 0.55rem;
+  gap: 0.2rem;
+  min-height: 2.65rem;
+  padding: 0.35rem 0.4rem;
+  overflow: hidden;
   border-radius: 12px;
   background: rgba(255, 122, 69, 0.1);
   border: 2px solid rgba(196, 58, 26, 0.28);
 }
 
 .relay-order-item {
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  gap: 0.15rem;
-}
-
-.relay-order-arrow {
-  margin: 0 0.15rem;
-  font-weight: 900;
-  color: #c43a1a;
-  opacity: 0.7;
+  justify-content: center;
+  min-width: 0;
 }
 
 .relay-order-name {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  display: block;
+  width: 100%;
+  min-width: 0;
   font-family: "M PLUS Rounded 1c", sans-serif;
-  font-size: 1.05rem;
+  font-size: clamp(0.72rem, 3.2vw, 0.95rem);
   font-weight: 800;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: center;
   color: #5c4033;
-  padding: 0.2rem 0.45rem;
+  padding: 0.2rem 0.25rem;
   border-radius: 999px;
 }
 
@@ -375,9 +457,6 @@ input:focus {
 
 .relay-order-name.is-hidden {
   color: #9a8578;
-  min-width: 1.6rem;
-  justify-content: center;
-  text-align: center;
 }
 
 .relay-order-name.is-current {
@@ -506,6 +585,38 @@ input:focus {
   gap: 0.6rem;
 }
 
+.finish-card {
+  text-align: center;
+  padding-top: 1.55rem;
+}
+
+.finish-icon {
+  font-size: 3.2rem;
+  line-height: 1;
+  animation: pop-in 0.45s ease both;
+}
+
+.finish-title {
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: clamp(1.65rem, 7vw, 2.2rem);
+  line-height: 1.25;
+  color: var(--paint-coral);
+}
+
+.finish-summary,
+.finish-wait {
+  margin: 0;
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.finish-wait {
+  padding: 0.75rem;
+  border: 2px dashed rgba(43, 36, 28, 0.28);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.52);
+}
+
 .divider-or {
   display: flex;
   align-items: center;
@@ -533,6 +644,30 @@ input:focus {
   justify-content: space-between;
   align-items: center;
   gap: 0.5rem;
+  flex-wrap: nowrap;
+}
+
+.row-meta > span {
+  white-space: nowrap;
+}
+
+.round-progress {
+  margin-left: auto;
+  flex-shrink: 0;
+  padding: 0.18rem 0.5rem;
+  border: 2px solid rgba(43, 36, 28, 0.62);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.7);
+  color: var(--ink);
+  font-size: 0.72rem;
+  font-weight: 900;
+  line-height: 1.2;
+}
+
+.round-progress.is-last {
+  border-color: #c43a1a;
+  background: rgba(255, 201, 60, 0.72);
+  color: #9a3412;
 }
 
 .mode-pill {
@@ -558,6 +693,11 @@ input:focus {
 
 .liar-pill {
   background: linear-gradient(90deg, #6d4fc4, #a04fc4);
+  color: #fff;
+}
+
+.gradual-pill {
+  background: linear-gradient(90deg, #2b7de0, #4d8fd9);
   color: #fff;
 }
 
@@ -652,6 +792,211 @@ input:focus {
   color: #6d3fa0;
 }
 
+.play-header.mode-gradual {
+  border-color: #2b6ac0;
+  background:
+    linear-gradient(180deg, rgba(77, 143, 217, 0.16), transparent 35%),
+    repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 27px,
+      rgba(77, 143, 217, 0.12) 27px,
+      rgba(77, 143, 217, 0.12) 28px
+    ),
+    #f0f7ff;
+}
+
+.play-header.mode-gradual::before {
+  background: rgba(77, 143, 217, 0.85);
+}
+
+.play-header.mode-gradual .prompt-value {
+  color: #17498f;
+  border-color: rgba(43, 125, 224, 0.4);
+  background: linear-gradient(transparent 62%, rgba(77, 143, 217, 0.24) 62%);
+}
+
+.play-header.mode-gradual .drawer-value {
+  background: rgba(77, 143, 217, 0.12);
+  border-color: #2b7de0;
+  color: #17498f;
+}
+
+.play-header.mode-gradual .info-drawer .info-label {
+  color: #1d5fb8;
+}
+
+/* —— しばりルーレット —— */
+.constraint-pill {
+  background: linear-gradient(90deg, #ffc93c, #ff9f1c);
+  color: #6b3b00;
+  animation: pulse-urgent 1.2s ease-in-out infinite;
+}
+
+.info-constraint {
+  padding: 0.5rem 0.6rem;
+  border: 3px dashed #d98324;
+  border-radius: 12px;
+  background:
+    repeating-linear-gradient(
+      -45deg,
+      rgba(255, 201, 60, 0.22) 0 10px,
+      transparent 10px 20px
+    ),
+    #fffaf0;
+}
+
+.info-constraint .info-label {
+  color: #a35709;
+}
+
+.constraint-value {
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: 1.3rem;
+  line-height: 1.25;
+  color: #8a4b06;
+}
+
+.constraint-rule {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 800;
+  color: var(--ink);
+}
+
+.constraint-gauge {
+  display: flex;
+  align-items: center;
+  gap: 0.22rem;
+  flex-wrap: wrap;
+  margin-top: 0.2rem;
+}
+
+.constraint-tick {
+  width: 16px;
+  height: 8px;
+  border-radius: 999px;
+  border: 2px solid #8a4b06;
+  background: #ffc93c;
+}
+
+.constraint-tick.is-used {
+  background: rgba(138, 75, 6, 0.12);
+}
+
+.constraint-remain {
+  margin-left: 0.25rem;
+  font-size: 0.82rem;
+  font-weight: 900;
+  color: #8a4b06;
+}
+
+.constraint-gauge.is-empty .constraint-remain {
+  color: #b71c1c;
+}
+
+.timer-fill.constraint {
+  background: linear-gradient(90deg, #ffc93c, #ff7a45);
+}
+
+.easel.has-constraint {
+  background: linear-gradient(180deg, #f0c27b 0%, #d99b45 55%, #a86a1f 100%);
+  border-color: #7a4a12;
+}
+
+.constraint-badge {
+  background: #fff6df;
+  color: #8a4b06;
+  transform: rotate(-4deg);
+}
+
+/* めかくししばり: 描いている本人にだけ、絵を隠す（線は下を通る） */
+.canvas-blind {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  pointer-events: none;
+  background:
+    repeating-linear-gradient(
+      -45deg,
+      rgba(255, 201, 60, 0.35) 0 18px,
+      rgba(255, 248, 232, 0.35) 18px 36px
+    ),
+    #fbf4e4;
+}
+
+.canvas-blind-face {
+  font-size: 3rem;
+  line-height: 1;
+}
+
+.canvas-blind-text {
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: 1.05rem;
+  color: #8a4b06;
+}
+
+/* だんだん見える: 公開までは、見ている側のキャンバスに幕をかける */
+.canvas-curtain {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  pointer-events: none;
+  background:
+    repeating-linear-gradient(
+      -45deg,
+      rgba(77, 143, 217, 0.24) 0 18px,
+      rgba(240, 247, 255, 0.4) 18px 36px
+    ),
+    #f0f7ff;
+}
+
+.canvas-curtain-face {
+  font-size: 3rem;
+  line-height: 1;
+  animation: pulse-urgent 1.6s ease-in-out infinite;
+}
+
+.canvas-curtain-text {
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: 1.05rem;
+  color: #17498f;
+}
+
+/* —— 爆笑リプレイ —— */
+.canvas-replay {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 3;
+  padding: 0.25rem 0.6rem;
+  border-radius: 999px;
+  border: 2px solid var(--ink);
+  background: #ff5a2e;
+  color: #fff;
+  font-size: 0.78rem;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+  animation: pulse-urgent 1s ease-in-out infinite;
+}
+
+.replay-btn {
+  border-color: #8a4b06;
+  color: #8a4b06;
+  background: #fff6df;
+}
+
 .timer-bar {
   margin-top: 0.35rem;
   display: flex;
@@ -693,6 +1038,10 @@ input:focus {
   background: linear-gradient(90deg, #6d4fc4, #ff7eb6);
 }
 
+.timer-fill.gradual {
+  background: linear-gradient(90deg, #2b7de0, #7fc3ff);
+}
+
 .easel.mode-relay {
   background: linear-gradient(180deg, #ff9a5c 0%, #ff5a2e 55%, #c43a1a 100%);
   border-color: #8b2208;
@@ -716,6 +1065,14 @@ input:focus {
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.35),
     6px 10px 0 rgba(63, 43, 133, 0.25);
+}
+
+.easel.mode-gradual {
+  background: linear-gradient(135deg, #6faef0 0%, #4d8fd9 55%, #1d5fb8 100%);
+  border-color: #143f80;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.35),
+    6px 10px 0 rgba(29, 95, 184, 0.25);
 }
 
 .easel-badge {
@@ -746,6 +1103,12 @@ input:focus {
 .liar-badge {
   background: #f3ecff;
   color: #4a2f96;
+  transform: rotate(-5deg);
+}
+
+.gradual-badge {
+  background: #eaf4ff;
+  color: #17498f;
   transform: rotate(-5deg);
 }
 
@@ -826,6 +1189,23 @@ input:focus {
     );
 }
 
+.canvas-wrap.mode-gradual {
+  border-color: #143f80;
+  box-shadow:
+    inset 0 0 0 8px #f0f7ff,
+    0 0 0 2px rgba(77, 143, 217, 0.35);
+  background:
+    radial-gradient(circle at 20% 15%, rgba(77, 143, 217, 0.14), transparent 30%),
+    radial-gradient(circle at 85% 80%, rgba(43, 125, 224, 0.1), transparent 28%),
+    repeating-linear-gradient(
+      0deg,
+      #fbf4e4,
+      #fbf4e4 2px,
+      #f7efd8 2px,
+      #f7efd8 4px
+    );
+}
+
 .fanfare {
   position: fixed;
   inset: 0;
@@ -876,6 +1256,158 @@ input:focus {
 .fanfare-liar .fanfare-text {
   background: linear-gradient(135deg, #ece2ff, #ffd9f2);
   color: #4a2f96;
+}
+
+.fanfare-gradual .fanfare-text {
+  background: linear-gradient(135deg, #ddefff, #c9e4ff);
+  color: #17498f;
+}
+
+.fanfare-constraint .fanfare-text {
+  background: linear-gradient(135deg, #fff0c9, #ffd9a0);
+  color: #8a4b06;
+}
+
+.fanfare-constraint-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  font-size: 1.15rem;
+}
+
+.fanfare-constraint-sub span {
+  font-size: 0.92rem;
+}
+
+/* —— 今日のハイライト —— */
+.highlight-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.7rem;
+  border: 3px dashed #2b7de0;
+  border-radius: 14px;
+  background:
+    repeating-linear-gradient(
+      -45deg,
+      rgba(77, 143, 217, 0.14) 0 10px,
+      transparent 10px 20px
+    ),
+    #f4faff;
+}
+
+.highlight-btn {
+  background: linear-gradient(135deg, #4d8fd9, #2b7de0);
+  color: #fff;
+}
+
+.highlight {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgba(43, 36, 28, 0.82);
+}
+
+.highlight-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  width: min(100%, 420px);
+}
+
+.highlight-eyebrow {
+  font-size: 0.8rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  color: #ffe9b8;
+}
+
+.highlight-frame {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  padding: 8px;
+  border: 4px solid var(--ink);
+  border-radius: 14px;
+  background: #fbf4e4;
+  box-shadow: 6px 8px 0 rgba(0, 0, 0, 0.35);
+  animation: highlight-flip 0.32s ease both;
+}
+
+.highlight-frame img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.highlight-missing {
+  font-size: 0.95rem;
+  font-weight: 800;
+  color: var(--muted);
+}
+
+.highlight-word {
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: clamp(1.6rem, 7vw, 2.2rem);
+  line-height: 1.2;
+  padding: 0.25rem 1rem;
+  border: 3px solid var(--ink);
+  border-radius: 12px;
+  background: #fff8e8;
+  color: var(--ink);
+  animation: fanfare-pop 0.32s ease both;
+}
+
+.highlight-drawers {
+  font-size: 0.92rem;
+  font-weight: 800;
+  color: #ffe9b8;
+}
+
+.highlight-track {
+  width: 100%;
+  height: 8px;
+  border-radius: 999px;
+  border: 2px solid rgba(255, 255, 255, 0.7);
+  background: rgba(255, 255, 255, 0.18);
+  overflow: hidden;
+}
+
+.highlight-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #ffc93c, #ff7a45);
+  transition: width 0.3s linear;
+}
+
+.highlight-count {
+  font-size: 0.82rem;
+  font-weight: 900;
+  color: #fff;
+}
+
+.highlight-close {
+  padding: 0.5rem 1.2rem;
+  font-size: 0.85rem;
+  background: #fff;
+  color: var(--ink);
+  box-shadow: 2px 3px 0 rgba(0, 0, 0, 0.4);
+}
+
+@keyframes highlight-flip {
+  from {
+    opacity: 0;
+    transform: rotateY(22deg) scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .ghost-btn,
@@ -955,6 +1487,19 @@ input:focus {
   white-space: nowrap;
 }
 
+.gallery-constraint {
+  flex-shrink: 0;
+  margin-left: auto;
+  padding: 0.06rem 0.34rem;
+  border-radius: 999px;
+  border: 2px solid #d98324;
+  background: #fff6df;
+  color: #8a4b06;
+  font-size: 0.66rem;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
 .gallery-foot {
   display: flex;
   align-items: center;
@@ -997,6 +1542,153 @@ input:focus {
   place-items: center;
   font-weight: 900;
   color: var(--paint-coral);
+}
+
+.ai-eyebrow {
+  color: #7651b5;
+  font-size: 0.72rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.ai-enabled-badge {
+  align-self: center;
+  padding: 0.38rem 0.7rem;
+  border: 2px solid rgba(89, 55, 145, 0.38);
+  border-radius: 999px;
+  background: linear-gradient(135deg, #f1e8ff, #fff3c6);
+  color: #593791;
+  font-size: 0.78rem;
+  font-weight: 900;
+}
+
+.ai-ceremony {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  padding: 0.9rem;
+  border: 3px solid #67449f;
+  border-radius: 18px;
+  background:
+    radial-gradient(circle at 95% 8%, rgba(255, 201, 60, 0.55), transparent 27%),
+    linear-gradient(145deg, #f6edff, #fff8dc);
+  box-shadow: 3px 4px 0 rgba(79, 43, 137, 0.18);
+  overflow-wrap: anywhere;
+}
+
+.ai-ceremony h2 {
+  margin: 0;
+  color: #4f2b89;
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+}
+
+.ai-ceremony h2 {
+  font-size: 1.35rem;
+}
+
+.ai-ceremony-intro,
+.ai-ceremony-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: 800;
+  line-height: 1.5;
+}
+
+.ai-awards-button {
+  padding-block: 0.75rem;
+  background: linear-gradient(135deg, #7b52b5, #b252a1);
+}
+
+.ai-busy {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.7rem;
+  border: 2px dashed rgba(79, 43, 137, 0.45);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.58);
+  color: #4f2b89;
+  font-size: 0.82rem;
+  font-weight: 900;
+}
+
+.ai-busy-icon {
+  display: inline-block;
+  font-size: 1.35rem;
+  animation: ai-paint 1.2s ease-in-out infinite;
+}
+
+.ai-award-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ai-award-item {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 0.65rem;
+  align-items: center;
+  padding: 0.55rem;
+  border: 2px solid rgba(43, 36, 28, 0.65);
+  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.82);
+  text-align: left;
+}
+
+.ai-award-item.no-image {
+  grid-template-columns: 1fr;
+}
+
+.ai-award-item img {
+  display: block;
+  width: 76px;
+  height: 76px;
+  border: 2px solid var(--ink);
+  border-radius: 10px;
+  background: #fbf4e4;
+  object-fit: cover;
+}
+
+.ai-award-item strong,
+.ai-award-work {
+  display: block;
+}
+
+.ai-award-item strong {
+  color: #4f2b89;
+  font-size: 0.9rem;
+}
+
+.ai-award-work {
+  margin-top: 0.08rem;
+  color: var(--paint-coral);
+  font-size: 0.7rem;
+  font-weight: 900;
+}
+
+.ai-award-item p {
+  margin: 0.2rem 0 0;
+  color: var(--ink);
+  font-size: 0.74rem;
+  font-weight: 700;
+  line-height: 1.45;
+}
+
+@keyframes ai-paint {
+  0%,
+  100% {
+    transform: rotate(-12deg);
+  }
+  50% {
+    transform: rotate(12deg);
+  }
 }
 
 @keyframes pulse-urgent {
@@ -1067,13 +1759,49 @@ input:focus {
   }
 }
 
+@media (max-width: 340px) {
+  .row-meta {
+    gap: 0.25rem;
+  }
+
+  .play-header .row-meta,
+  .round-progress,
+  .mode-pill {
+    font-size: 0.66rem;
+  }
+
+  .round-progress {
+    padding: 0.14rem 0.36rem;
+  }
+
+  .mode-pill {
+    padding: 0.16rem 0.4rem;
+  }
+
+  .gallery-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .ai-award-item {
+    grid-template-columns: 64px minmax(0, 1fr);
+  }
+
+  .ai-award-item img {
+    width: 64px;
+    height: 64px;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .brand,
   .card,
   .easel,
   .relay-pill,
+  .constraint-pill,
+  .canvas-replay,
   .fanfare,
-  .fanfare-text {
+  .fanfare-text,
+  .ai-busy-icon {
     animation: none;
   }
 }

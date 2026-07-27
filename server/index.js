@@ -1,4 +1,9 @@
-import { randomUUID } from "crypto";
+import {
+  createHash,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+} from "crypto";
 import cors from "cors";
 import express from "express";
 import { existsSync } from "fs";
@@ -6,9 +11,19 @@ import { createServer } from "http";
 import path from "path";
 import { fileURLToPath } from "url";
 import { Server } from "socket.io";
+import {
+  aiErrorLogDetails,
+  createAwards,
+  isAiConfigured,
+  parseImageDataUrl,
+  publicAiCapabilities,
+} from "./ai.js";
+import { findConstraint, randomConstraint } from "./constraints.js";
+import { hasVisibleDrawing } from "./drawing.js";
 import { randomWord } from "./words.js";
 
 const PORT = process.env.PORT || 3001;
+const MAX_ROOMS = 100;
 const MAX_PLAYERS = 20;
 const DISCONNECT_GRACE_MS = 45_000;
 /** 通常ラウンドの描き手が切断したときは短めに見切る（全員が待たされるため） */
@@ -16,29 +31,95 @@ const DRAWER_DISCONNECT_GRACE_MS = 12_000;
 const MAX_CONSECUTIVE_DRAWS = 2;
 const RELAY_MIN_PLAYERS = 3;
 const COOP_MIN_PLAYERS = 3;
+const RELAY_MIN_DRAWERS = 2;
+const COOP_MIN_DRAWERS = 2;
 const RELAY_MAX_DRAWERS = 5;
-const COOP_MAX_DRAWERS = 3;
+const COOP_MAX_DRAWERS = 5;
 const COOP_DURATION_MS = 40_000;
 const LIAR_MIN_PLAYERS = 4;
 const LIAR_MAX_DRAWERS = 3;
 const LIAR_DURATION_MS = 40_000;
-const GALLERY_MAX = 30;
+const GRADUAL_MIN_PLAYERS = 2;
+/**
+ * 見ている側は幕がかかったまま待つだけなので、協力・うそつきの40秒より短くする。
+ * 描き手を急かす声も飛ばないぶん、上限がないと丁寧に描きこんでしまう。
+ */
+const GRADUAL_DURATION_MS = 20_000;
+const GALLERY_MAX = 60;
 const EVENT_MIN_GAP = 3;
 const EVENT_FORCE_GAP = 6;
 const EVENT_CHANCE = 0.3;
+/** しばりはふつうのラウンドだけ。たまに出るくらいの間隔にする */
+const CONSTRAINT_MIN_GAP = 4;
+const CONSTRAINT_FORCE_GAP = 9;
+const CONSTRAINT_CHANCE = 0.25;
+const RECENT_CONSTRAINTS_MAX = 4;
+/** リプレイの連打よけ */
+const REPLAY_COOLDOWN_MS = 2_000;
+/** 今日のハイライトの連打よけ（最初の1枚が出るまで少し余裕を取る） */
+const HIGHLIGHT_COOLDOWN_MS = 3_000;
+const EXTENSION_ROUNDS = 3;
 const MAX_GALLERY_DATA_URL_LEN = 400_000;
+const MAX_TOTAL_GALLERY_DATA_URL_LEN = 80_000_000;
 const MAX_STROKES = 20_000;
 const RECENT_WORDS_MAX = 20;
+const AI_RATE_WINDOW_MS = 60 * 60 * 1000;
+const AI_RATE_LIMITS = {
+  room: Math.max(1, Number(process.env.ROOM_CREATE_RATE_LIMIT) || 10),
+  awards: Math.max(1, Number(process.env.AI_AWARDS_RATE_LIMIT) || 12),
+};
+const AI_GLOBAL_RATE_LIMITS = {
+  room: Math.max(
+    1,
+    Number(process.env.GLOBAL_ROOM_CREATE_RATE_LIMIT) || 200,
+  ),
+  awards: Math.max(
+    1,
+    Number(process.env.AI_GLOBAL_AWARDS_RATE_LIMIT) || 40,
+  ),
+};
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const clientDist = path.join(__dirname, "../client/dist");
 
+function normalizeOrigin(value) {
+  try {
+    return new URL(String(value || "").trim()).origin;
+  } catch {
+    return "";
+  }
+}
+
+const allowedOrigins = new Set(
+  [
+    process.env.APP_ORIGIN,
+    process.env.RENDER_EXTERNAL_URL,
+    ...String(process.env.ALLOWED_ORIGINS || "").split(","),
+  ]
+    .map(normalizeOrigin)
+    .filter(Boolean),
+);
+
+function isOriginAllowed(origin) {
+  if (!origin || process.env.NODE_ENV !== "production") {
+    return true;
+  }
+  return allowedOrigins.has(normalizeOrigin(origin));
+}
+
+function allowCorsOrigin(origin, callback) {
+  callback(null, isOriginAllowed(origin));
+}
+
 const app = express();
-app.use(cors());
+app.use(cors({ origin: allowCorsOrigin }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
-  cors: { origin: true, methods: ["GET", "POST"] },
+  cors: { origin: allowCorsOrigin, methods: ["GET", "POST"] },
+  allowRequest: (req, callback) => {
+    callback(null, isOriginAllowed(req.headers.origin));
+  },
   maxHttpBufferSize: 1e6,
 });
 
@@ -47,6 +128,7 @@ const io = new Server(httpServer, {
  *  id: string,
  *  name: string,
  *  isHost: boolean,
+ *  resumeToken: string,
  *  socketId: string | null,
  *  disconnectTimer?: ReturnType<typeof setTimeout>,
  * }} Player
@@ -57,8 +139,11 @@ const io = new Server(httpServer, {
  *  imageDataUrl: string,
  *  word: string,
  *  drawerNames: string[],
- *  roundType: 'normal' | 'relay' | 'coop' | 'liar',
+ *  roundType: 'normal' | 'relay' | 'coop' | 'liar' | 'gradual',
+ *  constraintLabel: string,
  *  createdAt: number,
+ *  gameSeq: number,
+ *  hasDrawing: boolean,
  * }} GalleryItem
  */
 /**
@@ -66,8 +151,8 @@ const io = new Server(httpServer, {
  *  code: string,
  *  hostId: string,
  *  players: Map<string, Player>,
- *  phase: 'lobby' | 'playing',
- *  roundType: 'normal' | 'relay' | 'coop' | 'liar',
+ *  phase: 'lobby' | 'playing' | 'finished',
+ *  roundType: 'normal' | 'relay' | 'coop' | 'liar' | 'gradual',
  *  drawPhase: 'drawing' | 'guessing' | 'reveal',
  *  drawerId: string | null,
  *  drawerIds: string[],
@@ -82,10 +167,30 @@ const io = new Server(httpServer, {
  *  seenWordIds: Set<string>,
  *  roundsSinceSpecial: number,
  *  lastWasSpecial: boolean,
+ *  constraint: import('./constraints.js').Constraint | null,
+ *  strokeCounts: Map<string, number>,
+ *  blockedDrawers: Set<string>,
+ *  roundsSinceConstraint: number,
+ *  recentConstraints: string[],
+ *  lastReplayAt: number,
+ *  lastHighlightAt: number,
  *  gallery: GalleryItem[],
  *  strokes: object[],
  *  recentWords: string[],
  *  roundSeq: number,
+ *  totalRounds: number,
+ *  completedRounds: number,
+ *  drawCounts: Map<string, number>,
+ *  lastCompletedRoundSeq: number | null,
+ *  gameSeq: number,
+ *  aiAwardsStatus: 'idle' | 'generating' | 'ready' | 'error',
+ *  aiAwards: null | {
+ *    intro: string,
+ *    awards: { galleryItemId: string, title: string, reason: string }[],
+ *  },
+ *  aiAwardsError: string,
+ *  aiAwardsAttempts: number,
+ *  aiAwardsToken: number,
  * }} Room
  */
 
@@ -95,6 +200,8 @@ const rooms = new Map();
 const socketRoom = new Map();
 /** socketId -> playerId */
 const socketPlayer = new Map();
+/** client address + AI action -> { startedAt, count } */
+const aiRateWindows = new Map();
 
 function generateCode() {
   for (let i = 0; i < 50; i++) {
@@ -106,10 +213,41 @@ function generateCode() {
 
 /** 全角数字なども半角4桁に正規化 */
 function normalizeRoomCode(code) {
-  return String(code || "")
+  return safeString(code)
     .normalize("NFKC")
     .replace(/\D/g, "")
     .slice(0, 4);
+}
+
+function safeString(value) {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  return "";
+}
+
+function safeNumber(value) {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : Number.NaN;
+  }
+  if (typeof value !== "string" || !value.trim()) return Number.NaN;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : Number.NaN;
+}
+
+function createResumeToken() {
+  return randomBytes(32).toString("base64url");
+}
+
+function resumeTokenMatches(player, candidate) {
+  const token = safeString(candidate);
+  if (!/^[A-Za-z0-9_-]{43}$/.test(token)) return false;
+  const expectedHash = createHash("sha256")
+    .update(player.resumeToken)
+    .digest();
+  const candidateHash = createHash("sha256").update(token).digest();
+  return timingSafeEqual(expectedHash, candidateHash);
 }
 
 function publicPlayers(room) {
@@ -118,6 +256,90 @@ function publicPlayers(room) {
     name: p.name,
     isHost: p.isHost,
   }));
+}
+
+function totalGalleryDataUrlLength() {
+  let total = 0;
+  for (const room of rooms.values()) {
+    for (const item of room.gallery) {
+      total += item.imageDataUrl?.length || 0;
+    }
+  }
+  return total;
+}
+
+function hasGalleryStorageFor(room, imageDataUrl) {
+  const evictedLength =
+    room.gallery.length >= GALLERY_MAX
+      ? room.gallery[0]?.imageDataUrl?.length || 0
+      : 0;
+  return (
+    totalGalleryDataUrlLength() +
+      imageDataUrl.length -
+      evictedLength <=
+    MAX_TOTAL_GALLERY_DATA_URL_LEN
+  );
+}
+
+function aiClientAddress(socket) {
+  const forwarded = socket.handshake.headers["x-forwarded-for"];
+  const forwardedText = Array.isArray(forwarded)
+    ? forwarded.join(",")
+    : String(forwarded || "");
+  const lastForwarded = forwardedText.split(",").at(-1);
+  return String(lastForwarded || socket.handshake.address || "unknown")
+    .trim()
+    .slice(0, 96);
+}
+
+function aiSafetyIdentifier(playerId) {
+  return createHash("sha256")
+    .update(String(playerId || "unknown-player"))
+    .digest("hex");
+}
+
+function consumeAiQuota(socket, kind) {
+  const now = Date.now();
+  const clientKey = `${kind}:${aiClientAddress(socket)}`;
+  const globalKey = `global:${kind}`;
+  const clientEntry = aiRateWindows.get(clientKey);
+  const globalEntry = aiRateWindows.get(globalKey);
+  const limit = AI_RATE_LIMITS[kind];
+  const globalLimit = AI_GLOBAL_RATE_LIMITS[kind];
+  if (!limit || !globalLimit) return false;
+
+  if (!clientEntry && aiRateWindows.size >= 5_000) {
+    for (const [entryKey, entry] of aiRateWindows) {
+      if (now - entry.startedAt >= AI_RATE_WINDOW_MS) {
+        aiRateWindows.delete(entryKey);
+      }
+    }
+    if (aiRateWindows.size >= 5_000) return false;
+  }
+
+  const clientCount =
+    clientEntry && now - clientEntry.startedAt < AI_RATE_WINDOW_MS
+      ? clientEntry.count
+      : 0;
+  const globalCount =
+    globalEntry && now - globalEntry.startedAt < AI_RATE_WINDOW_MS
+      ? globalEntry.count
+      : 0;
+  if (clientCount >= limit || globalCount >= globalLimit) return false;
+
+  aiRateWindows.set(clientKey, {
+    startedAt: clientCount === 0 ? now : clientEntry.startedAt,
+    count: clientCount + 1,
+  });
+  aiRateWindows.set(globalKey, {
+    startedAt: globalCount === 0 ? now : globalEntry.startedAt,
+    count: globalCount + 1,
+  });
+  return true;
+}
+
+function activePlayers(room) {
+  return [...room.players.values()].filter((player) => player.socketId);
 }
 
 function playerNames(room, ids) {
@@ -140,6 +362,9 @@ function emitLobby(room) {
     phase: room.phase,
     players: publicPlayers(room),
     hostId: room.hostId,
+    completedRounds: room.completedRounds,
+    totalRounds: room.totalRounds,
+    extensionRounds: EXTENSION_ROUNDS,
   });
 }
 
@@ -152,6 +377,99 @@ function emitGallery(room, targetSocketId = null) {
   }
 }
 
+function currentGameGallery(room) {
+  return room.gallery.filter((item) => item.gameSeq === room.gameSeq);
+}
+
+/**
+ * 今のゲームで、実際に線が引かれた絵。
+ * 授賞式の候補にも、今日のハイライトにも、この同じ集合を使う（白紙は出さない）。
+ */
+function drawnThisGame(room) {
+  return currentGameGallery(room).filter((item) => item.hasDrawing);
+}
+
+function buildAiState(room) {
+  return {
+    ...publicAiCapabilities(),
+    gameSeq: room.gameSeq,
+    currentGalleryCount: currentGameGallery(room).length,
+    awardCandidateCount: drawnThisGame(room).length,
+    awardsStatus: room.aiAwardsStatus,
+    awards: room.aiAwards,
+    awardsError: room.aiAwardsError,
+    canRetryAwards: room.aiAwardsAttempts < 2,
+  };
+}
+
+function emitAiState(room, targetSocketId = null) {
+  const payload = buildAiState(room);
+  if (targetSocketId) {
+    io.to(targetSocketId).emit("aiStateUpdate", payload);
+    return;
+  }
+  io.to(room.code).emit("aiStateUpdate", payload);
+}
+
+function resetAiForNewGame(room) {
+  room.aiAwardsToken += 1;
+  room.aiAwardsStatus = "idle";
+  room.aiAwards = null;
+  room.aiAwardsError = "";
+  room.aiAwardsAttempts = 0;
+}
+
+function resetAwardsForExtension(room) {
+  room.aiAwardsToken += 1;
+  room.aiAwardsStatus = "idle";
+  room.aiAwards = null;
+  room.aiAwardsError = "";
+  room.aiAwardsAttempts = 0;
+}
+
+function resetAiWhenReturningToLobby(room) {
+  room.aiAwardsToken += 1;
+  room.aiAwardsStatus = "idle";
+  room.aiAwards = null;
+  room.aiAwardsError = "";
+}
+
+function friendlyAiError(error, fallback) {
+  const code = String(error?.code || "");
+  if (code === "moderation_blocked") {
+    return "この絵はAIで処理できませんでした";
+  }
+  if (error?.status === 401 || error?.status === 403) {
+    return "AIの設定を確認してください";
+  }
+  if (error?.status === 429) {
+    if (
+      code === "insufficient_quota" ||
+      code === "billing_hard_limit_reached"
+    ) {
+      return "AIの利用上限に達しました";
+    }
+    return "AI画伯が混み合っています。少し待って試してください";
+  }
+  if (
+    error?.name === "TimeoutError" ||
+    String(error?.message || "").includes("timed out")
+  ) {
+    return "AI画伯の返事に時間がかかりました";
+  }
+  if (
+    String(error?.message || "").includes("moderation") ||
+    String(error?.message || "").includes("refused")
+  ) {
+    return "この絵はAIで処理できませんでした";
+  }
+  return fallback;
+}
+
+function logAiFailure(kind, error) {
+  console.error(`[ai] ${kind} failed`, aiErrorLogDetails(error));
+}
+
 function bindSocket(socket, room, player) {
   if (player.disconnectTimer) {
     clearTimeout(player.disconnectTimer);
@@ -160,6 +478,7 @@ function bindSocket(socket, room, player) {
   if (player.socketId && player.socketId !== socket.id) {
     socketRoom.delete(player.socketId);
     socketPlayer.delete(player.socketId);
+    io.sockets.sockets.get(player.socketId)?.leave(room.code);
   }
   player.socketId = socket.id;
   socketRoom.set(socket.id, room.code);
@@ -190,15 +509,84 @@ function randomInt(min, max) {
   return min + Math.floor(Math.random() * (max - min + 1));
 }
 
+function reply(callback, payload) {
+  if (typeof callback === "function") {
+    callback(payload);
+  }
+}
+
+function onSocket(socket, event, handler) {
+  socket.on(event, (...args) => {
+    const handleError = (error) => {
+      const message =
+        error instanceof Error ? error.message.slice(0, 160) : "Unknown error";
+      console.error("[socket] event failed", { event, message });
+      const callback = args.at(-1);
+      if (typeof callback === "function") {
+        try {
+          callback({ ok: false, error: "入力を処理できませんでした" });
+        } catch {
+          // A broken acknowledgement must not terminate the process.
+        }
+      }
+    };
+
+    try {
+      const result = handler(...args);
+      if (result && typeof result.then === "function") {
+        result.catch(handleError);
+      }
+    } catch (error) {
+      handleError(error);
+    }
+  });
+}
+
+function chooseTotalRounds(playerCount) {
+  if (playerCount <= 4) return randomInt(12, 16);
+  if (playerCount <= 7) return randomInt(16, 20);
+  if (playerCount <= 10) return randomInt(20, 24);
+  return randomInt(24, 30);
+}
+
+function getDrawCount(room, playerId) {
+  return room.drawCounts.get(playerId) || 0;
+}
+
+function recordDrawers(room, ids) {
+  for (const id of new Set(ids)) {
+    room.drawCounts.set(id, getDrawCount(room, id) + 1);
+  }
+}
+
+function pickFairPlayers(room, players, count) {
+  const ranked = shuffle(players).sort(
+    (a, b) => getDrawCount(room, a.id) - getDrawCount(room, b.id),
+  );
+  const selected = ranked.slice(0, Math.min(count, ranked.length));
+  return shuffle(selected);
+}
+
 function pickDrawer(room) {
-  const players = [...room.players.values()];
+  const players = activePlayers(room);
   if (players.length === 0) return null;
 
-  let candidates = players;
+  const fewestDraws = Math.min(
+    ...players.map((player) => getDrawCount(room, player.id)),
+  );
+  let candidates = players.filter(
+    (player) => getDrawCount(room, player.id) === fewestDraws,
+  );
+
+  // 同じ担当回数の人が複数いるときだけ、同じ人の連続担当を避ける。
+  // 担当回数が少ない人（途中参加者を含む）の優先は崩さない。
   const streak = room.drawerStreak;
-  if (streak && streak.count >= MAX_CONSECUTIVE_DRAWS && players.length > 1) {
-    const filtered = players.filter((p) => p.id !== streak.id);
-    if (filtered.length > 0) candidates = filtered;
+  if (
+    streak &&
+    streak.count >= MAX_CONSECUTIVE_DRAWS &&
+    candidates.length > 1
+  ) {
+    candidates = candidates.filter((player) => player.id !== streak.id);
   }
 
   const drawer = candidates[Math.floor(Math.random() * candidates.length)];
@@ -210,26 +598,29 @@ function pickDrawer(room) {
   return drawer;
 }
 
-function chooseRoundType(room) {
+function chooseRoundType(room, playerCount = activePlayers(room).length) {
   const forced = process.env.FORCE_ROUND_TYPE;
   if (
     forced === "relay" ||
     forced === "coop" ||
     forced === "liar" ||
+    forced === "gradual" ||
     forced === "normal"
   ) {
-    const n = room.players.size;
+    const n = playerCount;
     if (forced === "relay" && n < RELAY_MIN_PLAYERS) return "normal";
     if (forced === "coop" && n < COOP_MIN_PLAYERS) return "normal";
     if (forced === "liar" && n < LIAR_MIN_PLAYERS) return "normal";
+    if (forced === "gradual" && n < GRADUAL_MIN_PLAYERS) return "normal";
     return forced;
   }
 
-  const n = room.players.size;
+  const n = playerCount;
   const eligible = [];
   if (n >= RELAY_MIN_PLAYERS) eligible.push("relay");
   if (n >= COOP_MIN_PLAYERS) eligible.push("coop");
   if (n >= LIAR_MIN_PLAYERS) eligible.push("liar");
+  if (n >= GRADUAL_MIN_PLAYERS) eligible.push("gradual");
 
   if (eligible.length === 0 || room.lastWasSpecial) {
     return "normal";
@@ -245,6 +636,69 @@ function chooseRoundType(room) {
   return eligible[Math.floor(Math.random() * eligible.length)];
 }
 
+/**
+ * しばりを引くかどうか決める。
+ * ふつうのラウンド専用（リレー・協力・うそつきには重ねない）。
+ */
+function chooseConstraint(room) {
+  const forced = process.env.FORCE_CONSTRAINT;
+  if (forced) {
+    if (forced === "none") return null;
+    if (forced === "random") return randomConstraint();
+    return findConstraint(forced);
+  }
+
+  if (room.roundsSinceConstraint < CONSTRAINT_MIN_GAP) return null;
+  const roll =
+    room.roundsSinceConstraint >= CONSTRAINT_FORCE_GAP
+      ? true
+      : Math.random() < CONSTRAINT_CHANCE;
+  if (!roll) return null;
+  return randomConstraint(new Set(room.recentConstraints));
+}
+
+function applyConstraint(room, roundType) {
+  const constraint = roundType === "normal" ? chooseConstraint(room) : null;
+  room.constraint = constraint;
+  if (!constraint) {
+    room.roundsSinceConstraint += 1;
+    return;
+  }
+  room.roundsSinceConstraint = 0;
+  room.recentConstraints.push(constraint.id);
+  if (room.recentConstraints.length > RECENT_CONSTRAINTS_MAX) {
+    room.recentConstraints = room.recentConstraints.slice(
+      -RECENT_CONSTRAINTS_MAX,
+    );
+  }
+}
+
+/**
+ * 本数しばりの残量チェック。使い切ったら、その線はまるごと捨てる
+ * （start だけ捨てると move がつながって変な線になるため）。
+ */
+function allowConstrainedStroke(room, playerId, type) {
+  const limit = room.constraint?.kind === "strokes" ? room.constraint.value : 0;
+  if (!limit) return true;
+
+  if (type === "start") {
+    const used = room.strokeCounts.get(playerId) || 0;
+    if (used >= limit) {
+      room.blockedDrawers.add(playerId);
+      return false;
+    }
+    room.strokeCounts.set(playerId, used + 1);
+    room.blockedDrawers.delete(playerId);
+    return true;
+  }
+
+  if (room.blockedDrawers.has(playerId)) {
+    if (type === "end") room.blockedDrawers.delete(playerId);
+    return false;
+  }
+  return true;
+}
+
 function canPlayerDraw(room, playerId) {
   if (room.phase !== "playing" || room.drawPhase !== "drawing") return false;
   if (room.roundType === "coop" || room.roundType === "liar") {
@@ -256,6 +710,11 @@ function canPlayerDraw(room, playerId) {
 function canPlayerSeeWord(room, playerId) {
   if (room.phase !== "playing" || !room.word) return false;
   if (room.roundType === "normal") {
+    // 「せいかい！」のあとは全員に公開（聞き取れなかった子にも答えが伝わる）
+    if (room.drawPhase === "reveal") return true;
+    return room.drawerId === playerId;
+  }
+  if (room.roundType === "gradual") {
     return room.drawerId === playerId;
   }
   if (room.roundType === "coop") {
@@ -273,6 +732,13 @@ function canPlayerSeeWord(room, playerId) {
 function canPlayerNextRound(room, playerId) {
   if (room.phase !== "playing") return false;
   if (room.roundType === "normal") {
+    // 「せいかい！」で答えを出してから進む
+    if (room.drawPhase !== "reveal") return false;
+    return room.drawerId === playerId;
+  }
+  if (room.roundType === "gradual") {
+    // 公開が始まるまでは「できた！」で公開する（つぎへは公開後）
+    if (room.drawPhase !== "guessing") return false;
     return room.drawerId === playerId;
   }
   if (room.roundType === "relay") {
@@ -288,6 +754,13 @@ function canPlayerNextRound(room, playerId) {
     return room.drawerIds.includes(playerId) || room.hostId === playerId;
   }
   return false;
+}
+
+/** ふつうのラウンドの「せいかい！」。時間しばりであてっこタイムに入っていても押せる */
+function canRevealAnswer(room, playerId) {
+  if (room.phase !== "playing" || room.roundType !== "normal") return false;
+  if (room.drawPhase === "reveal") return false;
+  return room.drawerId === playerId;
 }
 
 function canRevealLiar(room, playerId) {
@@ -307,6 +780,12 @@ function buildRoundPayload(room, playerId) {
   /** @type {Record<string, unknown>} */
   const payload = {
     roundId: room.roundSeq,
+    roundNumber: room.completedRounds + 1,
+    totalRounds: room.totalRounds,
+    remainingRounds: Math.max(
+      0,
+      room.totalRounds - room.completedRounds - 1,
+    ),
     roundType: room.roundType,
     drawPhase: room.drawPhase,
     drawerId: room.drawerId,
@@ -326,7 +805,15 @@ function buildRoundPayload(room, playerId) {
           ? Math.round(COOP_DURATION_MS / 1000)
           : room.roundType === "liar" && room.drawPhase === "drawing"
             ? Math.round(LIAR_DURATION_MS / 1000)
-            : null,
+            : room.roundType === "gradual" && room.drawPhase === "drawing"
+              ? Math.round(GRADUAL_DURATION_MS / 1000)
+              : room.constraint?.kind === "time" &&
+                  room.drawPhase === "drawing"
+                ? room.constraint.value
+                : null,
+    // しばりは全員に見せる（見ている側が知らないと、ただ下手な人になってしまう）
+    constraint: room.constraint,
+    constraintStrokesUsed: room.strokeCounts.get(playerId) || 0,
     relayIndex:
       room.roundType === "relay" ? room.relayIndex : null,
     relayTotal:
@@ -343,6 +830,15 @@ function buildRoundPayload(room, playerId) {
     payload.liarName = room.drawPhase === "reveal" ? room.liarName : null;
   }
 
+  if (room.roundType === "gradual") {
+    payload.canFinishGradual =
+      room.drawPhase === "drawing" && room.drawerId === playerId;
+  }
+
+  if (room.roundType === "normal") {
+    payload.canRevealAnswer = canRevealAnswer(room, playerId);
+  }
+
   return payload;
 }
 
@@ -352,23 +848,28 @@ function emitRoundStart(room, { clear = false, fanfare = false } = {}) {
   }
 
   if (fanfare) {
-    const message =
-      room.roundType === "relay"
+    const constraint = room.constraint;
+    const message = constraint
+      ? "🎲 しばりルーレット！"
+      : room.roundType === "relay"
         ? "⚡ リレー！"
         : room.roundType === "coop"
           ? "🤝 協力！"
           : room.roundType === "liar"
             ? "🕵️ うそつきお絵かき！"
-            : null;
+            : room.roundType === "gradual"
+              ? "👀 だんだん見える！"
+              : null;
     if (message) {
       const names =
         room.roundType === "coop" || room.roundType === "liar"
           ? playerNames(room, room.drawerIds)
           : [];
       io.to(room.code).emit("roundFanfare", {
-        roundType: room.roundType,
+        roundType: constraint ? "constraint" : room.roundType,
         message,
         names,
+        constraint: constraint || null,
       });
     }
   }
@@ -399,6 +900,10 @@ function enterGuessing(room) {
     room.roundType === "relay"
       ? room.drawerIds[room.drawerIds.length - 1] || null
       : room.drawerId;
+  // だんだん見える: ここで初めて線を配り、全員の画面でスロー再生を始める
+  if (room.roundType === "gradual") {
+    io.to(room.code).emit("gradualReveal", { strokes: room.strokes });
+  }
   emitRoundSync(room);
 }
 
@@ -446,14 +951,17 @@ function advanceRelay(room) {
   beginRelayTurn(room);
 }
 
-/** 協力・うそつき用: 一定時間で自動的にあてっこタイムへ */
+/** 協力・うそつき・だんだん・時間しばり用: 一定時間で自動的にあてっこタイムへ */
 function scheduleTimedDrawing(room, ms) {
   clearTurnTimer(room);
   room.turnEndsAt = Date.now() + ms;
   room.turnTimer = setTimeout(() => {
     room.turnTimer = null;
     if (
-      (room.roundType === "coop" || room.roundType === "liar") &&
+      (room.roundType === "coop" ||
+        room.roundType === "liar" ||
+        room.roundType === "gradual" ||
+        room.constraint?.kind === "time") &&
       room.drawPhase === "drawing"
     ) {
       enterGuessing(room);
@@ -472,8 +980,35 @@ function resetRoundFields(room) {
   room.turnDurations = [];
   room.seenWordIds = new Set();
   room.strokes = [];
+  room.constraint = null;
+  room.strokeCounts = new Map();
+  room.blockedDrawers = new Set();
   room.liarId = null;
   room.liarName = "";
+}
+
+function resetGameProgress(room) {
+  room.totalRounds = 0;
+  room.completedRounds = 0;
+  room.drawCounts = new Map();
+  room.lastCompletedRoundSeq = null;
+}
+
+function buildFinishedPayload(room) {
+  return {
+    completedRounds: room.completedRounds,
+    totalRounds: room.totalRounds,
+    extensionRounds: EXTENSION_ROUNDS,
+  };
+}
+
+function finishGame(room) {
+  room.phase = "finished";
+  resetRoundFields(room);
+  io.to(room.code).emit("clearCanvas");
+  emitLobby(room);
+  io.to(room.code).emit("gameFinished", buildFinishedPayload(room));
+  emitAiState(room);
 }
 
 function pickWord(room) {
@@ -486,21 +1021,29 @@ function pickWord(room) {
 }
 
 function startRound(room) {
-  const players = [...room.players.values()];
+  const players = activePlayers(room);
   if (players.length === 0) return;
 
-  const roundType = chooseRoundType(room);
+  const roundType = chooseRoundType(room, players.length);
   resetRoundFields(room);
   room.roundSeq += 1;
   room.phase = "playing";
   room.roundType = roundType;
   room.word = pickWord(room);
+  applyConstraint(room, roundType);
 
   if (roundType === "relay") {
     room.lastWasSpecial = true;
     room.roundsSinceSpecial = 0;
-    const count = Math.min(RELAY_MAX_DRAWERS, players.length);
-    const order = shuffle(players.map((p) => p.id)).slice(0, count);
+    // 回答者を原則2人残し、参加人数に応じた範囲で描き手数も変化させる。
+    const maxCount = Math.min(
+      RELAY_MAX_DRAWERS,
+      Math.max(RELAY_MIN_DRAWERS, players.length - 2),
+    );
+    const count = randomInt(RELAY_MIN_DRAWERS, maxCount);
+    const order = pickFairPlayers(room, players, count).map(
+      (player) => player.id,
+    );
     room.drawerIds = order;
     room.turnDurations = order.map(() => randomInt(5, 10));
     room.relayIndex = 0;
@@ -515,7 +1058,7 @@ function startRound(room) {
       room.relayIndex += 1;
     }
     if (room.relayIndex >= room.drawerIds.length) {
-      // fallback
+      // fallback（しばりなしのふつうのラウンドとして始め直す）
       room.roundType = "normal";
       room.lastWasSpecial = false;
       const drawer = pickDrawer(room);
@@ -537,8 +1080,15 @@ function startRound(room) {
   if (roundType === "coop") {
     room.lastWasSpecial = true;
     room.roundsSinceSpecial = 0;
-    const count = Math.min(COOP_MAX_DRAWERS, players.length);
-    const members = shuffle(players.map((p) => p.id)).slice(0, count);
+    // 回答者を原則2人残し、参加人数に応じた範囲で描き手数も変化させる。
+    const maxCount = Math.min(
+      COOP_MAX_DRAWERS,
+      Math.max(COOP_MIN_DRAWERS, players.length - 2),
+    );
+    const count = randomInt(COOP_MIN_DRAWERS, maxCount);
+    const members = pickFairPlayers(room, players, count).map(
+      (player) => player.id,
+    );
     room.drawerIds = members;
     room.drawerId = members[0] || null;
     room.seenWordIds = new Set(members);
@@ -553,7 +1103,9 @@ function startRound(room) {
     room.lastWasSpecial = true;
     room.roundsSinceSpecial = 0;
     const count = Math.min(LIAR_MAX_DRAWERS, players.length);
-    const members = shuffle(players.map((p) => p.id)).slice(0, count);
+    const members = pickFairPlayers(room, players, count).map(
+      (player) => player.id,
+    );
     const liarId = members[Math.floor(Math.random() * members.length)];
     room.drawerIds = members;
     room.drawerId = members[0] || null;
@@ -568,6 +1120,20 @@ function startRound(room) {
     return;
   }
 
+  if (roundType === "gradual") {
+    room.lastWasSpecial = true;
+    room.roundsSinceSpecial = 0;
+    const drawer = pickDrawer(room);
+    if (!drawer) return;
+    room.drawerId = drawer.id;
+    room.drawerIds = [drawer.id];
+    room.seenWordIds = new Set([drawer.id]);
+    room.drawPhase = "drawing";
+    scheduleTimedDrawing(room, GRADUAL_DURATION_MS);
+    emitRoundStart(room, { clear: true, fanfare: true });
+    return;
+  }
+
   // normal
   room.lastWasSpecial = false;
   room.roundsSinceSpecial += 1;
@@ -577,15 +1143,35 @@ function startRound(room) {
   room.drawerIds = [drawer.id];
   room.seenWordIds = new Set([drawer.id]);
   room.drawPhase = "drawing";
-  emitRoundStart(room, { clear: true, fanfare: false });
+  if (room.constraint?.kind === "time") {
+    scheduleTimedDrawing(room, room.constraint.value * 1000);
+  }
+  emitRoundStart(room, { clear: true, fanfare: Boolean(room.constraint) });
+}
+
+/** だんだん見えるの公開前は、描き手本人以外に線を見せない */
+function strokesVisibleTo(room, playerId) {
+  if (
+    room.roundType === "gradual" &&
+    room.drawPhase === "drawing" &&
+    room.drawerId !== playerId
+  ) {
+    return [];
+  }
+  return room.strokes;
 }
 
 function syncPlayerState(socket, room, playerId) {
   const players = publicPlayers(room);
   emitGallery(room, socket.id);
+  emitAiState(room, socket.id);
   if (room.phase === "playing" && room.word) {
     io.to(socket.id).emit("roundStart", buildRoundPayload(room, playerId));
-    io.to(socket.id).emit("strokeHistory", { strokes: room.strokes });
+    io.to(socket.id).emit("strokeHistory", {
+      strokes: strokesVisibleTo(room, playerId),
+    });
+  } else if (room.phase === "finished") {
+    io.to(socket.id).emit("gameFinished", buildFinishedPayload(room));
   } else {
     emitLobby(room);
   }
@@ -624,6 +1210,7 @@ function removePlayer(room, playerId) {
 
   room.players.delete(playerId);
   room.seenWordIds.delete(playerId);
+  room.drawCounts.delete(playerId);
 
   if (room.players.size === 0) {
     clearTurnTimer(room);
@@ -638,15 +1225,32 @@ function removePlayer(room, playerId) {
     io.to(room.code).emit("hostChanged", { name: nextHost.name });
   }
 
+  // 支払い済みのAI処理は、1人になっても破棄せず完成を待つ。
+  if (
+    room.phase === "finished" &&
+    room.players.size === 1 &&
+    room.aiAwardsStatus === "generating"
+  ) {
+    emitLobby(room);
+    emitAiState(room);
+    return;
+  }
+
   // ひとりだけ残ったらゲームを畳んでロビーへ（部屋コードで再招集できる）
-  if (room.phase === "playing" && room.players.size === 1) {
+  if (
+    (room.phase === "playing" || room.phase === "finished") &&
+    room.players.size === 1
+  ) {
     clearTurnTimer(room);
     room.phase = "lobby";
     resetRoundFields(room);
+    resetGameProgress(room);
     room.drawerStreak = null;
+    resetAiWhenReturningToLobby(room);
     io.to(room.code).emit("clearCanvas");
     io.to(room.code).emit("gameEnded", { reason: "alone" });
     emitLobby(room);
+    emitAiState(room);
     return;
   }
 
@@ -738,12 +1342,70 @@ function scheduleDisconnect(room, player, graceMs = DISCONNECT_GRACE_MS) {
   }, graceMs);
 }
 
-function addGalleryItem(room, { imageDataUrl, word, drawerNames, roundType }) {
-  if (!imageDataUrl || typeof imageDataUrl !== "string") return;
-  if (!imageDataUrl.startsWith("data:image/")) return;
-  if (imageDataUrl.length > MAX_GALLERY_DATA_URL_LEN) return;
+function reconcileRemovedGalleryItems(
+  room,
+  removedIds,
+  { automatic = false } = {},
+) {
+  const idSet =
+    removedIds instanceof Set ? removedIds : new Set(removedIds || []);
+  if (idSet.size === 0) return;
 
-  room.gallery.push({
+  if (room.aiAwardsStatus === "ready" && room.aiAwards?.awards) {
+    const remainingAwards = room.aiAwards.awards.filter(
+      (award) => !idSet.has(award.galleryItemId),
+    );
+    if (remainingAwards.length !== room.aiAwards.awards.length) {
+      if (remainingAwards.length > 0) {
+        room.aiAwards = {
+          ...room.aiAwards,
+          awards: remainingAwards,
+        };
+      } else {
+        room.aiAwardsStatus = "error";
+        room.aiAwards = null;
+        room.aiAwardsError = automatic
+          ? "保存上限のため、古い受賞作品がギャラリーから整理されました"
+          : "受賞作品がギャラリーから削除されました";
+        room.aiAwardsAttempts = 2;
+      }
+    }
+  }
+}
+
+function trimGallery(room) {
+  if (room.gallery.length > GALLERY_MAX) {
+    const removedIds = room.gallery
+      .slice(0, room.gallery.length - GALLERY_MAX)
+      .map((item) => item.id);
+    room.gallery = room.gallery.slice(-GALLERY_MAX);
+    reconcileRemovedGalleryItems(room, removedIds, { automatic: true });
+    return removedIds;
+  }
+  return [];
+}
+
+function addGalleryItem(
+  room,
+  {
+    imageDataUrl,
+    word,
+    drawerNames,
+    roundType,
+    constraintLabel = "",
+    hasDrawing = false,
+  },
+) {
+  if (
+    typeof imageDataUrl !== "string" ||
+    imageDataUrl.length > MAX_GALLERY_DATA_URL_LEN ||
+    !parseImageDataUrl(imageDataUrl) ||
+    !hasGalleryStorageFor(room, imageDataUrl)
+  ) {
+    return null;
+  }
+
+  const item = {
     id: randomUUID(),
     imageDataUrl,
     word: String(word || "").slice(0, 40),
@@ -751,12 +1413,16 @@ function addGalleryItem(room, { imageDataUrl, word, drawerNames, roundType }) {
       ? drawerNames.map((n) => String(n).slice(0, 12)).slice(0, 8)
       : [],
     roundType: roundType || "normal",
+    constraintLabel: String(constraintLabel || "").slice(0, 24),
     createdAt: Date.now(),
-  });
-  if (room.gallery.length > GALLERY_MAX) {
-    room.gallery = room.gallery.slice(-GALLERY_MAX);
-  }
+    gameSeq: room.gameSeq,
+    hasDrawing: Boolean(hasDrawing),
+  };
+  room.gallery.push(item);
+  trimGallery(room);
   emitGallery(room);
+  emitAiState(room);
+  return item;
 }
 
 function createEmptyRoom(code, hostId) {
@@ -779,20 +1445,53 @@ function createEmptyRoom(code, hostId) {
     seenWordIds: new Set(),
     roundsSinceSpecial: 0,
     lastWasSpecial: false,
+    constraint: null,
+    strokeCounts: new Map(),
+    blockedDrawers: new Set(),
+    roundsSinceConstraint: 0,
+    recentConstraints: [],
+    lastReplayAt: 0,
+    lastHighlightAt: 0,
     gallery: [],
     strokes: [],
     recentWords: [],
     liarId: null,
     liarName: "",
     roundSeq: 0,
+    totalRounds: 0,
+    completedRounds: 0,
+    drawCounts: new Map(),
+    lastCompletedRoundSeq: null,
+    gameSeq: 0,
+    aiAwardsStatus: "idle",
+    aiAwards: null,
+    aiAwardsError: "",
+    aiAwardsAttempts: 0,
+    aiAwardsToken: 0,
   };
 }
 
 io.on("connection", (socket) => {
-  socket.on("createRoom", ({ name }, cb) => {
+  onSocket(socket, "createRoom", (data, cb) => {
+    const { name } = data || {};
     try {
-      const trimmed = String(name || "").trim().slice(0, 12);
-      if (!trimmed) return cb?.({ ok: false, error: "名前を入力してください" });
+      if (getContext(socket)) {
+        return reply(cb, { ok: false, error: "すでに部屋に入っています" });
+      }
+      const trimmed = safeString(name).trim().slice(0, 12);
+      if (!trimmed) return reply(cb, { ok: false, error: "名前を入力してください" });
+      if (!consumeAiQuota(socket, "room")) {
+        return reply(cb, {
+          ok: false,
+          error: "部屋を続けて作りすぎています。少し待ってください",
+        });
+      }
+      if (rooms.size >= MAX_ROOMS) {
+        return reply(cb, {
+          ok: false,
+          error: "ただいま満室です。少し待って試してください",
+        });
+      }
 
       const code = generateCode();
       const playerId = randomUUID();
@@ -801,39 +1500,49 @@ io.on("connection", (socket) => {
         id: playerId,
         name: trimmed,
         isHost: true,
+        resumeToken: createResumeToken(),
         socketId: null,
       };
       room.players.set(playerId, player);
       rooms.set(code, room);
       bindSocket(socket, room, player);
 
-      cb?.({
+      reply(cb, {
         ok: true,
         code,
         playerId,
+        resumeToken: player.resumeToken,
         hostId: room.hostId,
         players: publicPlayers(room),
         phase: room.phase,
+        completedRounds: room.completedRounds,
+        totalRounds: room.totalRounds,
+        extensionRounds: EXTENSION_ROUNDS,
       });
       emitLobby(room);
       emitGallery(room, socket.id);
+      emitAiState(room, socket.id);
     } catch (e) {
-      cb?.({ ok: false, error: e.message || "部屋を作成できませんでした" });
+      reply(cb, { ok: false, error: e.message || "部屋を作成できませんでした" });
     }
   });
 
-  socket.on("joinRoom", ({ code, name }, cb) => {
-    const trimmed = String(name || "").trim().slice(0, 12);
+  onSocket(socket, "joinRoom", (data, cb) => {
+    const { code, name } = data || {};
+    if (getContext(socket)) {
+      return reply(cb, { ok: false, error: "すでに部屋に入っています" });
+    }
+    const trimmed = safeString(name).trim().slice(0, 12);
     const roomCode = normalizeRoomCode(code);
-    if (!trimmed) return cb?.({ ok: false, error: "名前を入力してください" });
+    if (!trimmed) return reply(cb, { ok: false, error: "名前を入力してください" });
     if (!/^\d{4}$/.test(roomCode)) {
-      return cb?.({ ok: false, error: "部屋コードは4桁です" });
+      return reply(cb, { ok: false, error: "部屋コードは4桁です" });
     }
 
     const room = rooms.get(roomCode);
-    if (!room) return cb?.({ ok: false, error: "部屋が見つかりません" });
+    if (!room) return reply(cb, { ok: false, error: "部屋が見つかりません" });
     if (room.players.size >= MAX_PLAYERS) {
-      return cb?.({ ok: false, error: `部屋が満員です（最大${MAX_PLAYERS}人）` });
+      return reply(cb, { ok: false, error: `部屋が満員です（最大${MAX_PLAYERS}人）` });
     }
 
     const playerId = randomUUID();
@@ -841,48 +1550,69 @@ io.on("connection", (socket) => {
       id: playerId,
       name: trimmed,
       isHost: false,
+      resumeToken: createResumeToken(),
       socketId: null,
     };
     room.players.set(playerId, player);
     bindSocket(socket, room, player);
 
-    cb?.({
+    reply(cb, {
       ok: true,
       code: roomCode,
       playerId,
+      resumeToken: player.resumeToken,
       hostId: room.hostId,
       players: publicPlayers(room),
       phase: room.phase,
+      completedRounds: room.completedRounds,
+      totalRounds: room.totalRounds,
+      extensionRounds: EXTENSION_ROUNDS,
     });
 
     socket.to(roomCode).emit("playerJoined", { name: trimmed });
-    emitGallery(room, socket.id);
 
-    if (room.phase === "playing") {
+    if (room.phase !== "lobby") {
       syncPlayerState(socket, room, playerId);
-      emitLobby(room);
     } else {
-      emitLobby(room);
+      emitGallery(room, socket.id);
+      emitAiState(room, socket.id);
     }
+    emitLobby(room);
   });
 
-  socket.on("rejoinRoom", ({ code, playerId, name }, cb) => {
+  onSocket(socket, "rejoinRoom", (data, cb) => {
+    const { code, playerId, resumeToken, name } = data || {};
     const roomCode = normalizeRoomCode(code);
-    const id = String(playerId || "").trim();
-    const trimmed = String(name || "").trim().slice(0, 12);
+    const id = safeString(playerId).trim();
+    const trimmed = safeString(name).trim().slice(0, 12);
 
-    if (!/^\d{4}$/.test(roomCode) || !id) {
-      return cb?.({ ok: false, error: "再入室できません", expired: true });
+    if (
+      !/^\d{4}$/.test(roomCode) ||
+      !id ||
+      !/^[A-Za-z0-9_-]{43}$/.test(safeString(resumeToken))
+    ) {
+      return reply(cb, { ok: false, error: "再入室できません", expired: true });
+    }
+    const existingContext = getContext(socket);
+    if (
+      existingContext &&
+      (existingContext.code !== roomCode || existingContext.playerId !== id)
+    ) {
+      return reply(cb, {
+        ok: false,
+        error: "別の部屋に入っています",
+        expired: false,
+      });
     }
 
     const room = rooms.get(roomCode);
     if (!room) {
-      return cb?.({ ok: false, error: "部屋が見つかりません", expired: true });
+      return reply(cb, { ok: false, error: "部屋が見つかりません", expired: true });
     }
 
     const player = room.players.get(id);
-    if (!player) {
-      return cb?.({
+    if (!player || !resumeTokenMatches(player, resumeToken)) {
+      return reply(cb, {
         ok: false,
         error: "セッションが切れました。もう一度入室してください",
         expired: true,
@@ -893,13 +1623,17 @@ io.on("connection", (socket) => {
     const wasDisconnected = !player.socketId;
     bindSocket(socket, room, player);
 
-    cb?.({
+    reply(cb, {
       ok: true,
       code: roomCode,
       playerId: player.id,
+      resumeToken: player.resumeToken,
       hostId: room.hostId,
       players: publicPlayers(room),
       phase: room.phase,
+      completedRounds: room.completedRounds,
+      totalRounds: room.totalRounds,
+      extensionRounds: EXTENSION_ROUNDS,
     });
 
     syncPlayerState(socket, room, player.id);
@@ -908,31 +1642,44 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("leaveRoom", (cb) => {
+  onSocket(socket, "leaveRoom", (cb) => {
     const ctx = getContext(socket);
-    if (!ctx) return cb?.({ ok: true });
+    if (!ctx) return reply(cb, { ok: true });
     removePlayer(ctx.room, ctx.playerId);
-    cb?.({ ok: true });
+    reply(cb, { ok: true });
   });
 
-  socket.on("startGame", (cb) => {
+  onSocket(socket, "startGame", (cb) => {
     const ctx = getContext(socket);
-    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
     const { room, playerId } = ctx;
     if (room.hostId !== playerId) {
-      return cb?.({ ok: false, error: "ホストだけが開始できます" });
+      return reply(cb, { ok: false, error: "ホストだけが開始できます" });
     }
-    if (room.players.size < 2) {
-      return cb?.({ ok: false, error: "2人以上必要です" });
+    if (room.phase !== "lobby") {
+      return reply(cb, { ok: false, error: "すでにゲームが始まっています" });
+    }
+    const activeCount = activePlayers(room).length;
+    if (activeCount < 2) {
+      return reply(cb, { ok: false, error: "2人以上必要です" });
     }
     room.drawerStreak = null;
     room.roundsSinceSpecial = 0;
     room.lastWasSpecial = false;
+    // 最初の2問はしばりなし（先にゲームそのものに慣れてもらう）
+    room.roundsSinceConstraint = 0;
+    room.gameSeq += 1;
+    resetAiForNewGame(room);
+    room.totalRounds = chooseTotalRounds(activeCount);
+    room.completedRounds = 0;
+    room.drawCounts = new Map();
+    room.lastCompletedRoundSeq = null;
     startRound(room);
-    cb?.({ ok: true });
+    emitAiState(room);
+    reply(cb, { ok: true, totalRounds: room.totalRounds });
   });
 
-  socket.on("stroke", (data) => {
+  onSocket(socket, "stroke", (data) => {
     const ctx = getContext(socket);
     if (!ctx) return;
     const { code, room, playerId } = ctx;
@@ -944,36 +1691,94 @@ io.on("connection", (socket) => {
     /** @type {Record<string, unknown>} */
     const event = { type, playerId };
     if (type !== "end") {
-      const x = Number(data.x);
-      const y = Number(data.y);
+      const x = safeNumber(data.x);
+      const y = safeNumber(data.y);
       if (!Number.isFinite(x) || !Number.isFinite(y)) return;
       event.x = x;
       event.y = y;
       event.color =
         typeof data.color === "string" ? data.color.slice(0, 24) : "#1a1a1a";
-      event.width = Math.min(40, Math.max(1, Number(data.width) || 4));
+      event.width =
+        room.constraint?.kind === "pen"
+          ? room.constraint.value
+          : Math.min(40, Math.max(1, safeNumber(data.width) || 4));
     }
+
+    // 本数しばりを使い切っていたら、ここで捨てる
+    if (!allowConstrainedStroke(room, playerId, type)) return;
 
     room.strokes.push(event);
     if (room.strokes.length > MAX_STROKES) {
       room.strokes = room.strokes.slice(-MAX_STROKES);
     }
+    // だんだん見える: 公開までは自分の画面だけに描く（配信しない）
+    if (room.roundType === "gradual" && room.drawPhase === "drawing") return;
     socket.to(code).emit("stroke", event);
   });
 
-  socket.on("requestStrokeHistory", (cb) => {
+  onSocket(socket, "requestStrokeHistory", (cb) => {
     const ctx = getContext(socket);
-    if (!ctx) return cb?.({ ok: false, strokes: [] });
-    cb?.({ ok: true, strokes: ctx.room.strokes });
+    if (!ctx) return reply(cb, { ok: false, strokes: [] });
+    reply(cb, {
+      ok: true,
+      strokes: strokesVisibleTo(ctx.room, ctx.playerId),
+    });
   });
 
-  socket.on("timeSync", (cb) => {
-    cb?.({ now: Date.now() });
+  onSocket(socket, "timeSync", (cb) => {
+    reply(cb, { now: Date.now() });
   });
 
-  socket.on("revealLiar", (cb) => {
+  // 爆笑リプレイ: 線そのものは各端末が持っているので、合図だけ配る
+  onSocket(socket, "broadcastReplay", (cb) => {
     const ctx = getContext(socket);
-    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { code, room, playerId } = ctx;
+    if (room.phase !== "playing") {
+      return reply(cb, { ok: false, error: "いまはリプレイできません" });
+    }
+    // 流していいのは、こたえを知っている人（＝そのラウンドを次へ進められる人）だけ。
+    // 当てっこの最中に全員の画面が白くなると、ただの邪魔になる。
+    // リレー・協力・うそつき・だんだんでは、描く時間が終わるまで false になる。
+    if (!canPlayerNextRound(room, playerId)) {
+      return reply(cb, { ok: false, error: "こたえが出てからリプレイできます" });
+    }
+    const now = Date.now();
+    if (now - room.lastReplayAt < REPLAY_COOLDOWN_MS) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    room.lastReplayAt = now;
+    io.to(code).emit("replayStart");
+    reply(cb, { ok: true });
+  });
+
+  // 今日のハイライト: 絵は全員の端末にもう届いているので、順番だけ配る
+  onSocket(socket, "startHighlight", (cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { code, room, playerId } = ctx;
+    if (room.hostId !== playerId) {
+      return reply(cb, { ok: false, error: "ホストだけがハイライトを始められます" });
+    }
+    if (room.phase !== "finished") {
+      return reply(cb, { ok: false, error: "いまはハイライトを見られません" });
+    }
+    const items = drawnThisGame(room);
+    if (items.length < 2) {
+      return reply(cb, { ok: false, error: "ハイライトには絵が2枚以上必要です" });
+    }
+    const now = Date.now();
+    if (now - room.lastHighlightAt < HIGHLIGHT_COOLDOWN_MS) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    room.lastHighlightAt = now;
+    io.to(code).emit("highlightStart", { ids: items.map((item) => item.id) });
+    reply(cb, { ok: true });
+  });
+
+  onSocket(socket, "revealLiar", (cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
     const { code, room, playerId } = ctx;
     // すでに発表済みなら同時押しでもエラーにしない
     if (
@@ -981,10 +1786,10 @@ io.on("connection", (socket) => {
       room.roundType === "liar" &&
       room.drawPhase === "reveal"
     ) {
-      return cb?.({ ok: true });
+      return reply(cb, { ok: true });
     }
     if (!canRevealLiar(room, playerId)) {
-      return cb?.({ ok: false, error: "こたえあわせできません" });
+      return reply(cb, { ok: false, error: "こたえあわせできません" });
     }
     room.drawPhase = "reveal";
     io.to(code).emit("liarReveal", {
@@ -992,33 +1797,93 @@ io.on("connection", (socket) => {
       word: room.word,
     });
     emitRoundSync(room);
-    cb?.({ ok: true });
+    reply(cb, { ok: true });
   });
 
-  socket.on("nextRound", (data, cb) => {
+  // ふつうのラウンド: 描き手の「せいかい！」で答えを全員に出す
+  onSocket(socket, "revealAnswer", (cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { code, room, playerId } = ctx;
+    // 連打や同時押しでもエラーにしない
+    if (
+      room.phase === "playing" &&
+      room.roundType === "normal" &&
+      room.drawPhase === "reveal"
+    ) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    if (!canRevealAnswer(room, playerId)) {
+      return reply(cb, { ok: false, error: "いまは せいかい発表できません" });
+    }
+    // 時間しばりのカウントダウンが残っていても、ここで描く時間は終わり
+    clearTurnTimer(room);
+    room.drawPhase = "reveal";
+    io.to(code).emit("answerReveal", { word: room.word });
+    emitRoundSync(room);
+    reply(cb, { ok: true });
+  });
+
+  // だんだん見える: 描き手の「できた！」で公開スタート
+  onSocket(socket, "finishGradualDrawing", (cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { room, playerId } = ctx;
+    if (
+      room.phase !== "playing" ||
+      room.roundType !== "gradual" ||
+      room.drawerId !== playerId
+    ) {
+      return reply(cb, { ok: false, error: "いまは公開できません" });
+    }
+    // タイマー満了や連打と同時でもエラーにしない
+    if (room.drawPhase !== "drawing") {
+      return reply(cb, { ok: true, stale: true });
+    }
+    enterGuessing(room);
+    reply(cb, { ok: true });
+  });
+
+  onSocket(socket, "nextRound", (data, cb) => {
     if (typeof data === "function") {
       cb = data;
       data = {};
     }
-    const imageDataUrl = data?.imageDataUrl;
+    const imageDataUrl =
+      typeof data?.imageDataUrl === "string" ? data.imageDataUrl : "";
     const ctx = getContext(socket);
-    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
     const { room, playerId } = ctx;
+    const clientRoundId = data?.roundId;
+    if (!Number.isInteger(clientRoundId)) {
+      return reply(cb, { ok: false, error: "ラウンド情報がありません" });
+    }
+    if (clientRoundId === room.lastCompletedRoundSeq) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    if (room.phase === "finished") {
+      return reply(cb, { ok: true, finished: true });
+    }
     if (room.phase !== "playing") {
-      return cb?.({ ok: false, error: "プレイ中ではありません" });
+      return reply(cb, { ok: false, error: "プレイ中ではありません" });
     }
     // 同時押し対策: 別のラウンドに対する「つぎへ」は黙って無視する
-    const clientRoundId = data?.roundId;
-    if (clientRoundId != null && clientRoundId !== room.roundSeq) {
-      return cb?.({ ok: true, stale: true });
+    if (clientRoundId !== room.roundSeq) {
+      return reply(cb, { ok: true, stale: true });
     }
     if (!canPlayerNextRound(room, playerId)) {
-      return cb?.({ ok: false, error: "つぎへ進めません" });
+      return reply(cb, { ok: false, error: "つぎへ進めません" });
     }
 
     const drawerNames = playerNames(room, room.drawerIds);
     const word = room.word;
     const roundType = room.roundType;
+    const constraint = room.constraint;
+    const constraintLabel = constraint
+      ? `${constraint.emoji} ${constraint.label}`
+      : "";
+    // 白紙は授賞式の候補から外す
+    const drawn = hasVisibleDrawing(room.strokes);
 
     if (imageDataUrl) {
       addGalleryItem(room, {
@@ -1026,59 +1891,247 @@ io.on("connection", (socket) => {
         word,
         drawerNames,
         roundType,
+        constraintLabel,
+        hasDrawing: drawn,
       });
     }
 
+    recordDrawers(
+      room,
+      room.drawerIds.filter((id) => room.players.has(id)),
+    );
+    room.lastCompletedRoundSeq = room.roundSeq;
+    room.completedRounds += 1;
+    if (room.completedRounds >= room.totalRounds) {
+      finishGame(room);
+      reply(cb, { ok: true, finished: true });
+      return;
+    }
+
     startRound(room);
-    cb?.({ ok: true });
+    reply(cb, { ok: true });
   });
 
-  socket.on("endGame", (cb) => {
+  onSocket(socket, "extendGame", (cb) => {
     const ctx = getContext(socket);
-    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
     const { code, room, playerId } = ctx;
     if (room.hostId !== playerId) {
-      return cb?.({ ok: false, error: "ホストだけが終了できます" });
+      return reply(cb, { ok: false, error: "ホストだけが延長できます" });
+    }
+    if (room.phase !== "finished") {
+      return reply(cb, { ok: false, error: "いまは延長できません" });
+    }
+    if (activePlayers(room).length < 2) {
+      return reply(cb, { ok: false, error: "延長には2人以上必要です" });
+    }
+    if (room.aiAwardsStatus === "generating") {
+      return reply(cb, {
+        ok: false,
+        error: "AI授賞式が完成してから延長できます",
+      });
+    }
+
+    room.totalRounds += EXTENSION_ROUNDS;
+    resetAwardsForExtension(room);
+    io.to(code).emit("gameExtended", {
+      addedRounds: EXTENSION_ROUNDS,
+      totalRounds: room.totalRounds,
+    });
+    startRound(room);
+    emitAiState(room);
+    reply(cb, { ok: true, totalRounds: room.totalRounds });
+  });
+
+  onSocket(socket, "endGame", (cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { code, room, playerId } = ctx;
+    if (room.hostId !== playerId) {
+      return reply(cb, { ok: false, error: "ホストだけが終了できます" });
+    }
+    if (room.aiAwardsStatus === "generating") {
+      return reply(cb, {
+        ok: false,
+        error: "AI授賞式が完成してからロビーへ戻れます",
+      });
     }
     clearTurnTimer(room);
     room.phase = "lobby";
     resetRoundFields(room);
+    resetGameProgress(room);
     room.drawerStreak = null;
+    resetAiWhenReturningToLobby(room);
     io.to(code).emit("clearCanvas");
     io.to(code).emit("gameEnded");
     emitLobby(room);
+    emitAiState(room);
     // gallery is kept for room lifetime
-    cb?.({ ok: true });
+    reply(cb, { ok: true });
   });
 
-  socket.on("deleteGalleryItems", ({ ids }, cb) => {
+  onSocket(socket, "requestAiAwards", (cb) => {
     const ctx = getContext(socket);
-    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { room, playerId } = ctx;
+    if (!isAiConfigured()) {
+      return reply(cb, { ok: false, error: "AI画伯はまだ準備中です" });
+    }
+    if (room.hostId !== playerId) {
+      return reply(cb, { ok: false, error: "ホストだけが授賞式を始められます" });
+    }
+    if (room.phase !== "finished") {
+      return reply(cb, { ok: false, error: "ゲーム終了後に授賞式を始められます" });
+    }
+    if (room.aiAwardsStatus === "ready") {
+      return reply(cb, { ok: true, ready: true });
+    }
+    if (room.aiAwardsStatus === "generating") {
+      return reply(cb, { ok: true, generating: true });
+    }
+    if (room.aiAwardsAttempts >= 2) {
+      return reply(cb, {
+        ok: false,
+        error: "このゲームの授賞式はこれ以上やり直せません",
+      });
+    }
+
+    const candidates = drawnThisGame(room).map((item) => ({
+      id: item.id,
+      word: item.word,
+      roundType: item.roundType,
+      constraintLabel: item.constraintLabel,
+      imageDataUrl: item.imageDataUrl,
+    }));
+    if (candidates.length < 2) {
+      return reply(cb, { ok: false, error: "授賞式には絵が2枚以上必要です" });
+    }
+    if (!consumeAiQuota(socket, "awards")) {
+      return reply(cb, {
+        ok: false,
+        error: "授賞式の利用上限です。時間をおいて試してください",
+      });
+    }
+
+    const gameSeq = room.gameSeq;
+    const token = room.aiAwardsToken + 1;
+    const safetyIdentifier = aiSafetyIdentifier(playerId);
+    room.aiAwardsToken = token;
+    room.aiAwardsStatus = "generating";
+    room.aiAwards = null;
+    room.aiAwardsError = "";
+    room.aiAwardsAttempts += 1;
+    emitAiState(room);
+    reply(cb, { ok: true, generating: true });
+
+    const isCurrent = () => {
+      const currentRoom = rooms.get(room.code);
+      return (
+        currentRoom === room &&
+        currentRoom.gameSeq === gameSeq &&
+        currentRoom.aiAwardsToken === token &&
+        currentRoom.aiAwardsStatus === "generating" &&
+        currentRoom.phase === "finished"
+      );
+    };
+
+    void createAwards(candidates, { safetyIdentifier, isCurrent })
+      .then((awards) => {
+        const currentRoom = rooms.get(room.code);
+        if (
+          !currentRoom ||
+          currentRoom !== room ||
+          currentRoom.gameSeq !== gameSeq ||
+          currentRoom.aiAwardsToken !== token ||
+          currentRoom.phase !== "finished"
+        ) {
+          return;
+        }
+        const currentIds = new Set(
+          currentGameGallery(currentRoom).map((item) => item.id),
+        );
+        if (
+          awards.awards.some(
+            (award) => !currentIds.has(award.galleryItemId),
+          )
+        ) {
+          throw new Error("Award source drawing was removed");
+        }
+        currentRoom.aiAwardsStatus = "ready";
+        currentRoom.aiAwards = awards;
+        currentRoom.aiAwardsError = "";
+        emitAiState(currentRoom);
+        io.to(currentRoom.code).emit("aiAwardsReady", { gameSeq });
+      })
+      .catch((error) => {
+        logAiFailure("awards", error);
+        const currentRoom = rooms.get(room.code);
+        if (
+          !currentRoom ||
+          currentRoom !== room ||
+          currentRoom.gameSeq !== gameSeq ||
+          currentRoom.aiAwardsToken !== token
+        ) {
+          return;
+        }
+        currentRoom.aiAwardsStatus = "error";
+        currentRoom.aiAwards = null;
+        currentRoom.aiAwardsError = friendlyAiError(
+          error,
+          "授賞式を開けませんでした。もう一度試してください",
+        );
+        emitAiState(currentRoom);
+      });
+  });
+
+  onSocket(socket, "deleteGalleryItems", (data, cb) => {
+    const { ids } = data || {};
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
     const { room } = ctx;
+    if (room.aiAwardsStatus === "generating") {
+      return reply(cb, {
+        ok: false,
+        error: "AI画伯が作業中です。完成してから削除してください",
+      });
+    }
     const idSet = new Set(
-      Array.isArray(ids) ? ids.map((id) => String(id)) : []
+      Array.isArray(ids) ? ids.map(safeString).filter(Boolean) : [],
     );
     if (idSet.size === 0) {
-      return cb?.({ ok: false, error: "削除する絵がありません" });
+      return reply(cb, { ok: false, error: "削除する絵がありません" });
     }
     room.gallery = room.gallery.filter((g) => !idSet.has(g.id));
+    reconcileRemovedGalleryItems(room, idSet);
     emitGallery(room);
-    cb?.({ ok: true });
+    emitAiState(room);
+    reply(cb, { ok: true });
   });
 
-  socket.on("clearGallery", (cb) => {
+  onSocket(socket, "clearGallery", (cb) => {
     const ctx = getContext(socket);
-    if (!ctx) return cb?.({ ok: false, error: "部屋がありません" });
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
     const { room, playerId } = ctx;
     if (room.hostId !== playerId) {
-      return cb?.({ ok: false, error: "ホストだけが全部消せます" });
+      return reply(cb, { ok: false, error: "ホストだけが全部消せます" });
+    }
+    if (room.aiAwardsStatus === "generating") {
+      return reply(cb, {
+        ok: false,
+        error: "AI画伯が作業中です。完成してから削除してください",
+      });
     }
     room.gallery = [];
+    room.aiAwardsToken += 1;
+    room.aiAwardsStatus = "idle";
+    room.aiAwards = null;
+    room.aiAwardsError = "";
     emitGallery(room);
-    cb?.({ ok: true });
+    emitAiState(room);
+    reply(cb, { ok: true });
   });
 
-  socket.on("disconnect", () => {
+  onSocket(socket, "disconnect", () => {
     const code = socketRoom.get(socket.id);
     const playerId = socketPlayer.get(socket.id);
     socketRoom.delete(socket.id);
@@ -1090,10 +2143,10 @@ io.on("connection", (socket) => {
     if (!player) return;
     if (player.socketId && player.socketId !== socket.id) return;
 
-    // 通常ラウンドの描き手が切れたら、全員に知らせて短めに見切る
+    // ひとりで描くラウンドの描き手が切れたら、全員に知らせて短めに見切る
     const isActiveNormalDrawer =
       room.phase === "playing" &&
-      room.roundType === "normal" &&
+      (room.roundType === "normal" || room.roundType === "gradual") &&
       room.drawerId === playerId;
     if (isActiveNormalDrawer) {
       io.to(code).emit("drawerDisconnected", { name: player.name });
