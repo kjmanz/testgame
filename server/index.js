@@ -763,6 +763,13 @@ function canRevealAnswer(room, playerId) {
   return room.drawerId === playerId;
 }
 
+/** ふつうのラウンドを、お題を公開せずにパスできるのは現在の描き手だけ */
+function canPassRound(room, playerId) {
+  if (room.phase !== "playing" || room.roundType !== "normal") return false;
+  if (room.drawPhase === "reveal") return false;
+  return room.drawerId === playerId;
+}
+
 function canRevealLiar(room, playerId) {
   if (room.phase !== "playing" || room.roundType !== "liar") return false;
   if (room.drawPhase !== "guessing") return false;
@@ -837,6 +844,7 @@ function buildRoundPayload(room, playerId) {
 
   if (room.roundType === "normal") {
     payload.canRevealAnswer = canRevealAnswer(room, playerId);
+    payload.canPassRound = canPassRound(room, playerId);
   }
 
   return payload;
@@ -1425,6 +1433,66 @@ function addGalleryItem(
   return item;
 }
 
+/** 現在の1問を確定し、次の1問または結果画面へ進める。 */
+function completeCurrentRound(room, { imageDataUrl = "" } = {}) {
+  clearTurnTimer(room);
+
+  const drawerNames = playerNames(room, room.drawerIds);
+  const word = room.word;
+  const roundType = room.roundType;
+  const constraint = room.constraint;
+  const constraintLabel = constraint
+    ? `${constraint.emoji} ${constraint.label}`
+    : "";
+  const drawn = hasVisibleDrawing(room.strokes);
+
+  if (imageDataUrl) {
+    addGalleryItem(room, {
+      imageDataUrl,
+      word,
+      drawerNames,
+      roundType,
+      constraintLabel,
+      hasDrawing: drawn,
+    });
+  }
+
+  recordDrawers(
+    room,
+    room.drawerIds.filter((id) => room.players.has(id)),
+  );
+  room.lastCompletedRoundSeq = room.roundSeq;
+  room.completedRounds += 1;
+
+  if (room.completedRounds >= room.totalRounds) {
+    finishGame(room);
+    return true;
+  }
+
+  startRound(room);
+  return false;
+}
+
+/**
+ * ふつうのラウンドのお題だけを差し替える。
+ * 問題数・描き手・しばり・公平性カウントは進めず、白紙も保存しない。
+ */
+function passCurrentNormalRound(room) {
+  clearTurnTimer(room);
+  room.roundSeq += 1;
+  room.word = pickWord(room);
+  room.drawPhase = "drawing";
+  room.seenWordIds = new Set(room.drawerId ? [room.drawerId] : []);
+  room.strokes = [];
+  room.strokeCounts = new Map();
+  room.blockedDrawers = new Set();
+
+  if (room.constraint?.kind === "time") {
+    scheduleTimedDrawing(room, room.constraint.value * 1000);
+  }
+  emitRoundStart(room, { clear: true, fanfare: false });
+}
+
 function createEmptyRoom(code, hostId) {
   /** @type {Room} */
   return {
@@ -1801,10 +1869,22 @@ io.on("connection", (socket) => {
   });
 
   // ふつうのラウンド: 描き手の「せいかい！」で答えを全員に出す
-  onSocket(socket, "revealAnswer", (cb) => {
+  onSocket(socket, "revealAnswer", (data, cb) => {
+    if (typeof data === "function") {
+      cb = data;
+      data = {};
+    }
     const ctx = getContext(socket);
     if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
     const { code, room, playerId } = ctx;
+    const clientRoundId = data?.roundId;
+    if (!Number.isInteger(clientRoundId)) {
+      return reply(cb, { ok: false, error: "ラウンド情報がありません" });
+    }
+    // パス直後など、古い画面から遅れて届いた操作で新しい答えを出さない
+    if (clientRoundId !== room.roundSeq) {
+      return reply(cb, { ok: true, stale: true });
+    }
     // 連打や同時押しでもエラーにしない
     if (
       room.phase === "playing" &&
@@ -1844,6 +1924,49 @@ io.on("connection", (socket) => {
     reply(cb, { ok: true });
   });
 
+  onSocket(socket, "passRound", (data, cb) => {
+    if (typeof data === "function") {
+      cb = data;
+      data = {};
+    }
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { room, playerId } = ctx;
+    const clientRoundId = data?.roundId;
+    if (!Number.isInteger(clientRoundId)) {
+      return reply(cb, { ok: false, error: "ラウンド情報がありません" });
+    }
+    if (clientRoundId === room.lastCompletedRoundSeq) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    if (room.phase === "finished") {
+      return reply(cb, { ok: true, finished: true });
+    }
+    if (room.phase !== "playing") {
+      return reply(cb, { ok: false, error: "プレイ中ではありません" });
+    }
+    // 通信の遅延で前のラウンドのボタンが押されても、今のラウンドは飛ばさない
+    if (clientRoundId !== room.roundSeq) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    // 「せいかい！」とほぼ同時に押されたパスは、エラーにせず無視する
+    if (
+      room.roundType === "normal" &&
+      room.drawPhase === "reveal" &&
+      room.drawerId === playerId
+    ) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    if (!canPassRound(room, playerId)) {
+      return reply(cb, { ok: false, error: "いまはパスできません" });
+    }
+
+    const name = room.players.get(playerId)?.name || "描き手";
+    io.to(room.code).emit("roundPassed", { name });
+    passCurrentNormalRound(room);
+    reply(cb, { ok: true });
+  });
+
   onSocket(socket, "nextRound", (data, cb) => {
     if (typeof data === "function") {
       cb = data;
@@ -1875,41 +1998,8 @@ io.on("connection", (socket) => {
       return reply(cb, { ok: false, error: "つぎへ進めません" });
     }
 
-    const drawerNames = playerNames(room, room.drawerIds);
-    const word = room.word;
-    const roundType = room.roundType;
-    const constraint = room.constraint;
-    const constraintLabel = constraint
-      ? `${constraint.emoji} ${constraint.label}`
-      : "";
-    // 白紙は授賞式の候補から外す
-    const drawn = hasVisibleDrawing(room.strokes);
-
-    if (imageDataUrl) {
-      addGalleryItem(room, {
-        imageDataUrl,
-        word,
-        drawerNames,
-        roundType,
-        constraintLabel,
-        hasDrawing: drawn,
-      });
-    }
-
-    recordDrawers(
-      room,
-      room.drawerIds.filter((id) => room.players.has(id)),
-    );
-    room.lastCompletedRoundSeq = room.roundSeq;
-    room.completedRounds += 1;
-    if (room.completedRounds >= room.totalRounds) {
-      finishGame(room);
-      reply(cb, { ok: true, finished: true });
-      return;
-    }
-
-    startRound(room);
-    reply(cb, { ok: true });
+    const finished = completeCurrentRound(room, { imageDataUrl });
+    reply(cb, { ok: true, finished });
   });
 
   onSocket(socket, "extendGame", (cb) => {

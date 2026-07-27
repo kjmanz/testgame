@@ -180,6 +180,7 @@ export default function App() {
   const [liarName, setLiarName] = useState("");
   const [canFinishGradual, setCanFinishGradual] = useState(false);
   const [canRevealAnswer, setCanRevealAnswer] = useState(false);
+  const [canPassRound, setCanPassRound] = useState(false);
   const [constraint, setConstraint] = useState(null);
   const [strokesUsed, setStrokesUsed] = useState(0);
   const [hasDrawing, setHasDrawing] = useState(false);
@@ -238,6 +239,7 @@ export default function App() {
     setLiarName(data.liarName || "");
     setCanFinishGradual(!!data.canFinishGradual);
     setCanRevealAnswer(!!data.canRevealAnswer);
+    setCanPassRound(!!data.canPassRound);
     setConstraint(data.constraint || null);
     setStrokesUsed(data.constraintStrokesUsed ?? 0);
     setRoundId(data.roundId ?? null);
@@ -266,6 +268,7 @@ export default function App() {
     setLiarName("");
     setCanFinishGradual(false);
     setCanRevealAnswer(false);
+    setCanPassRound(false);
     setConstraint(null);
     setStrokesUsed(0);
     markDrawing(false);
@@ -477,6 +480,10 @@ export default function App() {
     socket.on("answerReveal", (data) => {
       if (!data?.word) return;
       setToast(`✅ こたえは「${data.word}」！`);
+    });
+
+    socket.on("roundPassed", (data) => {
+      setToast(`⏭️ ${data?.name || "描き手"}がパス！ つぎのお題へ`);
     });
 
     socket.on("liarReveal", (data) => {
@@ -827,9 +834,22 @@ export default function App() {
   }
 
   function revealAnswer() {
+    if (advancing) return;
     setError("");
-    socketRef.current?.emit("revealAnswer", (res) => {
+    setAdvancing(true);
+    socketRef.current?.emit("revealAnswer", { roundId }, (res) => {
+      setAdvancing(false);
       if (!res?.ok) setError(res?.error || "せいかい発表できません");
+    });
+  }
+
+  function passRound() {
+    if (advancing) return;
+    setError("");
+    setAdvancing(true);
+    socketRef.current?.emit("passRound", { roundId }, (res) => {
+      setAdvancing(false);
+      if (!res?.ok) setError(res?.error || "パスできません");
     });
   }
 
@@ -2051,10 +2071,28 @@ export default function App() {
                 できた！みんなに見せる
               </button>
             )}
-            {canRevealAnswer && (
-              <button type="button" onClick={revealAnswer}>
-                ✅ せいかい！
-              </button>
+            {(canRevealAnswer || canPassRound) && (
+              <div className="answer-actions">
+                {canRevealAnswer && (
+                  <button
+                    type="button"
+                    onClick={revealAnswer}
+                    disabled={advancing}
+                  >
+                    ✅ せいかい！
+                  </button>
+                )}
+                {canPassRound && (
+                  <button
+                    type="button"
+                    className="quiet pass-btn"
+                    onClick={passRound}
+                    disabled={advancing}
+                  >
+                    ⏭️ パス
+                  </button>
+                )}
+              </div>
             )}
             {canNextRound && (
               <button type="button" onClick={nextRound} disabled={advancing}>

@@ -585,6 +585,21 @@ input:focus {
   gap: 0.6rem;
 }
 
+.answer-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.6rem;
+}
+
+.answer-actions button {
+  width: 100%;
+  min-width: 0;
+}
+
+.answer-actions .pass-btn {
+  background: #fffef8;
+}
+
 .finish-card {
   text-align: center;
   padding-top: 1.55rem;
