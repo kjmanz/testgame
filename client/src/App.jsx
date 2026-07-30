@@ -180,6 +180,9 @@ export default function App() {
   const [liarName, setLiarName] = useState("");
   const [canFinishGradual, setCanFinishGradual] = useState(false);
   const [canRevealAnswer, setCanRevealAnswer] = useState(false);
+  const [canPassWord, setCanPassWord] = useState(false);
+  const [passesLeft, setPassesLeft] = useState(0);
+  const [passing, setPassing] = useState(false);
   const [constraint, setConstraint] = useState(null);
   const [strokesUsed, setStrokesUsed] = useState(0);
   const [hasDrawing, setHasDrawing] = useState(false);
@@ -238,6 +241,9 @@ export default function App() {
     setLiarName(data.liarName || "");
     setCanFinishGradual(!!data.canFinishGradual);
     setCanRevealAnswer(!!data.canRevealAnswer);
+    setCanPassWord(!!data.canPassWord);
+    setPassesLeft(data.passesLeft ?? 0);
+    setPassing(false);
     setConstraint(data.constraint || null);
     setStrokesUsed(data.constraintStrokesUsed ?? 0);
     setRoundId(data.roundId ?? null);
@@ -266,6 +272,9 @@ export default function App() {
     setLiarName("");
     setCanFinishGradual(false);
     setCanRevealAnswer(false);
+    setCanPassWord(false);
+    setPassesLeft(0);
+    setPassing(false);
     setConstraint(null);
     setStrokesUsed(0);
     markDrawing(false);
@@ -477,6 +486,16 @@ export default function App() {
     socket.on("answerReveal", (data) => {
       if (!data?.word) return;
       setToast(`✅ こたえは「${data.word}」！`);
+    });
+
+    // お題のパス。黙って絵が消えると当てる側が混乱するので必ず知らせる
+    socket.on("wordPassed", (data) => {
+      const name = data?.drawerName;
+      setToast(
+        name
+          ? `🙅 ${name}がパス！あたらしいおだいだよ`
+          : "🙅 パス！あたらしいおだいだよ"
+      );
     });
 
     socket.on("liarReveal", (data) => {
@@ -830,6 +849,22 @@ export default function App() {
     setError("");
     socketRef.current?.emit("revealAnswer", (res) => {
       if (!res?.ok) setError(res?.error || "せいかい発表できません");
+    });
+  }
+
+  /** お題がわからないとき。ラウンドは進まず、お題だけ引き直す */
+  function passWord() {
+    if (passing) return;
+    setError("");
+    setPassing(true);
+    socketRef.current?.emit("passWord", { roundId, passesLeft }, (res) => {
+      // 成功時は roundUpdate が来て passing が下りる
+      if (!res?.ok) {
+        setPassing(false);
+        setError(res?.error || "いまはパスできません");
+      } else if (res.stale) {
+        setPassing(false);
+      }
     });
   }
 
@@ -2054,6 +2089,16 @@ export default function App() {
             {canRevealAnswer && (
               <button type="button" onClick={revealAnswer}>
                 ✅ せいかい！
+              </button>
+            )}
+            {canPassWord && (
+              <button
+                type="button"
+                className="quiet pass-btn"
+                onClick={passWord}
+                disabled={passing}
+              >
+                🙅 わからない…パス（あと{passesLeft}回）
               </button>
             )}
             {canNextRound && (

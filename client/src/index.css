@@ -997,6 +997,17 @@ input:focus {
   background: #fff6df;
 }
 
+/* パスは逃げ道なので、目立たせず「せいかい！」より弱く見せる */
+.pass-btn {
+  border-color: #6b7280;
+  color: #4b5563;
+  background: #f3f4f6;
+}
+
+.pass-btn:disabled {
+  opacity: 0.55;
+}
+
 .timer-bar {
   margin-top: 0.35rem;
   display: flex;

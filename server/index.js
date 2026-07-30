@@ -54,6 +54,12 @@ const CONSTRAINT_MIN_GAP = 4;
 const CONSTRAINT_FORCE_GAP = 9;
 const CONSTRAINT_CHANCE = 0.25;
 const RECENT_CONSTRAINTS_MAX = 4;
+/**
+ * 「わからない」ときのお題パス。ふつうのラウンド（しばりなし）だけ。
+ * 描き手は変えずにお題だけ引き直すので、連打されると進まなくなる。
+ * 1ターンにこの回数まで＝お題は最大3つ見られて、3つ目は必ず描く。
+ */
+const PASS_MAX_PER_TURN = 2;
 /** リプレイの連打よけ */
 const REPLAY_COOLDOWN_MS = 2_000;
 /** 今日のハイライトの連打よけ（最初の1枚が出るまで少し余裕を取る） */
@@ -168,6 +174,7 @@ const io = new Server(httpServer, {
  *  roundsSinceSpecial: number,
  *  lastWasSpecial: boolean,
  *  constraint: import('./constraints.js').Constraint | null,
+ *  passesUsed: number,
  *  strokeCounts: Map<string, number>,
  *  blockedDrawers: Set<string>,
  *  roundsSinceConstraint: number,
@@ -763,6 +770,19 @@ function canRevealAnswer(room, playerId) {
   return room.drawerId === playerId;
 }
 
+/**
+ * 「わからない」でお題を引き直せるか。
+ * ふつうのラウンド専用（リレー・協力・うそつき・だんだん、しばり付きは不可）。
+ */
+function canPassWord(room, playerId) {
+  if (room.phase !== "playing" || room.roundType !== "normal") return false;
+  // しばり中はパスできない（お題を選び直せると、しばりの縛りが薄くなる）
+  if (room.constraint) return false;
+  if (room.drawPhase !== "drawing") return false;
+  if (room.passesUsed >= PASS_MAX_PER_TURN) return false;
+  return room.drawerId === playerId;
+}
+
 function canRevealLiar(room, playerId) {
   if (room.phase !== "playing" || room.roundType !== "liar") return false;
   if (room.drawPhase !== "guessing") return false;
@@ -837,6 +857,8 @@ function buildRoundPayload(room, playerId) {
 
   if (room.roundType === "normal") {
     payload.canRevealAnswer = canRevealAnswer(room, playerId);
+    payload.canPassWord = canPassWord(room, playerId);
+    payload.passesLeft = Math.max(0, PASS_MAX_PER_TURN - room.passesUsed);
   }
 
   return payload;
@@ -981,6 +1003,7 @@ function resetRoundFields(room) {
   room.seenWordIds = new Set();
   room.strokes = [];
   room.constraint = null;
+  room.passesUsed = 0;
   room.strokeCounts = new Map();
   room.blockedDrawers = new Set();
   room.liarId = null;
@@ -1018,6 +1041,33 @@ function pickWord(room) {
     room.recentWords = room.recentWords.slice(-RECENT_WORDS_MAX);
   }
   return word;
+}
+
+/**
+ * わからないお題を引き直す。ラウンド自体は進めず、描き手も変えない。
+ *
+ * 担当回数（drawCounts）を増やさないので、pickDrawer の公平ローテーションも
+ * しばり・イベントの間隔カウンタも乱さない。別の人に回すと「描きたくない」
+ * ボタンになってしまうため、あくまで同じ人がお題だけ引き直す。
+ */
+function passWord(room) {
+  const drawerId = room.drawerId;
+  const drawerName = room.players.get(drawerId)?.name || "";
+  room.passesUsed += 1;
+  room.word = pickWord(room);
+  room.strokes = [];
+  room.strokeCounts = new Map();
+  room.seenWordIds = new Set([drawerId]);
+
+  // 黙って絵が消えると当てる側が混乱するので、全員に知らせる
+  io.to(room.code).emit("wordPassed", {
+    drawerName,
+    passesLeft: Math.max(0, PASS_MAX_PER_TURN - room.passesUsed),
+  });
+  io.to(room.code).emit("clearCanvas");
+  // ラウンドは変わらないので roundStart ではなく同期にする
+  // （ギャラリーを見ている人を無理に引きもどさない）
+  emitRoundSync(room);
 }
 
 function startRound(room) {
@@ -1446,6 +1496,7 @@ function createEmptyRoom(code, hostId) {
     roundsSinceSpecial: 0,
     lastWasSpecial: false,
     constraint: null,
+    passesUsed: 0,
     strokeCounts: new Map(),
     blockedDrawers: new Set(),
     roundsSinceConstraint: 0,
@@ -1821,6 +1872,34 @@ io.on("connection", (socket) => {
     room.drawPhase = "reveal";
     io.to(code).emit("answerReveal", { word: room.word });
     emitRoundSync(room);
+    reply(cb, { ok: true });
+  });
+
+  onSocket(socket, "passWord", (data, cb) => {
+    if (typeof data === "function") {
+      cb = data;
+      data = {};
+    }
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { room, playerId } = ctx;
+    // 連打や同時押しで、引き直した先のお題までパスしてしまわないようにする。
+    // ラウンドは進まない（roundSeq が変わらない）ので、残り回数を合図に使う。
+    const clientRoundId = data?.roundId;
+    if (Number.isInteger(clientRoundId) && clientRoundId !== room.roundSeq) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    const clientPassesLeft = data?.passesLeft;
+    if (
+      Number.isInteger(clientPassesLeft) &&
+      clientPassesLeft !== PASS_MAX_PER_TURN - room.passesUsed
+    ) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    if (!canPassWord(room, playerId)) {
+      return reply(cb, { ok: false, error: "いまはパスできません" });
+    }
+    passWord(room);
     reply(cb, { ok: true });
   });
 
