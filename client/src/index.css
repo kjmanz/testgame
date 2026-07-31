@@ -600,6 +600,10 @@ input:focus {
   background: #fffef8;
 }
 
+.answer-actions > button:only-child {
+  grid-column: 1 / -1;
+}
+
 .finish-card {
   text-align: center;
   padding-top: 1.55rem;
@@ -711,7 +715,7 @@ input:focus {
   color: #fff;
 }
 
-.gradual-pill {
+.peephole-pill {
   background: linear-gradient(90deg, #2b7de0, #4d8fd9);
   color: #fff;
 }
@@ -956,36 +960,51 @@ input:focus {
   color: #8a4b06;
 }
 
-/* だんだん見える: 公開までは、見ている側のキャンバスに幕をかける */
-.canvas-curtain {
+/* のぞき穴: 暗幕に透明な穴をあけ、下の絵を一部分だけ見せる */
+.canvas-peephole {
   position: absolute;
   inset: 0;
   z-index: 2;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 0.4rem;
+  overflow: hidden;
   pointer-events: none;
-  background:
-    repeating-linear-gradient(
-      -45deg,
-      rgba(77, 143, 217, 0.24) 0 18px,
-      rgba(240, 247, 255, 0.4) 18px 36px
-    ),
-    #f0f7ff;
 }
 
-.canvas-curtain-face {
-  font-size: 3rem;
-  line-height: 1;
-  animation: pulse-urgent 1.6s ease-in-out infinite;
+.canvas-peephole-window {
+  position: absolute;
+  left: var(--peephole-x);
+  top: var(--peephole-y);
+  width: var(--peephole-size);
+  aspect-ratio: 1 / 1;
+  transform: translate(-50%, -50%);
+  border: 4px solid #ffd65a;
+  border-radius: 50%;
+  box-shadow:
+    0 0 0 4px rgba(255, 214, 90, 0.24),
+    0 0 0 120vmax rgba(10, 30, 49, 0.95),
+    inset 0 0 18px rgba(255, 214, 90, 0.3);
+  transition:
+    left 0.65s cubic-bezier(0.2, 0.8, 0.2, 1),
+    top 0.65s cubic-bezier(0.2, 0.8, 0.2, 1),
+    width 0.2s linear;
 }
 
-.canvas-curtain-text {
+.canvas-peephole-label {
+  position: absolute;
+  left: 50%;
+  bottom: 10px;
+  z-index: 1;
+  transform: translateX(-50%) rotate(-1deg);
+  max-width: calc(100% - 24px);
+  padding: 0.28rem 0.62rem;
+  border: 2px solid #ffd65a;
+  border-radius: 999px;
+  background: rgba(10, 30, 49, 0.88);
+  color: #fff8d6;
   font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
-  font-size: 1.05rem;
-  color: #17498f;
+  font-size: 0.78rem;
+  line-height: 1.2;
+  white-space: nowrap;
+  box-shadow: 2px 3px 0 rgba(0, 0, 0, 0.22);
 }
 
 /* —— 爆笑リプレイ —— */
@@ -1121,7 +1140,7 @@ input:focus {
   transform: rotate(-5deg);
 }
 
-.gradual-badge {
+.peephole-badge {
   background: #eaf4ff;
   color: #17498f;
   transform: rotate(-5deg);
@@ -1818,5 +1837,9 @@ input:focus {
   .fanfare-text,
   .ai-busy-icon {
     animation: none;
+  }
+
+  .canvas-peephole-window {
+    transition: none;
   }
 }

@@ -20,6 +20,11 @@ import {
 } from "./ai.js";
 import { findConstraint, randomConstraint } from "./constraints.js";
 import { hasVisibleDrawing } from "./drawing.js";
+import {
+  canPlayerNextRound,
+  canPlayerSeeWord,
+  canRevealAnswer,
+} from "./round-rules.js";
 import { randomWord } from "./words.js";
 
 const PORT = process.env.PORT || 3001;
@@ -39,12 +44,10 @@ const COOP_DURATION_MS = 40_000;
 const LIAR_MIN_PLAYERS = 4;
 const LIAR_MAX_DRAWERS = 3;
 const LIAR_DURATION_MS = 40_000;
-const GRADUAL_MIN_PLAYERS = 2;
-/**
- * 見ている側は幕がかかったまま待つだけなので、協力・うそつきの40秒より短くする。
- * 描き手を急かす声も飛ばないぶん、上限がないと丁寧に描きこんでしまう。
- */
-const GRADUAL_DURATION_MS = 20_000;
+// 通信上の gradual という識別子は、旧クライアントとの互換性のため残す。
+const PEEPHOLE_MIN_PLAYERS = 2;
+/** のぞき穴が動いている間に、描いて当てる時間。 */
+const PEEPHOLE_DURATION_MS = 20_000;
 const GALLERY_MAX = 60;
 const EVENT_MIN_GAP = 3;
 const EVENT_FORCE_GAP = 6;
@@ -611,7 +614,7 @@ function chooseRoundType(room, playerCount = activePlayers(room).length) {
     if (forced === "relay" && n < RELAY_MIN_PLAYERS) return "normal";
     if (forced === "coop" && n < COOP_MIN_PLAYERS) return "normal";
     if (forced === "liar" && n < LIAR_MIN_PLAYERS) return "normal";
-    if (forced === "gradual" && n < GRADUAL_MIN_PLAYERS) return "normal";
+    if (forced === "gradual" && n < PEEPHOLE_MIN_PLAYERS) return "normal";
     return forced;
   }
 
@@ -620,7 +623,7 @@ function chooseRoundType(room, playerCount = activePlayers(room).length) {
   if (n >= RELAY_MIN_PLAYERS) eligible.push("relay");
   if (n >= COOP_MIN_PLAYERS) eligible.push("coop");
   if (n >= LIAR_MIN_PLAYERS) eligible.push("liar");
-  if (n >= GRADUAL_MIN_PLAYERS) eligible.push("gradual");
+  if (n >= PEEPHOLE_MIN_PLAYERS) eligible.push("gradual");
 
   if (eligible.length === 0 || room.lastWasSpecial) {
     return "normal";
@@ -707,62 +710,6 @@ function canPlayerDraw(room, playerId) {
   return room.drawerId === playerId;
 }
 
-function canPlayerSeeWord(room, playerId) {
-  if (room.phase !== "playing" || !room.word) return false;
-  if (room.roundType === "normal") {
-    // 「せいかい！」のあとは全員に公開（聞き取れなかった子にも答えが伝わる）
-    if (room.drawPhase === "reveal") return true;
-    return room.drawerId === playerId;
-  }
-  if (room.roundType === "gradual") {
-    return room.drawerId === playerId;
-  }
-  if (room.roundType === "coop") {
-    return room.drawerIds.includes(playerId);
-  }
-  if (room.roundType === "liar") {
-    // こたえ発表後は全員に公開。それまでは正直な描き手だけ
-    if (room.drawPhase === "reveal") return true;
-    return room.seenWordIds.has(playerId);
-  }
-  // relay: already drawn or currently drawing
-  return room.seenWordIds.has(playerId);
-}
-
-function canPlayerNextRound(room, playerId) {
-  if (room.phase !== "playing") return false;
-  if (room.roundType === "normal") {
-    // 「せいかい！」で答えを出してから進む
-    if (room.drawPhase !== "reveal") return false;
-    return room.drawerId === playerId;
-  }
-  if (room.roundType === "gradual") {
-    // 公開が始まるまでは「できた！」で公開する（つぎへは公開後）
-    if (room.drawPhase !== "guessing") return false;
-    return room.drawerId === playerId;
-  }
-  if (room.roundType === "relay") {
-    if (room.drawPhase !== "guessing") return false;
-    return room.seenWordIds.has(playerId);
-  }
-  if (room.roundType === "coop") {
-    if (room.drawPhase !== "guessing") return false;
-    return room.drawerIds.includes(playerId);
-  }
-  if (room.roundType === "liar") {
-    if (room.drawPhase !== "reveal") return false;
-    return room.drawerIds.includes(playerId) || room.hostId === playerId;
-  }
-  return false;
-}
-
-/** ふつうのラウンドの「せいかい！」。時間しばりであてっこタイムに入っていても押せる */
-function canRevealAnswer(room, playerId) {
-  if (room.phase !== "playing" || room.roundType !== "normal") return false;
-  if (room.drawPhase === "reveal") return false;
-  return room.drawerId === playerId;
-}
-
 /** ふつうのラウンドを、お題を公開せずにパスできるのは現在の描き手だけ */
 function canPassRound(room, playerId) {
   if (room.phase !== "playing" || room.roundType !== "normal") return false;
@@ -813,7 +760,7 @@ function buildRoundPayload(room, playerId) {
           : room.roundType === "liar" && room.drawPhase === "drawing"
             ? Math.round(LIAR_DURATION_MS / 1000)
             : room.roundType === "gradual" && room.drawPhase === "drawing"
-              ? Math.round(GRADUAL_DURATION_MS / 1000)
+              ? Math.round(PEEPHOLE_DURATION_MS / 1000)
               : room.constraint?.kind === "time" &&
                   room.drawPhase === "drawing"
                 ? room.constraint.value
@@ -837,13 +784,16 @@ function buildRoundPayload(room, playerId) {
     payload.liarName = room.drawPhase === "reveal" ? room.liarName : null;
   }
 
+  if (room.roundType === "normal" || room.roundType === "gradual") {
+    payload.canRevealAnswer = canRevealAnswer(room, playerId);
+  }
+
   if (room.roundType === "gradual") {
     payload.canFinishGradual =
       room.drawPhase === "drawing" && room.drawerId === playerId;
   }
 
   if (room.roundType === "normal") {
-    payload.canRevealAnswer = canRevealAnswer(room, playerId);
     payload.canPassRound = canPassRound(room, playerId);
   }
 
@@ -866,7 +816,7 @@ function emitRoundStart(room, { clear = false, fanfare = false } = {}) {
           : room.roundType === "liar"
             ? "🕵️ うそつきお絵かき！"
             : room.roundType === "gradual"
-              ? "👀 だんだん見える！"
+              ? "🔍 のぞき穴お絵かき！"
               : null;
     if (message) {
       const names =
@@ -908,10 +858,6 @@ function enterGuessing(room) {
     room.roundType === "relay"
       ? room.drawerIds[room.drawerIds.length - 1] || null
       : room.drawerId;
-  // だんだん見える: ここで初めて線を配り、全員の画面でスロー再生を始める
-  if (room.roundType === "gradual") {
-    io.to(room.code).emit("gradualReveal", { strokes: room.strokes });
-  }
   emitRoundSync(room);
 }
 
@@ -959,7 +905,7 @@ function advanceRelay(room) {
   beginRelayTurn(room);
 }
 
-/** 協力・うそつき・だんだん・時間しばり用: 一定時間で自動的にあてっこタイムへ */
+/** 協力・うそつき・のぞき穴・時間しばり用: 一定時間で自動的にあてっこタイムへ */
 function scheduleTimedDrawing(room, ms) {
   clearTurnTimer(room);
   room.turnEndsAt = Date.now() + ms;
@@ -1137,7 +1083,7 @@ function startRound(room) {
     room.drawerIds = [drawer.id];
     room.seenWordIds = new Set([drawer.id]);
     room.drawPhase = "drawing";
-    scheduleTimedDrawing(room, GRADUAL_DURATION_MS);
+    scheduleTimedDrawing(room, PEEPHOLE_DURATION_MS);
     emitRoundStart(room, { clear: true, fanfare: true });
     return;
   }
@@ -1157,15 +1103,8 @@ function startRound(room) {
   emitRoundStart(room, { clear: true, fanfare: Boolean(room.constraint) });
 }
 
-/** だんだん見えるの公開前は、描き手本人以外に線を見せない */
-function strokesVisibleTo(room, playerId) {
-  if (
-    room.roundType === "gradual" &&
-    room.drawPhase === "drawing" &&
-    room.drawerId !== playerId
-  ) {
-    return [];
-  }
+/** 再接続した人にも、現在までの線を復元する。見える範囲は画面側で制御する。 */
+function strokesVisibleTo(room) {
   return room.strokes;
 }
 
@@ -1176,7 +1115,7 @@ function syncPlayerState(socket, room, playerId) {
   if (room.phase === "playing" && room.word) {
     io.to(socket.id).emit("roundStart", buildRoundPayload(room, playerId));
     io.to(socket.id).emit("strokeHistory", {
-      strokes: strokesVisibleTo(room, playerId),
+      strokes: strokesVisibleTo(room),
     });
   } else if (room.phase === "finished") {
     io.to(socket.id).emit("gameFinished", buildFinishedPayload(room));
@@ -1779,8 +1718,6 @@ io.on("connection", (socket) => {
     if (room.strokes.length > MAX_STROKES) {
       room.strokes = room.strokes.slice(-MAX_STROKES);
     }
-    // だんだん見える: 公開までは自分の画面だけに描く（配信しない）
-    if (room.roundType === "gradual" && room.drawPhase === "drawing") return;
     socket.to(code).emit("stroke", event);
   });
 
@@ -1789,7 +1726,7 @@ io.on("connection", (socket) => {
     if (!ctx) return reply(cb, { ok: false, strokes: [] });
     reply(cb, {
       ok: true,
-      strokes: strokesVisibleTo(ctx.room, ctx.playerId),
+      strokes: strokesVisibleTo(ctx.room),
     });
   });
 
@@ -1807,7 +1744,7 @@ io.on("connection", (socket) => {
     }
     // 流していいのは、こたえを知っている人（＝そのラウンドを次へ進められる人）だけ。
     // 当てっこの最中に全員の画面が白くなると、ただの邪魔になる。
-    // リレー・協力・うそつき・だんだんでは、描く時間が終わるまで false になる。
+    // リレー・協力・うそつき・のぞき穴では、答えが出るまで false になる。
     if (!canPlayerNextRound(room, playerId)) {
       return reply(cb, { ok: false, error: "こたえが出てからリプレイできます" });
     }
@@ -1888,7 +1825,7 @@ io.on("connection", (socket) => {
     // 連打や同時押しでもエラーにしない
     if (
       room.phase === "playing" &&
-      room.roundType === "normal" &&
+      (room.roundType === "normal" || room.roundType === "gradual") &&
       room.drawPhase === "reveal"
     ) {
       return reply(cb, { ok: true, stale: true });
@@ -1904,7 +1841,7 @@ io.on("connection", (socket) => {
     reply(cb, { ok: true });
   });
 
-  // だんだん見える: 描き手の「できた！」で公開スタート
+  // のぞき穴お絵かき: 描き手が描き終えたら、穴を外して最後の回答タイムへ
   onSocket(socket, "finishGradualDrawing", (cb) => {
     const ctx = getContext(socket);
     if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
@@ -1914,7 +1851,7 @@ io.on("connection", (socket) => {
       room.roundType !== "gradual" ||
       room.drawerId !== playerId
     ) {
-      return reply(cb, { ok: false, error: "いまは公開できません" });
+      return reply(cb, { ok: false, error: "いまは全体を見せられません" });
     }
     // タイマー満了や連打と同時でもエラーにしない
     if (room.drawPhase !== "drawing") {

@@ -10,6 +10,19 @@ const SESSION_TTL_MS = 3 * 60 * 60 * 1000;
 const HIGHLIGHT_MS_PER_ITEM = 1100;
 const HIGHLIGHT_MIN_MS_PER_ITEM = 500;
 const HIGHLIGHT_TOTAL_MS = 24_000;
+const PEEPHOLE_POSITIONS = [
+  [24, 24],
+  [51, 25],
+  [76, 27],
+  [72, 51],
+  [48, 48],
+  [25, 55],
+  [27, 75],
+  [53, 74],
+  [75, 73],
+  [40, 31],
+  [63, 63],
+];
 const EMPTY_AI_STATE = {
   enabled: false,
   gameSeq: 0,
@@ -75,6 +88,25 @@ function clearSession() {
 function formatRemain(ms) {
   const sec = Math.max(0, Math.ceil(ms / 1000));
   return sec;
+}
+
+/** 全員で同じ場所を見られるよう、ラウンド番号と経過秒から穴の位置を決める。 */
+function getPeepholeStyle(roundId, remainSec, turnDurationSec) {
+  const duration = Math.max(1, turnDurationSec || 20);
+  const remaining = Math.min(duration, Math.max(0, remainSec ?? duration));
+  const progress = 1 - remaining / duration;
+  const elapsed = duration - remaining;
+  const offset = Number.isInteger(roundId) ? roundId : 0;
+  const position =
+    PEEPHOLE_POSITIONS[
+      (offset + Math.floor(elapsed / 2)) % PEEPHOLE_POSITIONS.length
+    ];
+  const size = 25 + progress * 27;
+  return {
+    "--peephole-x": `${position[0]}%`,
+    "--peephole-y": `${position[1]}%`,
+    "--peephole-size": `${size}%`,
+  };
 }
 
 /** 全角数字なども半角4桁に正規化 */
@@ -203,6 +235,11 @@ export default function App() {
   const isHost = playerId && playerId === hostId;
   const isAiFinishBusy = aiState.awardsStatus === "generating";
   const modeClass = `mode-${roundType || "normal"}`;
+  const peepholeStyle = getPeepholeStyle(
+    roundId,
+    remainSec,
+    turnDurationSec
+  );
   const inviteUrl = useMemo(() => buildInviteUrl(roomCode), [roomCode]);
   const canShareInvite =
     typeof navigator !== "undefined" && typeof navigator.share === "function";
@@ -449,13 +486,6 @@ export default function App() {
       canvasApiRef.current?.playReplay();
     });
 
-    // だんだん見える: サーバーから線が届いたら、ゆっくり公開再生する
-    socket.on("gradualReveal", (data) => {
-      const strokes = data?.strokes || [];
-      canvasApiRef.current?.playGradualReveal(strokes);
-      markDrawing(strokes.some((ev) => ev?.type === "move"));
-    });
-
     socket.on("playerJoined", (data) => {
       if (data?.name) setToast(`${data.name}が遊びに来たよ！`);
     });
@@ -476,7 +506,7 @@ export default function App() {
       }
     });
 
-    // ふつうのラウンドの答え発表。画面は止めず、トーストで知らせる
+    // ふつう・のぞき穴ラウンドの答え発表
     socket.on("answerReveal", (data) => {
       if (!data?.word) return;
       setToast(`✅ こたえは「${data.word}」！`);
@@ -829,7 +859,7 @@ export default function App() {
   function finishGradualDrawing() {
     setError("");
     socketRef.current?.emit("finishGradualDrawing", (res) => {
-      if (!res?.ok) setError(res?.error || "公開できません");
+      if (!res?.ok) setError(res?.error || "全体を見せられません");
     });
   }
 
@@ -1334,28 +1364,14 @@ export default function App() {
           <div className="meta row-meta">
             <span>部屋 {roomCode}</span>
             {renderRoundProgress()}
-            <span className="mode-pill gradual-pill">だんだん</span>
+            <span className="mode-pill peephole-pill">のぞき穴</span>
           </div>
-          {drawPhase === "drawing" ? (
-            word ? (
-              <>
-                <div className="info-block info-prompt">
-                  <div className="info-label">あなたのお題</div>
-                  <div className="prompt-value">{word}</div>
-                </div>
-                <p className="hint">
-                  みんなには まだ見えてないよ。描きおわったら「できた！」を押そう
-                </p>
-              </>
-            ) : (
-              <div className="info-block info-drawer">
-                <div className="info-label">🤫 こっそり おえかき中</div>
-                <div className="drawer-value">{drawerName}</div>
-                <p className="hint">
-                  できあがると、絵が だんだん見えてくるよ…！
-                </p>
-              </div>
-            )
+          {drawPhase === "reveal" ? (
+            <div className="info-block info-answer">
+              <div className="info-label">✅ こたえ</div>
+              <div className="prompt-value">{word}</div>
+              <p className="hint">{drawerName}が描きました</p>
+            </div>
           ) : word ? (
             <>
               <div className="info-block info-prompt">
@@ -1363,14 +1379,22 @@ export default function App() {
                 <div className="prompt-value">{word}</div>
               </div>
               <p className="hint">
-                みんなの画面に じわじわ出てるよ。当たったら「つぎのお題へ」！
+                {drawPhase === "drawing"
+                  ? "みんなには動く穴の中だけ見えてるよ。当たったら「せいかい！」"
+                  : "全体オープン！ 当てられたら「せいかい！」を押してね"}
               </p>
             </>
+          ) : drawPhase === "drawing" ? (
+            <div className="info-block info-drawer">
+              <div className="info-label">🔍 のぞき穴おえかき</div>
+              <div className="drawer-value">{drawerName}</div>
+              <p className="hint">動く穴を追いかけて、絵を当てよう！</p>
+            </div>
           ) : (
             <div className="info-block info-drawer">
-              <div className="info-label">👀 だんだん見えてくる…</div>
-              <div className="drawer-value">わかったら さけぼう！</div>
-              <p className="hint">はやく当てた人の勝ち！</p>
+              <div className="info-label">👀 全体オープン！</div>
+              <div className="drawer-value">ラストチャンス！</div>
+              <p className="hint">絵を見て、答えをさけぼう！</p>
             </div>
           )}
           {remainSec != null && drawPhase === "drawing" && (
@@ -2007,8 +2031,8 @@ export default function App() {
               </div>
             )}
             {roundType === "gradual" && (
-              <div className="easel-badge gradual-badge" aria-hidden="true">
-                だんだん
+              <div className="easel-badge peephole-badge" aria-hidden="true">
+                のぞき穴
               </div>
             )}
             <div className={`canvas-wrap ${modeClass}`}>
@@ -2033,14 +2057,18 @@ export default function App() {
                   <span className="canvas-blind-text">見ないで描こう！</span>
                 </div>
               )}
-              {/* だんだん見える: 公開までは見ている側に幕をかける */}
+              {/* のぞき穴: 見ている側は、動く丸の中だけリアルタイムで見える */}
               {roundType === "gradual" &&
                 drawPhase === "drawing" &&
-                !canDraw && (
-                  <div className="canvas-curtain" aria-hidden="true">
-                    <span className="canvas-curtain-face">🤫</span>
-                    <span className="canvas-curtain-text">
-                      こっそり おえかき中…
+                playerId !== drawerId && (
+                  <div
+                    className="canvas-peephole"
+                    style={peepholeStyle}
+                    aria-hidden="true"
+                  >
+                    <div className="canvas-peephole-window" />
+                    <span className="canvas-peephole-label">
+                      🔍 穴を追いかけよう！
                     </span>
                   </div>
                 )}
@@ -2066,12 +2094,7 @@ export default function App() {
                 こたえあわせ
               </button>
             )}
-            {canFinishGradual && (
-              <button type="button" onClick={finishGradualDrawing}>
-                できた！みんなに見せる
-              </button>
-            )}
-            {(canRevealAnswer || canPassRound) && (
+            {(canRevealAnswer || canPassRound || canFinishGradual) && (
               <div className="answer-actions">
                 {canRevealAnswer && (
                   <button
@@ -2090,6 +2113,16 @@ export default function App() {
                     disabled={advancing}
                   >
                     ⏭️ パス
+                  </button>
+                )}
+                {canFinishGradual && (
+                  <button
+                    type="button"
+                    className="quiet"
+                    onClick={finishGradualDrawing}
+                    disabled={advancing}
+                  >
+                    👀 ぜんぶ見せる
                   </button>
                 )}
               </div>
