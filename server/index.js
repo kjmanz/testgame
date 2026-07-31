@@ -21,6 +21,10 @@ import {
 import { findConstraint, randomConstraint } from "./constraints.js";
 import { hasVisibleDrawing } from "./drawing.js";
 import {
+  createHighlightState,
+  isHighlightActive,
+} from "./highlight.js";
+import {
   canPlayerNextRound,
   canPlayerSeeWord,
   canRevealAnswer,
@@ -177,6 +181,12 @@ const io = new Server(httpServer, {
  *  recentConstraints: string[],
  *  lastReplayAt: number,
  *  lastHighlightAt: number,
+ *  highlight: null | {
+ *    ids: string[],
+ *    startedAt: number,
+ *    msPerItem: number,
+ *    endsAt: number,
+ *  },
  *  gallery: GalleryItem[],
  *  strokes: object[],
  *  recentWords: string[],
@@ -717,6 +727,30 @@ function canPassRound(room, playerId) {
   return room.drawerId === playerId;
 }
 
+function currentHighlight(room, now = Date.now()) {
+  if (!isHighlightActive(room.highlight, now)) {
+    room.highlight = null;
+    return null;
+  }
+  return room.highlight;
+}
+
+/** 再接続・画面復帰した端末にも、進行中の同じ再生位置を送る。 */
+function emitHighlightState(room, targetSocketId) {
+  const highlight = currentHighlight(room);
+  if (!highlight || !targetSocketId) return false;
+  io.to(targetSocketId).emit("highlightStart", {
+    ...highlight,
+    serverNow: Date.now(),
+  });
+  return true;
+}
+
+function stopHighlight(room, { broadcast = false } = {}) {
+  room.highlight = null;
+  if (broadcast) io.to(room.code).emit("highlightStop");
+}
+
 function canRevealLiar(room, playerId) {
   if (room.phase !== "playing" || room.roundType !== "liar") return false;
   if (room.drawPhase !== "guessing") return false;
@@ -946,6 +980,7 @@ function resetGameProgress(room) {
   room.completedRounds = 0;
   room.drawCounts = new Map();
   room.lastCompletedRoundSeq = null;
+  room.highlight = null;
 }
 
 function buildFinishedPayload(room) {
@@ -958,6 +993,7 @@ function buildFinishedPayload(room) {
 
 function finishGame(room) {
   room.phase = "finished";
+  room.highlight = null;
   resetRoundFields(room);
   io.to(room.code).emit("clearCanvas");
   emitLobby(room);
@@ -1122,6 +1158,7 @@ function syncPlayerState(socket, room, playerId) {
   } else {
     emitLobby(room);
   }
+  emitHighlightState(room, socket.id);
   void players;
 }
 
@@ -1459,6 +1496,7 @@ function createEmptyRoom(code, hostId) {
     recentConstraints: [],
     lastReplayAt: 0,
     lastHighlightAt: 0,
+    highlight: null,
     gallery: [],
     strokes: [],
     recentWords: [],
@@ -1676,6 +1714,7 @@ io.on("connection", (socket) => {
     // 最初の2問はしばりなし（先にゲームそのものに慣れてもらう）
     room.roundsSinceConstraint = 0;
     room.gameSeq += 1;
+    room.highlight = null;
     resetAiForNewGame(room);
     room.totalRounds = chooseTotalRounds(activeCount);
     room.completedRounds = 0;
@@ -1757,7 +1796,7 @@ io.on("connection", (socket) => {
     reply(cb, { ok: true });
   });
 
-  // 今日のハイライト: 絵は全員の端末にもう届いているので、順番だけ配る
+  // 今日のハイライト: 再接続しても同じ位置に戻れる絶対時刻つきで配る
   onSocket(socket, "startHighlight", (cb) => {
     const ctx = getContext(socket);
     if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
@@ -1776,9 +1815,27 @@ io.on("connection", (socket) => {
     if (now - room.lastHighlightAt < HIGHLIGHT_COOLDOWN_MS) {
       return reply(cb, { ok: true, stale: true });
     }
+    const highlight = createHighlightState(
+      items.map((item) => item.id),
+      Date.now(),
+    );
+    if (!highlight) {
+      return reply(cb, { ok: false, error: "ハイライトを始められません" });
+    }
     room.lastHighlightAt = now;
-    io.to(code).emit("highlightStart", { ids: items.map((item) => item.id) });
+    room.highlight = highlight;
+    io.to(code).emit("highlightStart", {
+      ...highlight,
+      serverNow: Date.now(),
+    });
     reply(cb, { ok: true });
+  });
+
+  onSocket(socket, "requestHighlightState", (cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, active: false });
+    const active = emitHighlightState(ctx.room, socket.id);
+    reply(cb, { ok: true, active });
   });
 
   onSocket(socket, "revealLiar", (cb) => {
@@ -1959,6 +2016,7 @@ io.on("connection", (socket) => {
       });
     }
 
+    stopHighlight(room, { broadcast: true });
     room.totalRounds += EXTENSION_ROUNDS;
     resetAwardsForExtension(room);
     io.to(code).emit("gameExtended", {
@@ -1983,6 +2041,7 @@ io.on("connection", (socket) => {
         error: "AI授賞式が完成してからロビーへ戻れます",
       });
     }
+    stopHighlight(room, { broadcast: true });
     clearTurnTimer(room);
     room.phase = "lobby";
     resetRoundFields(room);
@@ -2128,6 +2187,10 @@ io.on("connection", (socket) => {
     if (idSet.size === 0) {
       return reply(cb, { ok: false, error: "削除する絵がありません" });
     }
+    const highlight = currentHighlight(room);
+    if (highlight?.ids.some((id) => idSet.has(id))) {
+      stopHighlight(room, { broadcast: true });
+    }
     room.gallery = room.gallery.filter((g) => !idSet.has(g.id));
     reconcileRemovedGalleryItems(room, idSet);
     emitGallery(room);
@@ -2148,6 +2211,7 @@ io.on("connection", (socket) => {
         error: "AI画伯が作業中です。完成してから削除してください",
       });
     }
+    stopHighlight(room, { broadcast: true });
     room.gallery = [];
     room.aiAwardsToken += 1;
     room.aiAwardsStatus = "idle";

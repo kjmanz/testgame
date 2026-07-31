@@ -6,10 +6,11 @@ import DrawingCanvas from "./DrawingCanvas.jsx";
 const SESSION_KEY = "oekaki-session";
 /** ブラウザを閉じても3時間は同じ部屋に戻れる */
 const SESSION_TTL_MS = 3 * 60 * 60 * 1000;
-/** 今日のハイライト: 1枚あたりの表示時間。枚数が多いときは早送りして全体を収める */
-const HIGHLIGHT_MS_PER_ITEM = 1100;
-const HIGHLIGHT_MIN_MS_PER_ITEM = 500;
-const HIGHLIGHT_TOTAL_MS = 24_000;
+/** 古いサーバーから時刻情報が来なかった場合にも使える表示時間。 */
+const HIGHLIGHT_MS_PER_ITEM = 2_400;
+const HIGHLIGHT_MIN_MS_PER_ITEM = 1_800;
+const HIGHLIGHT_TOTAL_MS = 60_000;
+const HIGHLIGHT_FINAL_HOLD_MS = 2_500;
 const PEEPHOLE_POSITIONS = [
   [24, 24],
   [51, 25],
@@ -88,6 +89,43 @@ function clearSession() {
 function formatRemain(ms) {
   const sec = Math.max(0, Math.ceil(ms / 1000));
   return sec;
+}
+
+function fallbackHighlightMsPerItem(itemCount) {
+  const count = Math.max(1, itemCount);
+  return Math.max(
+    HIGHLIGHT_MIN_MS_PER_ITEM,
+    Math.min(HIGHLIGHT_MS_PER_ITEM, Math.round(HIGHLIGHT_TOTAL_MS / count))
+  );
+}
+
+/** サーバー時刻から、受信時点で表示すべきハイライトの位置を復元する。 */
+function parseHighlightState(data, now) {
+  const ids = Array.isArray(data?.ids)
+    ? data.ids.filter((id) => typeof id === "string" && id)
+    : [];
+  if (ids.length === 0) return null;
+
+  const msPerItem =
+    Number.isFinite(data?.msPerItem) && data.msPerItem > 0
+      ? data.msPerItem
+      : fallbackHighlightMsPerItem(ids.length);
+  const startedAt = Number.isFinite(data?.startedAt) ? data.startedAt : now;
+  const endsAt = Number.isFinite(data?.endsAt)
+    ? data.endsAt
+    : startedAt + msPerItem * ids.length + HIGHLIGHT_FINAL_HOLD_MS;
+  if (now >= endsAt) return null;
+
+  const preparing = now < startedAt;
+  const elapsed = Math.max(0, now - startedAt);
+  return {
+    ids,
+    startedAt,
+    msPerItem,
+    endsAt,
+    preparing,
+    index: Math.min(ids.length - 1, Math.floor(elapsed / msPerItem)),
+  };
 }
 
 /** 全員で同じ場所を見られるよう、ラウンド番号と経過秒から穴の位置を決める。 */
@@ -173,6 +211,12 @@ export default function App() {
   const hasDrawingRef = useRef(false);
   /** サーバー時刻 - 端末時刻（タイマー表示のずれ補正用） */
   const serverOffsetRef = useRef(0);
+  const clockSyncedRef = useRef(false);
+  /** 自分で閉じた同じ上映が、画面復帰時に再び開かないようにする。 */
+  const dismissedHighlightRef = useRef(null);
+  /** 現在と直後の画像をデコード済みで保持する。 */
+  const highlightImageCacheRef = useRef(new Map());
+  const highlightImageRunRef = useRef(null);
   const [initialInviteCode] = useState(readInviteRoomCode);
   const [screen, setScreen] = useState("home"); // home | lobby | play | finished | gallery
   // 期限切れセッションでも名前だけは引き継いで入力の手間を省く
@@ -318,6 +362,9 @@ export default function App() {
     setTotalRounds(0);
     setExtensionRounds(3);
     setFinishBusy(false);
+    dismissedHighlightRef.current = null;
+    highlightImageCacheRef.current.clear();
+    highlightImageRunRef.current = null;
     setHighlight(null);
   }
 
@@ -348,26 +395,57 @@ export default function App() {
     return () => clearTimeout(t);
   }, [fanfare]);
 
-  // 今日のハイライト: 1枚ずつめくって、最後まで来たら閉じる
+  // 今日のハイライト: サーバーの絶対時刻に合わせ、復帰後も同じ位置へ戻す
   useEffect(() => {
     if (!highlight) return;
-    const perItem = Math.max(
-      HIGHLIGHT_MIN_MS_PER_ITEM,
-      Math.min(
-        HIGHLIGHT_MS_PER_ITEM,
-        Math.round(HIGHLIGHT_TOTAL_MS / Math.max(1, highlight.ids.length))
-      )
-    );
-    const t = setTimeout(() => {
+    const { ids, startedAt, msPerItem, endsAt } = highlight;
+
+    function syncHighlightPosition() {
+      const now = Date.now() + serverOffsetRef.current;
       setHighlight((current) => {
-        if (!current) return null;
-        const next = current.index + 1;
-        if (next >= current.ids.length) return null;
-        return { ...current, index: next };
+        if (!current || current.startedAt !== startedAt) return current;
+        if (now >= endsAt) return null;
+        const preparing = now < startedAt;
+        const elapsed = Math.max(0, now - startedAt);
+        const next = Math.min(
+          ids.length - 1,
+          Math.floor(elapsed / msPerItem)
+        );
+        return current.index === next && current.preparing === preparing
+          ? current
+          : { ...current, index: next, preparing };
       });
-    }, perItem);
-    return () => clearTimeout(t);
-  }, [highlight]);
+    }
+
+    syncHighlightPosition();
+    const timer = setInterval(syncHighlightPosition, 200);
+    return () => clearInterval(timer);
+  }, [
+    highlight?.ids,
+    highlight?.startedAt,
+    highlight?.msPerItem,
+    highlight?.endsAt,
+  ]);
+
+  // 現在と次の2枚をデコード済みで保持し、表示時間を読み込みに使わせない
+  useEffect(() => {
+    if (!highlight || typeof Image === "undefined") return;
+    const nextIds = new Set(
+      highlight.ids.slice(highlight.index, highlight.index + 3)
+    );
+    const cache = highlightImageCacheRef.current;
+    for (const id of cache.keys()) {
+      if (!nextIds.has(id)) cache.delete(id);
+    }
+    for (const item of gallery) {
+      if (!nextIds.has(item.id) || !item.imageDataUrl) continue;
+      if (cache.has(item.id)) continue;
+      const image = new Image();
+      image.src = item.imageDataUrl;
+      cache.set(item.id, image);
+      image.decode?.().catch(() => {});
+    }
+  }, [gallery, highlight?.ids, highlight?.index, highlight?.startedAt]);
 
   useEffect(() => {
     window.scrollTo(0, 0);
@@ -575,11 +653,28 @@ export default function App() {
       setToast("🏆 AI画伯の授賞式がはじまるよ！");
     });
 
-    // 今日のハイライト: 順番だけ届くので、絵は手元のギャラリーから引く
+    // 今日のハイライト: 絶対時刻から現在位置を復元し、途中復帰にも追いつく
     socket.on("highlightStart", (data) => {
-      const ids = Array.isArray(data?.ids) ? data.ids : [];
-      if (ids.length === 0) return;
-      setHighlight({ ids, index: 0 });
+      if (Number.isFinite(data?.serverNow) && !clockSyncedRef.current) {
+        // 通知の片道遅延ぶんだけ保守的だが、端末時計の大きなずれは防げる。
+        serverOffsetRef.current = data.serverNow - Date.now();
+      }
+      const next = parseHighlightState(
+        data,
+        Date.now() + serverOffsetRef.current
+      );
+      if (!next || dismissedHighlightRef.current === next.startedAt) return;
+      if (highlightImageRunRef.current !== next.startedAt) {
+        highlightImageCacheRef.current.clear();
+        highlightImageRunRef.current = next.startedAt;
+      }
+      setHighlight(next);
+    });
+
+    socket.on("highlightStop", () => {
+      highlightImageCacheRef.current.clear();
+      highlightImageRunRef.current = null;
+      setHighlight(null);
     });
 
     socket.on("strokeHistory", (data) => {
@@ -592,11 +687,13 @@ export default function App() {
     });
 
     function syncClock() {
+      clockSyncedRef.current = false;
       const t0 = Date.now();
       socket.emit("timeSync", (res) => {
         if (!res?.now) return;
         const t1 = Date.now();
         serverOffsetRef.current = res.now - (t0 + t1) / 2;
+        clockSyncedRef.current = true;
       });
     }
 
@@ -654,8 +751,21 @@ export default function App() {
     if (socket.connected) tryRejoin();
     socket.on("connect", tryRejoin);
 
+    function requestHighlightWhenVisible() {
+      if (document.visibilityState !== "visible") return;
+      socket.emit("requestHighlightState");
+    }
+
+    document.addEventListener("visibilitychange", requestHighlightWhenVisible);
+    window.addEventListener("pageshow", requestHighlightWhenVisible);
+
     return () => {
       socket.off("connect", tryRejoin);
+      document.removeEventListener(
+        "visibilitychange",
+        requestHighlightWhenVisible
+      );
+      window.removeEventListener("pageshow", requestHighlightWhenVisible);
       socket.disconnect();
     };
   }, []);
@@ -873,6 +983,15 @@ export default function App() {
     });
   }
 
+  function closeHighlight() {
+    if (highlight?.startedAt != null) {
+      dismissedHighlightRef.current = highlight.startedAt;
+    }
+    highlightImageCacheRef.current.clear();
+    highlightImageRunRef.current = null;
+    setHighlight(null);
+  }
+
   function passRound() {
     if (advancing) return;
     setError("");
@@ -1080,6 +1199,26 @@ export default function App() {
   /** 今日のハイライト: 全員の画面で同時に、今日の絵を1枚ずつめくる */
   function renderHighlight() {
     if (!highlight) return null;
+    if (highlight.preparing) {
+      return (
+        <div className="highlight" role="status" aria-live="polite">
+          <div className="highlight-inner">
+            <div className="highlight-countdown" aria-hidden="true">
+              🎬
+            </div>
+            <div className="highlight-word">まもなくスタート！</div>
+            <div className="highlight-count">全{highlight.ids.length}枚</div>
+            <button
+              type="button"
+              className="highlight-close"
+              onClick={closeHighlight}
+            >
+              とじる
+            </button>
+          </div>
+        </div>
+      );
+    }
     const total = highlight.ids.length;
     const shown = highlight.index + 1;
     const item = gallery.find((g) => g.id === highlight.ids[highlight.index]);
@@ -1094,10 +1233,10 @@ export default function App() {
                 key={item.id}
                 src={item.imageDataUrl}
                 alt={item.word || "絵"}
-                decoding="async"
+                decoding="sync"
               />
             ) : (
-              <div className="highlight-missing">この絵はもうないよ</div>
+              <div className="highlight-missing">絵を読み込み中…</div>
             )}
           </div>
           <div className="highlight-word">{item?.word || "？？？"}</div>
@@ -1114,7 +1253,7 @@ export default function App() {
           <button
             type="button"
             className="highlight-close"
-            onClick={() => setHighlight(null)}
+            onClick={closeHighlight}
           >
             とじる
           </button>

@@ -1360,6 +1360,13 @@ input:focus {
   color: #ffe9b8;
 }
 
+.highlight-countdown {
+  font-size: clamp(4rem, 22vw, 7rem);
+  line-height: 1;
+  filter: drop-shadow(0 6px 0 rgba(0, 0, 0, 0.28));
+  animation: pulse-urgent 0.9s ease-in-out infinite;
+}
+
 .highlight-frame {
   width: 100%;
   aspect-ratio: 1 / 1;
@@ -1841,5 +1848,9 @@ input:focus {
 
   .canvas-peephole-window {
     transition: none;
+  }
+
+  .highlight-countdown {
+    animation: none;
   }
 }
