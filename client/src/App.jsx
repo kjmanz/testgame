@@ -10,6 +10,10 @@ const SESSION_TTL_MS = 3 * 60 * 60 * 1000;
 const HIGHLIGHT_MS_PER_ITEM = 1100;
 const HIGHLIGHT_MIN_MS_PER_ITEM = 500;
 const HIGHLIGHT_TOTAL_MS = 24_000;
+/** AI授賞式: 無音のドラムロールをはさんで1作品ずつ発表する */
+const AWARD_OPENING_MS = 1800;
+const AWARD_DRUMROLL_MS = 2200;
+const AWARD_REVEAL_MS = 5000;
 const EMPTY_AI_STATE = {
   enabled: false,
   gameSeq: 0,
@@ -201,6 +205,8 @@ export default function App() {
   const [aiState, setAiState] = useState(EMPTY_AI_STATE);
   /** 今日のハイライト: { ids: string[], index: number } */
   const [highlight, setHighlight] = useState(null);
+  /** AI授賞式: { phase: 'opening' | 'drumroll' | 'reveal' | 'finale', index: number } */
+  const [awardCeremony, setAwardCeremony] = useState(null);
 
   const isHost = playerId && playerId === hostId;
   const isAiFinishBusy = aiState.awardsStatus === "generating";
@@ -288,6 +294,7 @@ export default function App() {
     setExtensionRounds(3);
     setFinishBusy(false);
     setHighlight(null);
+    setAwardCeremony(null);
   }
 
   function showFinished(data, { resetBusy = true } = {}) {
@@ -337,6 +344,38 @@ export default function App() {
     }, perItem);
     return () => clearTimeout(t);
   }, [highlight]);
+
+  // AI授賞式: 開幕 → ためる → 1作品発表、を受賞数だけくり返す
+  useEffect(() => {
+    if (!awardCeremony) return;
+    const awardCount = aiState.awards?.awards?.length || 0;
+    if (awardCount === 0 || awardCeremony.phase === "finale") return;
+
+    const delay =
+      awardCeremony.phase === "opening"
+        ? AWARD_OPENING_MS
+        : awardCeremony.phase === "drumroll"
+          ? AWARD_DRUMROLL_MS
+          : AWARD_REVEAL_MS;
+
+    const timer = setTimeout(() => {
+      setAwardCeremony((current) => {
+        if (!current) return null;
+        if (current.phase === "opening") {
+          return { phase: "drumroll", index: 0 };
+        }
+        if (current.phase === "drumroll") {
+          return { ...current, phase: "reveal" };
+        }
+        const nextIndex = current.index + 1;
+        if (nextIndex >= awardCount) {
+          return { phase: "finale", index: current.index };
+        }
+        return { phase: "drumroll", index: nextIndex };
+      });
+    }, delay);
+    return () => clearTimeout(timer);
+  }, [awardCeremony, aiState.awards]);
 
   useEffect(() => {
     window.scrollTo(0, 0);
@@ -443,6 +482,7 @@ export default function App() {
     socket.on("gameExtended", (data) => {
       setTotalRounds(data?.totalRounds ?? 0);
       setFinishBusy(false);
+      setAwardCeremony(null);
       setToast(`あと${data?.addedRounds || 3}問、延長！`);
     });
 
@@ -554,7 +594,8 @@ export default function App() {
     });
 
     socket.on("aiAwardsReady", () => {
-      setToast("🏆 AI画伯の授賞式がはじまるよ！");
+      setHighlight(null);
+      setAwardCeremony({ phase: "opening", index: 0 });
     });
 
     // 今日のハイライト: 順番だけ届くので、絵は手元のギャラリーから引く
@@ -817,6 +858,7 @@ export default function App() {
 
   function requestAiAwards() {
     setError("");
+    setAwardCeremony(null);
     socketRef.current?.emit("requestAiAwards", (res) => {
       if (!res?.ok) {
         setError(res?.error || "授賞式を始められません");
@@ -829,6 +871,12 @@ export default function App() {
     socketRef.current?.emit("startHighlight", (res) => {
       if (!res?.ok) setError(res?.error || "ハイライトを始められません");
     });
+  }
+
+  function startAwardCeremony() {
+    if (!aiState.awards?.awards?.length) return;
+    setHighlight(null);
+    setAwardCeremony({ phase: "opening", index: 0 });
   }
 
   function revealLiar() {
@@ -1103,6 +1151,152 @@ export default function App() {
           >
             とじる
           </button>
+        </div>
+      </div>
+    );
+  }
+
+  /** AI授賞式: 結果をいったん隠し、無音のドラムロールをはさんで発表する */
+  function renderAwardCeremony() {
+    const awards = aiState.awards?.awards || [];
+    if (!awardCeremony || awards.length === 0) return null;
+
+    const phase = awardCeremony.phase;
+    const index = Math.min(awardCeremony.index, awards.length - 1);
+    const award = awards[index];
+    const item = gallery.find(
+      (candidate) => candidate.id === award?.galleryItemId
+    );
+    const drawers = (item?.drawerNames || []).join("・");
+    const announcedCount =
+      phase === "finale"
+        ? awards.length
+        : phase === "reveal"
+          ? index + 1
+          : index;
+
+    return (
+      <div
+        className={`award-show award-show-${phase}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="award-show-title"
+      >
+        <div className="award-show-shell">
+          <button
+            type="button"
+            className="award-show-close"
+            onClick={() => setAwardCeremony(null)}
+            aria-label="授賞式を閉じる"
+          >
+            × とじる
+          </button>
+
+          <div className="award-show-progress" aria-hidden="true">
+            {awards.map((candidate, dotIndex) => (
+              <span
+                key={candidate.galleryItemId}
+                className={`${dotIndex < announcedCount ? "is-done" : ""}${
+                  phase !== "opening" &&
+                  phase !== "finale" &&
+                  dotIndex === index
+                    ? " is-current"
+                    : ""
+                }`}
+              />
+            ))}
+          </div>
+
+          <div className="award-show-live" aria-live="polite">
+            {phase === "opening" && (
+              <div className="award-opening" key="award-opening">
+                <div className="award-show-eyebrow">AI画伯 presents</div>
+                <div className="award-opening-trophy" aria-hidden="true">
+                  🏆
+                </div>
+                <h2 id="award-show-title">みんなの授賞式</h2>
+                <p>{aiState.awards?.intro}</p>
+                <div className="award-opening-cue">
+                  まもなく最初の賞を発表します！
+                </div>
+              </div>
+            )}
+
+            {phase === "drumroll" && (
+              <div className="award-drumroll" key={`drumroll-${index}`}>
+                <div className="award-step-label">
+                  {index + 1}つ目の賞 ／ 全{awards.length}賞
+                </div>
+                <div className="award-drum-trophy" aria-hidden="true">
+                  🏆
+                </div>
+                <h2 id="award-show-title">つぎの受賞作品は…</h2>
+                <div className="award-drum-dots" aria-hidden="true">
+                  {Array.from({ length: 9 }, (_, dotIndex) => (
+                    <span key={dotIndex} />
+                  ))}
+                </div>
+                <p>ドラムロール中…（音は脳内でどうぞ）</p>
+              </div>
+            )}
+
+            {phase === "reveal" && award && (
+              <div
+                className={`award-reveal${item ? "" : " no-image"}`}
+                key={`${award.galleryItemId}-${index}`}
+              >
+                <div className="award-confetti" aria-hidden="true">
+                  <span>◆</span><span>●</span><span>▲</span><span>★</span>
+                  <span>●</span><span>◆</span><span>★</span><span>▲</span>
+                </div>
+                <div className="award-step-label">
+                  {index + 1}つ目の賞 ／ 全{awards.length}賞
+                </div>
+                <h2 id="award-show-title">🏆 {award.title}</h2>
+                <div className="award-reveal-layout">
+                  {item && (
+                    <div className="award-reveal-frame">
+                      <img
+                        src={item.imageDataUrl}
+                        alt={item.word || "受賞作品"}
+                        decoding="async"
+                      />
+                    </div>
+                  )}
+                  <div className="award-reveal-copy">
+                    {item && (
+                      <div className="award-reveal-work">
+                        <strong>「{item.word || "？？？"}」</strong>
+                        {drawers && <span>{drawers}</span>}
+                      </div>
+                    )}
+                    <div className="award-comment-label">AI画伯のひとこと</div>
+                    <p className="award-comment">{award.reason}</p>
+                  </div>
+                </div>
+                <div className="award-auto-progress" aria-hidden="true">
+                  <span />
+                </div>
+              </div>
+            )}
+
+            {phase === "finale" && (
+              <div className="award-finale" key="award-finale">
+                <div className="award-finale-icons" aria-hidden="true">
+                  🎉 🏆 🎉
+                </div>
+                <h2 id="award-show-title">以上、全{awards.length}賞でした！</h2>
+                <p>どの絵も、今日だけの立派な名作です。</p>
+                <button
+                  type="button"
+                  className="award-finale-button"
+                  onClick={() => setAwardCeremony(null)}
+                >
+                  受賞作を一覧で見る
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     );
@@ -1474,6 +1668,8 @@ export default function App() {
 
       {renderHighlight()}
 
+      {renderAwardCeremony()}
+
       {fanfare && (
         <div className={`fanfare fanfare-${fanfare.roundType}`} role="status">
           <div className="fanfare-inner">
@@ -1730,6 +1926,13 @@ export default function App() {
                     <p className="ai-ceremony-intro">
                       {aiState.awards.intro}
                     </p>
+                    <button
+                      type="button"
+                      className="ai-awards-replay"
+                      onClick={startAwardCeremony}
+                    >
+                      🎬 授賞式をもう一度見る
+                    </button>
                     <ol className="ai-award-list">
                       {aiState.awards.awards.map((award) => {
                         const item = gallery.find(

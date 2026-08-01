@@ -163,6 +163,9 @@ test("createAwards sends the drawings themselves and stays server-side", async (
     assert.equal(body.text.format.type, "json_schema");
     assert.equal(body.text.format.strict, true);
     assert.equal(body.safety_identifier, "safe-test-user");
+    assert.match(body.instructions, /クスッ/);
+    assert.match(body.instructions, /失敗を笑わず/);
+    assert.match(body.instructions, /発表する順番/);
 
     const content = body.input[0].content;
     const images = content.filter((part) => part.type === "input_image");
