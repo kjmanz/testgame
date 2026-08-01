@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { QRCodeCanvas } from "qrcode.react";
 import { io } from "socket.io-client";
+import {
+  CommunityAwardCeremony,
+  CommunityAwardsSummary,
+  CommunityVoteOverlay,
+} from "./CommunityAwards.jsx";
 import DrawingCanvas from "./DrawingCanvas.jsx";
 
 const SESSION_KEY = "oekaki-session";
@@ -14,6 +19,10 @@ const HIGHLIGHT_TOTAL_MS = 24_000;
 const AWARD_OPENING_MS = 1800;
 const AWARD_DRUMROLL_MS = 2200;
 const AWARD_REVEAL_MS = 5000;
+/** みんなの投票授賞式も、1賞ずつ間を取って発表する */
+const COMMUNITY_AWARD_OPENING_MS = 1700;
+const COMMUNITY_AWARD_DRUMROLL_MS = 2100;
+const COMMUNITY_AWARD_REVEAL_MS = 5600;
 const EMPTY_AI_STATE = {
   enabled: false,
   gameSeq: 0,
@@ -23,6 +32,18 @@ const EMPTY_AI_STATE = {
   awards: null,
   awardsError: "",
   canRetryAwards: true,
+};
+const EMPTY_COMMUNITY_AWARDS_STATE = {
+  gameSeq: 0,
+  candidateCount: 0,
+  status: "idle",
+  categories: [],
+  votedCount: 0,
+  eligibleCount: 0,
+  closesAt: null,
+  hasVoted: false,
+  canVote: false,
+  results: null,
 };
 
 function createSocket() {
@@ -207,9 +228,28 @@ export default function App() {
   const [highlight, setHighlight] = useState(null);
   /** AI授賞式: { phase: 'opening' | 'drumroll' | 'reveal' | 'finale', index: number } */
   const [awardCeremony, setAwardCeremony] = useState(null);
+  const [communityAwardsState, setCommunityAwardsState] = useState(
+    EMPTY_COMMUNITY_AWARDS_STATE
+  );
+  const [communityVoteOpen, setCommunityVoteOpen] = useState(false);
+  const [communityVoteStep, setCommunityVoteStep] = useState(0);
+  const [communityVotes, setCommunityVotes] = useState({});
+  const [communityVoteEditing, setCommunityVoteEditing] = useState(false);
+  const [communityVoteSubmitting, setCommunityVoteSubmitting] = useState(false);
+  const [communityVoteRemainSec, setCommunityVoteRemainSec] = useState(null);
+  /** 会場投票の結果発表: opening | drumroll | reveal | finale */
+  const [communityCeremony, setCommunityCeremony] = useState(null);
 
   const isHost = playerId && playerId === hostId;
   const isAiFinishBusy = aiState.awardsStatus === "generating";
+  const isCommunityVoting = communityAwardsState.status === "voting";
+  const isFinishCeremonyBusy = isAiFinishBusy || isCommunityVoting;
+  const communityVoteSessionKey =
+    communityAwardsState.status === "voting"
+      ? `${communityAwardsState.gameSeq}:${(communityAwardsState.categories || [])
+          .map((category) => category.id)
+          .join(",")}`
+      : "";
   const modeClass = `mode-${roundType || "normal"}`;
   const inviteUrl = useMemo(() => buildInviteUrl(roomCode), [roomCode]);
   const canShareInvite =
@@ -295,6 +335,14 @@ export default function App() {
     setFinishBusy(false);
     setHighlight(null);
     setAwardCeremony(null);
+    setCommunityAwardsState(EMPTY_COMMUNITY_AWARDS_STATE);
+    setCommunityVoteOpen(false);
+    setCommunityVoteStep(0);
+    setCommunityVotes({});
+    setCommunityVoteEditing(false);
+    setCommunityVoteSubmitting(false);
+    setCommunityVoteRemainSec(null);
+    setCommunityCeremony(null);
   }
 
   function showFinished(data, { resetBusy = true } = {}) {
@@ -376,6 +424,87 @@ export default function App() {
     }, delay);
     return () => clearTimeout(timer);
   }, [awardCeremony, aiState.awards]);
+
+  // 新しい会場投票が始まったときだけ下書きを初期化する。
+  // 進捗更新のたびに投票画面を勝手に開き直さないため、文字列キーで判定する。
+  useEffect(() => {
+    if (!communityVoteSessionKey) {
+      if (communityAwardsState.status === "idle") {
+        setCommunityVoteOpen(false);
+        setCommunityVoteStep(0);
+        setCommunityVotes({});
+        setCommunityVoteEditing(false);
+        setCommunityVoteSubmitting(false);
+      }
+      if (communityAwardsState.status === "ready") {
+        setCommunityVoteOpen(false);
+        setCommunityVoteSubmitting(false);
+      }
+      return;
+    }
+
+    setHighlight(null);
+    setAwardCeremony(null);
+    setCommunityCeremony(null);
+    setCommunityVoteStep(0);
+    setCommunityVotes({});
+    setCommunityVoteEditing(false);
+    setCommunityVoteSubmitting(false);
+    setCommunityVoteOpen(true);
+  }, [communityVoteSessionKey, communityAwardsState.status]);
+
+  useEffect(() => {
+    if (
+      communityAwardsState.status !== "voting" ||
+      !communityAwardsState.closesAt
+    ) {
+      setCommunityVoteRemainSec(null);
+      return;
+    }
+    function tickCommunityVote() {
+      setCommunityVoteRemainSec(
+        formatRemain(
+          communityAwardsState.closesAt -
+            (Date.now() + serverOffsetRef.current)
+        )
+      );
+    }
+    tickCommunityVote();
+    const timer = setInterval(tickCommunityVote, 250);
+    return () => clearInterval(timer);
+  }, [communityAwardsState.status, communityAwardsState.closesAt]);
+
+  // みんなの投票結果も、開幕 → ドラムロール → 発表の順に1賞ずつ見せる
+  useEffect(() => {
+    if (!communityCeremony) return;
+    const awardCount = communityAwardsState.results?.awards?.length || 0;
+    if (awardCount === 0 || communityCeremony.phase === "finale") return;
+
+    const delay =
+      communityCeremony.phase === "opening"
+        ? COMMUNITY_AWARD_OPENING_MS
+        : communityCeremony.phase === "drumroll"
+          ? COMMUNITY_AWARD_DRUMROLL_MS
+          : COMMUNITY_AWARD_REVEAL_MS;
+
+    const timer = setTimeout(() => {
+      setCommunityCeremony((current) => {
+        if (!current) return null;
+        if (current.phase === "opening") {
+          return { phase: "drumroll", index: 0 };
+        }
+        if (current.phase === "drumroll") {
+          return { ...current, phase: "reveal" };
+        }
+        const nextIndex = current.index + 1;
+        if (nextIndex >= awardCount) {
+          return { phase: "finale", index: current.index };
+        }
+        return { phase: "drumroll", index: nextIndex };
+      });
+    }, delay);
+    return () => clearTimeout(timer);
+  }, [communityCeremony, communityAwardsState.results]);
 
   useEffect(() => {
     window.scrollTo(0, 0);
@@ -483,6 +612,9 @@ export default function App() {
       setTotalRounds(data?.totalRounds ?? 0);
       setFinishBusy(false);
       setAwardCeremony(null);
+      setCommunityAwardsState(EMPTY_COMMUNITY_AWARDS_STATE);
+      setCommunityVoteOpen(false);
+      setCommunityCeremony(null);
       setToast(`あと${data?.addedRounds || 3}問、延長！`);
     });
 
@@ -595,13 +727,45 @@ export default function App() {
 
     socket.on("aiAwardsReady", () => {
       setHighlight(null);
+      setCommunityCeremony(null);
       setAwardCeremony({ phase: "opening", index: 0 });
+    });
+
+    socket.on("communityAwardsStateUpdate", (data) => {
+      setCommunityAwardsState({
+        ...EMPTY_COMMUNITY_AWARDS_STATE,
+        ...data,
+      });
+    });
+
+    socket.on("communityAwardsStarted", () => {
+      setHighlight(null);
+      setAwardCeremony(null);
+      setCommunityCeremony(null);
+      setCommunityVoteOpen(true);
+    });
+
+    socket.on("communityAwardsReady", () => {
+      setHighlight(null);
+      setAwardCeremony(null);
+      setCommunityVoteOpen(false);
+      setCommunityVoteSubmitting(false);
+      setCommunityCeremony({ phase: "opening", index: 0 });
+    });
+
+    socket.on("communityAwardsNoVotes", () => {
+      setCommunityVoteOpen(false);
+      setCommunityVoteSubmitting(false);
+      setCommunityCeremony(null);
+      setToast("今回は票が集まらず閉幕！ホストからもう一度始められます");
     });
 
     // 今日のハイライト: 順番だけ届くので、絵は手元のギャラリーから引く
     socket.on("highlightStart", (data) => {
       const ids = Array.isArray(data?.ids) ? data.ids : [];
       if (ids.length === 0) return;
+      setAwardCeremony(null);
+      setCommunityCeremony(null);
       setHighlight({ ids, index: 0 });
     });
 
@@ -627,6 +791,8 @@ export default function App() {
     socket.on("connect", syncClock);
 
     function tryRejoin() {
+      // 投票送信中に回線が切れてackが失われても、再接続後は操作を復帰させる。
+      setCommunityVoteSubmitting(false);
       const session = loadSession();
       if (initialInviteCode && session?.roomCode !== initialInviteCode) {
         setRestoring(false);
@@ -874,9 +1040,93 @@ export default function App() {
   }
 
   function startAwardCeremony() {
-    if (!aiState.awards?.awards?.length) return;
+    if (isCommunityVoting || !aiState.awards?.awards?.length) return;
     setHighlight(null);
+    setCommunityCeremony(null);
     setAwardCeremony({ phase: "opening", index: 0 });
+  }
+
+  function startCommunityAwards() {
+    setError("");
+    setHighlight(null);
+    setAwardCeremony(null);
+    setCommunityCeremony(null);
+    socketRef.current?.emit("startCommunityAwards", (res) => {
+      if (!res?.ok) {
+        setError(res?.error || "みんなの投票を始められません");
+      }
+    });
+  }
+
+  function submitCommunityAwardsVotes() {
+    const categories = communityAwardsState.categories || [];
+    const ballot = categories.map((category) => ({
+      categoryId: category.id,
+      galleryItemId: communityVotes[category.id] || "",
+    }));
+    if (ballot.length === 0 || ballot.some((vote) => !vote.galleryItemId)) {
+      setError("3つの賞すべてで作品を選んでください");
+      return;
+    }
+
+    setError("");
+    setCommunityVoteSubmitting(true);
+    const socket = socketRef.current;
+    if (!socket) {
+      setCommunityVoteSubmitting(false);
+      setError("サーバーへ接続できません。もう一度試してください");
+      return;
+    }
+    socket.timeout(10_000).emit(
+      "submitCommunityAwardsVotes",
+      { gameSeq: communityAwardsState.gameSeq, votes: ballot },
+      (timeoutError, res) => {
+        setCommunityVoteSubmitting(false);
+        if (timeoutError) {
+          setError("投票の応答を確認できませんでした。接続後にもう一度確認してください");
+          return;
+        }
+        if (!res?.ok) {
+          setError(res?.error || "投票できませんでした");
+          return;
+        }
+        setCommunityVoteEditing(false);
+        setCommunityAwardsState((current) => ({
+          ...current,
+          hasVoted: true,
+        }));
+      }
+    );
+  }
+
+  function finalizeCommunityAwards() {
+    const remaining = Math.max(
+      0,
+      (communityAwardsState.eligibleCount || 0) -
+        (communityAwardsState.votedCount || 0)
+    );
+    if (
+      remaining > 0 &&
+      !window.confirm(
+        `まだ${remaining}人が投票していません。ここで締め切って発表しますか？`
+      )
+    ) {
+      return;
+    }
+    setError("");
+    socketRef.current?.emit("finalizeCommunityAwards", (res) => {
+      if (!res?.ok) {
+        setError(res?.error || "まだ投票を締め切れません");
+      }
+    });
+  }
+
+  function startCommunityAwardCeremony() {
+    if (!communityAwardsState.results?.awards?.length) return;
+    setHighlight(null);
+    setAwardCeremony(null);
+    setCommunityVoteOpen(false);
+    setCommunityCeremony({ phase: "opening", index: 0 });
   }
 
   function revealLiar() {
@@ -1670,6 +1920,33 @@ export default function App() {
 
       {renderAwardCeremony()}
 
+      {communityVoteOpen && (
+        <CommunityVoteOverlay
+          state={communityAwardsState}
+          gallery={gallery}
+          votes={communityVotes}
+          setVotes={setCommunityVotes}
+          step={communityVoteStep}
+          setStep={setCommunityVoteStep}
+          editing={communityVoteEditing}
+          setEditing={setCommunityVoteEditing}
+          remainSec={communityVoteRemainSec}
+          submitting={communityVoteSubmitting}
+          error={error}
+          isHost={isHost}
+          onSubmit={submitCommunityAwardsVotes}
+          onFinalize={finalizeCommunityAwards}
+          onClose={() => setCommunityVoteOpen(false)}
+        />
+      )}
+
+      <CommunityAwardCeremony
+        ceremony={communityCeremony}
+        state={communityAwardsState}
+        gallery={gallery}
+        onClose={() => setCommunityCeremony(null)}
+      />
+
       {fanfare && (
         <div className={`fanfare fanfare-${fanfare.roundType}`} role="status">
           <div className="fanfare-inner">
@@ -1890,7 +2167,7 @@ export default function App() {
                     type="button"
                     className="highlight-btn"
                     onClick={startHighlight}
-                    disabled={!!highlight}
+                    disabled={!!highlight || isCommunityVoting}
                   >
                     🎬 今日のハイライトを見る（{aiState.awardCandidateCount}枚）
                   </button>
@@ -1906,10 +2183,119 @@ export default function App() {
             </section>
           )}
 
+          <section
+            className="community-awards-panel"
+            aria-labelledby="community-awards-title"
+          >
+            <div className="community-panel-eyebrow">会場のみんな presents</div>
+            <h2 id="community-awards-title">🙌 みんなで決める3大賞</h2>
+
+            {communityAwardsState.status === "idle" && (
+              <>
+                <p className="community-panel-note">
+                  3つの「○○賞」に匿名投票。結果は最後まで秘密です。
+                </p>
+                <div className="community-award-samples" aria-hidden="true">
+                  <span>じわじわ</span>
+                  <span>発想が斜め上</span>
+                  <span>飾りたい</span>
+                </div>
+                {communityAwardsState.candidateCount < 2 ? (
+                  <p className="community-panel-note">
+                    絵が2枚以上あると、みんなで投票できます
+                  </p>
+                ) : isHost ? (
+                  <button
+                    type="button"
+                    className="community-start-button"
+                    onClick={startCommunityAwards}
+                    disabled={isAiFinishBusy}
+                  >
+                    🗳️ みんなの投票をはじめる
+                  </button>
+                ) : (
+                  <p className="hint">ホストが投票を始められます</p>
+                )}
+              </>
+            )}
+
+            {communityAwardsState.status === "voting" && (
+              <>
+                <div className="community-panel-status" role="status" aria-live="polite">
+                  <span className="community-panel-ballot" aria-hidden="true">🗳️</span>
+                  <div>
+                    <strong>ただいま匿名投票中！</strong>
+                    <span>
+                      {communityAwardsState.votedCount} / {communityAwardsState.eligibleCount}人 投票ずみ
+                    </span>
+                  </div>
+                </div>
+                <div className="community-panel-track" aria-hidden="true">
+                  <span
+                    style={{
+                      width: `${
+                        communityAwardsState.eligibleCount > 0
+                          ? (communityAwardsState.votedCount /
+                              communityAwardsState.eligibleCount) *
+                            100
+                          : 0
+                      }%`,
+                    }}
+                  />
+                </div>
+                {communityVoteRemainSec !== null && (
+                  <p className="community-panel-remain">
+                    あと{communityVoteRemainSec}秒で自動集計
+                  </p>
+                )}
+                <button
+                  type="button"
+                  className="community-open-vote"
+                  onClick={() => setCommunityVoteOpen(true)}
+                >
+                  {communityAwardsState.hasVoted
+                    ? "投票ずみ・結果を待つ"
+                    : communityAwardsState.canVote
+                      ? "投票画面を開く"
+                      : "投票状況を見る"}
+                </button>
+                {isHost && communityAwardsState.votedCount > 0 && (
+                  <button
+                    type="button"
+                    className="community-panel-finalize"
+                    onClick={finalizeCommunityAwards}
+                  >
+                    ここで締め切って発表
+                  </button>
+                )}
+              </>
+            )}
+
+            {communityAwardsState.status === "ready" &&
+              communityAwardsState.results?.awards?.length > 0 && (
+                <>
+                  <p className="community-panel-note">
+                    みんなの票で決まった、本日の3大賞です！
+                  </p>
+                  <button
+                    type="button"
+                    className="community-replay-button"
+                    onClick={startCommunityAwardCeremony}
+                  >
+                    🎬 投票結果をもう一度見る
+                  </button>
+                  <CommunityAwardsSummary
+                    state={communityAwardsState}
+                    gallery={gallery}
+                  />
+                </>
+              )}
+          </section>
+
           {aiState.enabled && (
             <section className="ai-ceremony" aria-labelledby="ai-awards-title">
               <div className="ai-eyebrow">AI画伯 presents</div>
-              <h2 id="ai-awards-title">みんなの授賞式</h2>
+              <h2 id="ai-awards-title">AI画伯の授賞式</h2>
 
               {aiState.awardsStatus === "generating" && (
                 <div className="ai-busy" role="status">
@@ -1930,6 +2316,7 @@ export default function App() {
                       type="button"
                       className="ai-awards-replay"
                       onClick={startAwardCeremony}
+                      disabled={isCommunityVoting}
                     >
                       🎬 授賞式をもう一度見る
                     </button>
@@ -1994,7 +2381,9 @@ export default function App() {
                       type="button"
                       className="ai-awards-button"
                       onClick={requestAiAwards}
-                      disabled={aiState.awardCandidateCount < 2}
+                      disabled={
+                        aiState.awardCandidateCount < 2 || isCommunityVoting
+                      }
                     >
                       {aiState.awardsStatus === "error"
                         ? "授賞式をもう一度ためす"
@@ -2018,13 +2407,19 @@ export default function App() {
             </p>
           )}
 
+          {isCommunityVoting && (
+            <p className="finish-wait" role="status">
+              みんなの投票中です。結果発表後に延長・ロビーへ戻れます
+            </p>
+          )}
+
           <div className="actions">
             {isHost ? (
               <>
                 <button
                   type="button"
                   onClick={extendGame}
-                  disabled={finishBusy || isAiFinishBusy}
+                  disabled={finishBusy || isFinishCeremonyBusy}
                 >
                   あと{extensionRounds}問だけ延長！
                 </button>
@@ -2032,7 +2427,7 @@ export default function App() {
                   type="button"
                   className="secondary"
                   onClick={endGame}
-                  disabled={finishBusy || isAiFinishBusy}
+                  disabled={finishBusy || isFinishCeremonyBusy}
                 >
                   ロビーへ戻る
                 </button>

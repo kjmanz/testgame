@@ -18,6 +18,10 @@ import {
   parseImageDataUrl,
   publicAiCapabilities,
 } from "./ai.js";
+import {
+  selectCommunityAwardCategories,
+  tallyCommunityAwards,
+} from "./community-awards.js";
 import { findConstraint, randomConstraint } from "./constraints.js";
 import { hasVisibleDrawing } from "./drawing.js";
 import { randomWord } from "./words.js";
@@ -65,6 +69,7 @@ const REPLAY_COOLDOWN_MS = 2_000;
 /** 今日のハイライトの連打よけ（最初の1枚が出るまで少し余裕を取る） */
 const HIGHLIGHT_COOLDOWN_MS = 3_000;
 const EXTENSION_ROUNDS = 3;
+const COMMUNITY_AWARDS_VOTING_MS = 45_000;
 const MAX_GALLERY_DATA_URL_LEN = 400_000;
 const MAX_TOTAL_GALLERY_DATA_URL_LEN = 80_000_000;
 const MAX_STROKES = 20_000;
@@ -198,6 +203,20 @@ const io = new Server(httpServer, {
  *  aiAwardsError: string,
  *  aiAwardsAttempts: number,
  *  aiAwardsToken: number,
+ *  communityAwardsStatus: 'idle' | 'voting' | 'ready',
+ *  communityAwardCategories: {
+ *    id: string,
+ *    title: string,
+ *    prompt: string,
+ *    emoji: string,
+ *    candidateIds: string[],
+ *  }[],
+ *  communityAwardVotes: Map<string, Map<string, string>>,
+ *  communityAwardEligibleIds: Set<string>,
+ *  communityAwardsClosesAt: number | null,
+ *  communityAwardsTimer: ReturnType<typeof setTimeout> | null,
+ *  communityAwardsResults: null | { awards: object[] },
+ *  communityAwardsToken: number,
  * }} Room
  */
 
@@ -416,6 +435,153 @@ function emitAiState(room, targetSocketId = null) {
     return;
   }
   io.to(room.code).emit("aiStateUpdate", payload);
+}
+
+function buildCommunityAwardsState(room, playerId = null) {
+  const hasVoted = Boolean(
+    playerId && room.communityAwardVotes.has(playerId),
+  );
+  const canVote = Boolean(
+    playerId &&
+      room.communityAwardsStatus === "voting" &&
+      room.communityAwardEligibleIds.has(playerId),
+  );
+  return {
+    gameSeq: room.gameSeq,
+    candidateCount: drawnThisGame(room).length,
+    status: room.communityAwardsStatus,
+    categories: room.communityAwardCategories,
+    votedCount: room.communityAwardVotes.size,
+    eligibleCount: room.communityAwardEligibleIds.size,
+    closesAt: room.communityAwardsClosesAt,
+    hasVoted,
+    canVote,
+    results: room.communityAwardsResults,
+  };
+}
+
+/** hasVoted/canVote は個人情報なので、同じpayloadを部屋全体へ流さない。 */
+function emitCommunityAwardsState(
+  room,
+  targetSocketId = null,
+  targetPlayerId = null,
+) {
+  if (targetSocketId) {
+    io.to(targetSocketId).emit(
+      "communityAwardsStateUpdate",
+      buildCommunityAwardsState(room, targetPlayerId),
+    );
+    return;
+  }
+  for (const player of room.players.values()) {
+    if (!player.socketId) continue;
+    io.to(player.socketId).emit(
+      "communityAwardsStateUpdate",
+      buildCommunityAwardsState(room, player.id),
+    );
+  }
+}
+
+function clearCommunityAwardsTimer(room) {
+  if (room.communityAwardsTimer) {
+    clearTimeout(room.communityAwardsTimer);
+    room.communityAwardsTimer = null;
+  }
+}
+
+function resetCommunityAwards(room) {
+  clearCommunityAwardsTimer(room);
+  room.communityAwardsToken += 1;
+  room.communityAwardsStatus = "idle";
+  room.communityAwardCategories = [];
+  room.communityAwardVotes = new Map();
+  room.communityAwardEligibleIds = new Set();
+  room.communityAwardsClosesAt = null;
+  room.communityAwardsResults = null;
+}
+
+function finalizeCommunityAwards(room, reason) {
+  if (room.communityAwardsStatus !== "voting") return false;
+  clearCommunityAwardsTimer(room);
+  room.communityAwardsStatus = "ready";
+  room.communityAwardsClosesAt = null;
+  room.communityAwardsResults = {
+    ...tallyCommunityAwards(
+      room.communityAwardCategories,
+      room.communityAwardVotes,
+      { eligibleCount: room.communityAwardEligibleIds.size },
+    ),
+    finalizedAt: Date.now(),
+    reason,
+  };
+  emitCommunityAwardsState(room);
+  io.to(room.code).emit("communityAwardsReady", { gameSeq: room.gameSeq });
+  return true;
+}
+
+function scheduleCommunityAwardsDeadline(room) {
+  clearCommunityAwardsTimer(room);
+  const token = room.communityAwardsToken;
+  const gameSeq = room.gameSeq;
+  room.communityAwardsClosesAt = Date.now() + COMMUNITY_AWARDS_VOTING_MS;
+  room.communityAwardsTimer = setTimeout(() => {
+    room.communityAwardsTimer = null;
+    const current = rooms.get(room.code);
+    if (
+      current !== room ||
+      current.gameSeq !== gameSeq ||
+      current.communityAwardsToken !== token ||
+      current.communityAwardsStatus !== "voting"
+    ) {
+      return;
+    }
+    if (current.communityAwardVotes.size === 0) {
+      resetCommunityAwards(current);
+      emitCommunityAwardsState(current);
+      io.to(current.code).emit("communityAwardsNoVotes", {
+        gameSeq: current.gameSeq,
+      });
+      return;
+    }
+    finalizeCommunityAwards(current, "timeout");
+  }, COMMUNITY_AWARDS_VOTING_MS);
+}
+
+function allCommunityAwardVotesSubmitted(room) {
+  return (
+    room.communityAwardEligibleIds.size > 0 &&
+    room.communityAwardVotes.size >= room.communityAwardEligibleIds.size
+  );
+}
+
+function parseCommunityAwardBallot(room, data) {
+  const submitted = Array.isArray(data?.votes) ? data.votes : null;
+  if (!submitted || submitted.length !== room.communityAwardCategories.length) {
+    return { error: "3つの賞すべてに投票してください" };
+  }
+
+  const categoryById = new Map(
+    room.communityAwardCategories.map((category) => [category.id, category]),
+  );
+  const ballot = new Map();
+  for (const vote of submitted) {
+    const categoryId = safeString(vote?.categoryId).trim();
+    const galleryItemId = safeString(vote?.galleryItemId).trim();
+    const category = categoryById.get(categoryId);
+    if (
+      !category ||
+      ballot.has(categoryId) ||
+      !category.candidateIds.includes(galleryItemId)
+    ) {
+      return { error: "投票内容を確認してください" };
+    }
+    ballot.set(categoryId, galleryItemId);
+  }
+
+  if (ballot.size !== categoryById.size) {
+    return { error: "3つの賞すべてに投票してください" };
+  }
+  return { ballot };
 }
 
 function resetAiForNewGame(room) {
@@ -1032,6 +1198,7 @@ function finishGame(room) {
   emitLobby(room);
   io.to(room.code).emit("gameFinished", buildFinishedPayload(room));
   emitAiState(room);
+  emitCommunityAwardsState(room);
 }
 
 function pickWord(room) {
@@ -1215,6 +1382,7 @@ function syncPlayerState(socket, room, playerId) {
   const players = publicPlayers(room);
   emitGallery(room, socket.id);
   emitAiState(room, socket.id);
+  emitCommunityAwardsState(room, socket.id, playerId);
   if (room.phase === "playing" && room.word) {
     io.to(socket.id).emit("roundStart", buildRoundPayload(room, playerId));
     io.to(socket.id).emit("strokeHistory", {
@@ -1264,6 +1432,7 @@ function removePlayer(room, playerId) {
 
   if (room.players.size === 0) {
     clearTurnTimer(room);
+    clearCommunityAwardsTimer(room);
     rooms.delete(room.code);
     return;
   }
@@ -1297,11 +1466,31 @@ function removePlayer(room, playerId) {
     resetGameProgress(room);
     room.drawerStreak = null;
     resetAiWhenReturningToLobby(room);
+    resetCommunityAwards(room);
     io.to(room.code).emit("clearCanvas");
     io.to(room.code).emit("gameEnded", { reason: "alone" });
     emitLobby(room);
     emitAiState(room);
+    emitCommunityAwardsState(room);
     return;
+  }
+
+  if (
+    room.communityAwardsStatus === "voting" &&
+    room.communityAwardEligibleIds.delete(playerId)
+  ) {
+    room.communityAwardVotes.delete(playerId);
+    if (room.communityAwardEligibleIds.size === 0) {
+      resetCommunityAwards(room);
+      emitCommunityAwardsState(room);
+      io.to(room.code).emit("communityAwardsNoVotes", {
+        gameSeq: room.gameSeq,
+      });
+    } else if (allCommunityAwardVotesSubmitted(room)) {
+      finalizeCommunityAwards(room, "all-voted");
+    } else {
+      emitCommunityAwardsState(room);
+    }
   }
 
   // ホスト交代や人数変化を全経路で確実に配る
@@ -1421,6 +1610,41 @@ function reconcileRemovedGalleryItems(
       }
     }
   }
+
+  if (room.communityAwardsStatus === "ready") {
+    const currentIds = new Set(drawnThisGame(room).map((item) => item.id));
+    const updatedCategories = room.communityAwardCategories.map((category) => ({
+      ...category,
+      candidateIds: category.candidateIds.filter((id) => currentIds.has(id)),
+    }));
+    const removedAwardWinner = Boolean(
+      room.communityAwardsResults?.awards?.some((award) =>
+        award.winnerIds?.some((id) => idSet.has(id)),
+      ),
+    );
+    const removedVotedCandidate = [...room.communityAwardVotes.values()].some(
+      (ballot) => [...ballot.values()].some((id) => idSet.has(id)),
+    );
+    if (
+      currentIds.size < 2 ||
+      removedAwardWinner ||
+      removedVotedCandidate ||
+      updatedCategories.some((category) => category.candidateIds.length === 0)
+    ) {
+      resetCommunityAwards(room);
+    } else {
+      room.communityAwardCategories = updatedCategories;
+      room.communityAwardsResults = {
+        ...tallyCommunityAwards(
+          room.communityAwardCategories,
+          room.communityAwardVotes,
+          { eligibleCount: room.communityAwardEligibleIds.size },
+        ),
+        finalizedAt: Date.now(),
+        reason: automatic ? "gallery-trimmed" : "gallery-updated",
+      };
+    }
+  }
 }
 
 function trimGallery(room) {
@@ -1472,6 +1696,7 @@ function addGalleryItem(
   trimGallery(room);
   emitGallery(room);
   emitAiState(room);
+  emitCommunityAwardsState(room);
   return item;
 }
 
@@ -1519,6 +1744,14 @@ function createEmptyRoom(code, hostId) {
     aiAwardsError: "",
     aiAwardsAttempts: 0,
     aiAwardsToken: 0,
+    communityAwardsStatus: "idle",
+    communityAwardCategories: [],
+    communityAwardVotes: new Map(),
+    communityAwardEligibleIds: new Set(),
+    communityAwardsClosesAt: null,
+    communityAwardsTimer: null,
+    communityAwardsResults: null,
+    communityAwardsToken: 0,
   };
 }
 
@@ -1573,6 +1806,7 @@ io.on("connection", (socket) => {
       emitLobby(room);
       emitGallery(room, socket.id);
       emitAiState(room, socket.id);
+      emitCommunityAwardsState(room, socket.id, playerId);
     } catch (e) {
       reply(cb, { ok: false, error: e.message || "部屋を作成できませんでした" });
     }
@@ -1627,6 +1861,7 @@ io.on("connection", (socket) => {
     } else {
       emitGallery(room, socket.id);
       emitAiState(room, socket.id);
+      emitCommunityAwardsState(room, socket.id, playerId);
     }
     emitLobby(room);
   });
@@ -1721,12 +1956,14 @@ io.on("connection", (socket) => {
     room.roundsSinceConstraint = 0;
     room.gameSeq += 1;
     resetAiForNewGame(room);
+    resetCommunityAwards(room);
     room.totalRounds = chooseTotalRounds(activeCount);
     room.completedRounds = 0;
     room.drawCounts = new Map();
     room.lastCompletedRoundSeq = null;
     startRound(room);
     emitAiState(room);
+    emitCommunityAwardsState(room);
     reply(cb, { ok: true, totalRounds: room.totalRounds });
   });
 
@@ -1813,6 +2050,12 @@ io.on("connection", (socket) => {
     }
     if (room.phase !== "finished") {
       return reply(cb, { ok: false, error: "いまはハイライトを見られません" });
+    }
+    if (room.communityAwardsStatus === "voting") {
+      return reply(cb, {
+        ok: false,
+        error: "みんなの投票が終わってからハイライトを見られます",
+      });
     }
     const items = drawnThisGame(room);
     if (items.length < 2) {
@@ -2010,15 +2253,23 @@ io.on("connection", (socket) => {
         error: "AI授賞式が完成してから延長できます",
       });
     }
+    if (room.communityAwardsStatus === "voting") {
+      return reply(cb, {
+        ok: false,
+        error: "みんなの投票が終わってから延長できます",
+      });
+    }
 
     room.totalRounds += EXTENSION_ROUNDS;
     resetAwardsForExtension(room);
+    resetCommunityAwards(room);
     io.to(code).emit("gameExtended", {
       addedRounds: EXTENSION_ROUNDS,
       totalRounds: room.totalRounds,
     });
     startRound(room);
     emitAiState(room);
+    emitCommunityAwardsState(room);
     reply(cb, { ok: true, totalRounds: room.totalRounds });
   });
 
@@ -2035,32 +2286,175 @@ io.on("connection", (socket) => {
         error: "AI授賞式が完成してからロビーへ戻れます",
       });
     }
+    if (room.communityAwardsStatus === "voting") {
+      return reply(cb, {
+        ok: false,
+        error: "みんなの投票が終わってからロビーへ戻れます",
+      });
+    }
     clearTurnTimer(room);
     room.phase = "lobby";
     resetRoundFields(room);
     resetGameProgress(room);
     room.drawerStreak = null;
     resetAiWhenReturningToLobby(room);
+    resetCommunityAwards(room);
     io.to(code).emit("clearCanvas");
     io.to(code).emit("gameEnded");
     emitLobby(room);
     emitAiState(room);
+    emitCommunityAwardsState(room);
     // gallery is kept for room lifetime
     reply(cb, { ok: true });
+  });
+
+  onSocket(socket, "startCommunityAwards", (cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { room, playerId } = ctx;
+    if (room.hostId !== playerId) {
+      return reply(cb, {
+        ok: false,
+        error: "ホストだけがみんなの授賞式を始められます",
+      });
+    }
+    if (room.phase !== "finished") {
+      return reply(cb, {
+        ok: false,
+        error: "ゲーム終了後にみんなの授賞式を始められます",
+      });
+    }
+    if (room.aiAwardsStatus === "generating") {
+      return reply(cb, {
+        ok: false,
+        error: "AI授賞式が完成してからみんなの投票を始められます",
+      });
+    }
+    if (room.communityAwardsStatus === "ready") {
+      return reply(cb, { ok: true, ready: true });
+    }
+    if (room.communityAwardsStatus === "voting") {
+      return reply(cb, { ok: true, voting: true });
+    }
+
+    const candidates = drawnThisGame(room);
+    if (candidates.length < 2) {
+      return reply(cb, {
+        ok: false,
+        error: "みんなの授賞式には絵が2枚以上必要です",
+      });
+    }
+    const categories = selectCommunityAwardCategories(candidates);
+    if (categories.length !== 3) {
+      return reply(cb, {
+        ok: false,
+        error: "賞を用意できませんでした。もう一度試してください",
+      });
+    }
+    const eligibleIds = new Set(
+      activePlayers(room).map((player) => player.id),
+    );
+    if (eligibleIds.size === 0) {
+      return reply(cb, { ok: false, error: "投票できる参加者がいません" });
+    }
+
+    room.communityAwardsToken += 1;
+    room.communityAwardsStatus = "voting";
+    room.communityAwardCategories = categories;
+    room.communityAwardVotes = new Map();
+    room.communityAwardEligibleIds = eligibleIds;
+    room.communityAwardsResults = null;
+    scheduleCommunityAwardsDeadline(room);
+    emitCommunityAwardsState(room);
+    io.to(room.code).emit("communityAwardsStarted", {
+      gameSeq: room.gameSeq,
+    });
+    reply(cb, {
+      ok: true,
+      voting: true,
+      closesAt: room.communityAwardsClosesAt,
+    });
+  });
+
+  onSocket(socket, "submitCommunityAwardsVotes", (data, cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { room, playerId } = ctx;
+    if (room.phase !== "finished" || room.communityAwardsStatus !== "voting") {
+      return reply(cb, { ok: false, error: "いまは投票できません" });
+    }
+    if (!Number.isInteger(data?.gameSeq) || data.gameSeq !== room.gameSeq) {
+      return reply(cb, {
+        ok: false,
+        error: "投票情報が古くなりました。画面を開き直してください",
+      });
+    }
+    if (!room.communityAwardEligibleIds.has(playerId)) {
+      return reply(cb, {
+        ok: false,
+        error: "投票開始後に参加したため、今回は投票できません",
+      });
+    }
+
+    const parsed = parseCommunityAwardBallot(room, data);
+    if (!parsed.ballot) {
+      return reply(cb, { ok: false, error: parsed.error });
+    }
+    const overwritten = room.communityAwardVotes.has(playerId);
+    room.communityAwardVotes.set(playerId, parsed.ballot);
+    const completed = allCommunityAwardVotesSubmitted(room);
+    if (completed) {
+      finalizeCommunityAwards(room, "all-voted");
+    } else {
+      emitCommunityAwardsState(room);
+    }
+    reply(cb, {
+      ok: true,
+      overwritten,
+      ready: completed,
+      votedCount: room.communityAwardVotes.size,
+      eligibleCount: room.communityAwardEligibleIds.size,
+    });
+  });
+
+  onSocket(socket, "finalizeCommunityAwards", (cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { room, playerId } = ctx;
+    if (room.hostId !== playerId) {
+      return reply(cb, { ok: false, error: "ホストだけが締め切れます" });
+    }
+    if (room.phase !== "finished" || room.communityAwardsStatus !== "voting") {
+      return reply(cb, { ok: false, error: "いまは投票を締め切れません" });
+    }
+    if (room.communityAwardVotes.size < 1) {
+      return reply(cb, {
+        ok: false,
+        error: "まだ投票がありません。最初の1票を待ってください",
+      });
+    }
+    finalizeCommunityAwards(room, "host");
+    reply(cb, { ok: true, ready: true });
   });
 
   onSocket(socket, "requestAiAwards", (cb) => {
     const ctx = getContext(socket);
     if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
     const { room, playerId } = ctx;
-    if (!isAiConfigured()) {
-      return reply(cb, { ok: false, error: "AI画伯はまだ準備中です" });
-    }
     if (room.hostId !== playerId) {
       return reply(cb, { ok: false, error: "ホストだけが授賞式を始められます" });
     }
     if (room.phase !== "finished") {
       return reply(cb, { ok: false, error: "ゲーム終了後に授賞式を始められます" });
+    }
+    if (room.communityAwardsStatus === "voting") {
+      return reply(cb, {
+        ok: false,
+        error: "みんなの投票が終わってからAI授賞式を始められます",
+      });
+    }
+    if (!isAiConfigured()) {
+      return reply(cb, { ok: false, error: "AI画伯はまだ準備中です" });
     }
     if (room.aiAwardsStatus === "ready") {
       return reply(cb, { ok: true, ready: true });
@@ -2174,6 +2568,12 @@ io.on("connection", (socket) => {
         error: "AI画伯が作業中です。完成してから削除してください",
       });
     }
+    if (room.communityAwardsStatus === "voting") {
+      return reply(cb, {
+        ok: false,
+        error: "みんなが投票中です。結果発表後に削除してください",
+      });
+    }
     const idSet = new Set(
       Array.isArray(ids) ? ids.map(safeString).filter(Boolean) : [],
     );
@@ -2184,6 +2584,7 @@ io.on("connection", (socket) => {
     reconcileRemovedGalleryItems(room, idSet);
     emitGallery(room);
     emitAiState(room);
+    emitCommunityAwardsState(room);
     reply(cb, { ok: true });
   });
 
@@ -2200,13 +2601,21 @@ io.on("connection", (socket) => {
         error: "AI画伯が作業中です。完成してから削除してください",
       });
     }
+    if (room.communityAwardsStatus === "voting") {
+      return reply(cb, {
+        ok: false,
+        error: "みんなが投票中です。結果発表後に削除してください",
+      });
+    }
     room.gallery = [];
     room.aiAwardsToken += 1;
     room.aiAwardsStatus = "idle";
     room.aiAwards = null;
     room.aiAwardsError = "";
+    resetCommunityAwards(room);
     emitGallery(room);
     emitAiState(room);
+    emitCommunityAwardsState(room);
     reply(cb, { ok: true });
   });
 
