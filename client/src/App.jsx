@@ -48,6 +48,13 @@ const EMPTY_COMMUNITY_AWARDS_STATE = {
   canVote: false,
   results: null,
 };
+const EMPTY_AI_CRAZY_PROMPT_STATE = {
+  enabled: false,
+  active: false,
+  mainAnswer: null,
+  fullPrompt: null,
+  promptLabel: null,
+};
 
 function createSocket() {
   const url = import.meta.env.VITE_SOCKET_URL || undefined;
@@ -252,6 +259,9 @@ export default function App() {
   const [secretGuessActive, setSecretGuessActive] = useState(false);
   const [secretGuessPending, setSecretGuessPending] = useState(false);
   const [secretGuessReveal, setSecretGuessReveal] = useState(null);
+  const [aiCrazyPromptState, setAiCrazyPromptState] = useState(
+    EMPTY_AI_CRAZY_PROMPT_STATE
+  );
 
   const isHost = playerId && playerId === hostId;
   const isAiFinishBusy = aiState.awardsStatus === "generating";
@@ -293,6 +303,10 @@ export default function App() {
       setSecretGuessActive(!!data.aiSecretGuessActive);
       setSecretGuessPending(!!data.aiSecretGuessPending);
       setSecretGuessReveal(data.aiSecretGuessReveal || null);
+      setAiCrazyPromptState({
+        ...EMPTY_AI_CRAZY_PROMPT_STATE,
+        ...(data.aiCrazyPrompt || {}),
+      });
     } else {
       if (
         Object.prototype.hasOwnProperty.call(data, "aiSecretGuessActive")
@@ -311,6 +325,12 @@ export default function App() {
       ) {
         setSecretGuessReveal(data.aiSecretGuessReveal);
       }
+    }
+    if (!isNewRound && data.aiCrazyPrompt) {
+      setAiCrazyPromptState({
+        ...EMPTY_AI_CRAZY_PROMPT_STATE,
+        ...data.aiCrazyPrompt,
+      });
     }
     setRoundType(data.roundType || "normal");
     setDrawPhase(data.drawPhase || "drawing");
@@ -374,6 +394,7 @@ export default function App() {
     setSecretGuessActive(false);
     setSecretGuessPending(false);
     setSecretGuessReveal(null);
+    setAiCrazyPromptState(EMPTY_AI_CRAZY_PROMPT_STATE);
     setAdvancing(false);
   }
 
@@ -824,7 +845,21 @@ export default function App() {
     // ふつうのラウンドの答え発表。画面は止めず、トーストで知らせる
     socket.on("answerReveal", (data) => {
       if (!data?.word) return;
-      setToast(`✅ こたえは「${data.word}」！`);
+      if (data.aiCrazyPrompt) {
+        setAiCrazyPromptState({
+          ...EMPTY_AI_CRAZY_PROMPT_STATE,
+          enabled: true,
+          active: true,
+          mainAnswer: data.aiCrazyPrompt.mainAnswer || data.word,
+          fullPrompt: data.aiCrazyPrompt.fullPrompt || null,
+          promptLabel: "AIむちゃぶりお題",
+        });
+      }
+      setToast(
+        data.aiCrazyPrompt?.fullPrompt
+          ? `✅ 主役は「${data.word}」！ AIのお題は「${data.aiCrazyPrompt.fullPrompt}」`
+          : `✅ こたえは「${data.word}」！`
+      );
     });
 
     socket.on("aiSecretGuessPending", (data) => {
@@ -1603,6 +1638,12 @@ export default function App() {
             )}
           </div>
           <div className="highlight-word">{item?.word || "？？？"}</div>
+          {item?.aiCrazyPromptFullPrompt && (
+            <div className="highlight-ai-crazy">
+              <span className="gallery-ai-crazy-badge">🤖 AIむちゃぶり</span>
+              <span>{item.aiCrazyPromptFullPrompt}</span>
+            </div>
+          )}
           {drawers && <div className="highlight-drawers">{drawers}</div>}
           <div className="highlight-track">
             <div
@@ -2183,12 +2224,48 @@ export default function App() {
           {secretGuessActive && (
             <span className="mode-pill ai-secret-pill">🤖 AIひみつ予想</span>
           )}
+          {aiCrazyPromptState.active && (
+            <span className="mode-pill ai-crazy-badge">🤖 AIむちゃぶり</span>
+          )}
         </div>
-        {drawPhase === "reveal" ? (
+        {drawPhase === "reveal" && aiCrazyPromptState.active ? (
+          <div className="info-block info-answer ai-crazy-prompt-card is-reveal">
+            <div className="info-label ai-crazy-label">✅ こたえ</div>
+            <div className="ai-crazy-main">
+              <span>正解の主役</span>
+              <strong>{aiCrazyPromptState.mainAnswer || word}</strong>
+            </div>
+            <div className="ai-crazy-full">
+              <span>🤖 AIむちゃぶりお題</span>
+              <strong>{aiCrazyPromptState.fullPrompt}</strong>
+            </div>
+            <p className="hint">{drawerName}が描きました</p>
+          </div>
+        ) : drawPhase === "reveal" ? (
           <div className="info-block info-answer">
             <div className="info-label">✅ こたえ</div>
             <div className="prompt-value">{word}</div>
             <p className="hint">{drawerName}が描きました</p>
+          </div>
+        ) : aiCrazyPromptState.active && canDraw ? (
+          <div className="info-block ai-crazy-prompt-card">
+            <div className="info-label ai-crazy-label">
+              🤖 AIむちゃぶりお題
+            </div>
+            <div className="ai-crazy-full">
+              <strong>{aiCrazyPromptState.fullPrompt}</strong>
+            </div>
+            <p className="ai-crazy-sub">
+              主役の「{aiCrazyPromptState.mainAnswer}」が当たれば正解でOK！
+            </p>
+          </div>
+        ) : aiCrazyPromptState.active ? (
+          <div className="info-block ai-crazy-prompt-card is-guessing">
+            <div className="info-label ai-crazy-label">🤖 AIむちゃぶり中</div>
+            <div className="ai-crazy-full">
+              <strong>今回はAIが考えた変なお題！</strong>
+            </div>
+            <p className="ai-crazy-sub">まずは主役を当てよう！</p>
           </div>
         ) : word ? (
           <>
@@ -2286,7 +2363,10 @@ export default function App() {
       {renderAiSecretGuessReveal()}
 
       {fanfare && (
-        <div className={`fanfare fanfare-${fanfare.roundType}`} role="status">
+        <div
+          className={`fanfare fanfare-${fanfare.roundType}${fanfare.aiCrazyPrompt ? " fanfare-ai-crazy" : ""}`}
+          role="status"
+        >
           <div className="fanfare-inner">
             <div className="fanfare-text">{fanfare.message}</div>
             {fanfare.roundType === "coop" && fanfare.names?.length > 0 && (
@@ -2296,6 +2376,12 @@ export default function App() {
               <div className="fanfare-sub fanfare-constraint-sub">
                 {fanfare.constraint.emoji} {fanfare.constraint.label}
                 <span>{fanfare.constraint.rule}</span>
+              </div>
+            )}
+            {fanfare.aiCrazyPrompt && (
+              <div className="fanfare-sub ai-crazy-fanfare-sub">
+                今回はちょっと変なお題！
+                <span>まずは主役を当てよう！</span>
               </div>
             )}
           </div>
@@ -2896,6 +2982,16 @@ export default function App() {
                   </div>
                   <div className="gallery-meta">
                     <span className="gallery-word">{item.word}</span>
+                    {item.aiCrazyPromptFullPrompt && (
+                      <>
+                        <span className="gallery-ai-crazy-badge">
+                          🤖 AIむちゃぶり
+                        </span>
+                        <span className="gallery-ai-crazy-subtext">
+                          {item.aiCrazyPromptFullPrompt}
+                        </span>
+                      </>
+                    )}
                     {item.constraintLabel && (
                       <span className="gallery-constraint">
                         {item.constraintLabel}

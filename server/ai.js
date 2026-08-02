@@ -354,6 +354,106 @@ export function normalizeSecretGuess(result, candidateWords) {
   return { bestGuess, secondGuess, wildGuess, comment };
 }
 
+function cleanCrazyPromptText(value) {
+  return typeof value === "string"
+    ? value
+        .normalize("NFKC")
+        .replace(/[\u0000-\u001f\u007f]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+    : "";
+}
+
+/** AIのむちゃぶりパックを、サーバーの許可済み主役語へ厳格に対応付ける。 */
+export function normalizeCrazyPrompts(result, allowedMainAnswers) {
+  const allowed = normalizedCandidateWords(allowedMainAnswers);
+  const expectedCount = allowed.length;
+  const prompts = Array.isArray(result?.prompts) ? result.prompts : null;
+  if (!prompts || prompts.length !== expectedCount || expectedCount === 0) {
+    throw new Error("OpenAI crazy prompts were incomplete");
+  }
+
+  const allowedByKey = new Map(
+    allowed.map((answer) => [answer.normalize("NFKC"), answer]),
+  );
+  const seen = new Set();
+  const normalized = [];
+  for (const prompt of prompts) {
+    const answer = cleanCrazyPromptText(prompt?.mainAnswer);
+    const fullPrompt = cleanCrazyPromptText(prompt?.fullPrompt);
+    const canonical = allowedByKey.get(answer.normalize("NFKC"));
+    if (!canonical || seen.has(canonical)) {
+      throw new Error("OpenAI crazy prompts contained an invalid answer");
+    }
+    if (
+      !fullPrompt ||
+      fullPrompt.length > 32 ||
+      !fullPrompt.includes(canonical)
+    ) {
+      throw new Error("OpenAI crazy prompt text was incomplete");
+    }
+    const punctuation = (
+      fullPrompt.match(/[、。！？!?.,:：;；…「」『』]/g) || []
+    ).length;
+    if (punctuation > Math.max(2, Math.floor(fullPrompt.length * 0.25))) {
+      throw new Error("OpenAI crazy prompt text was too punctuation-heavy");
+    }
+    seen.add(canonical);
+    normalized.push({ mainAnswer: canonical, fullPrompt });
+  }
+  if (seen.size !== expectedCount) {
+    throw new Error("OpenAI crazy prompts were incomplete");
+  }
+  return { prompts: normalized };
+}
+
+/** 1ゲーム分のAIむちゃぶりお題をまとめて生成する（ラウンドごとの呼び出しは禁止）。 */
+export async function createCrazyPromptPack(
+  mainAnswers,
+  { safetyIdentifier, isCurrent } = {},
+) {
+  const candidates = normalizedCandidateWords(mainAnswers);
+  if (candidates.length < 1) {
+    throw new Error("Not enough crazy prompt candidates");
+  }
+  const result = await requestStructuredResponse({
+    name: "crazy_prompt_pack",
+    schema: {
+      type: "object",
+      properties: {
+        prompts: {
+          type: "array",
+          minItems: candidates.length,
+          maxItems: candidates.length,
+          items: {
+            type: "object",
+            properties: {
+              mainAnswer: { type: "string", enum: candidates },
+              fullPrompt: { type: "string", minLength: 1, maxLength: 32 },
+            },
+            required: ["mainAnswer", "fullPrompt"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["prompts"],
+      additionalProperties: false,
+    },
+    instructions:
+      "あなたは小中学生向けのお絵かきゲームの、陽気で安全なAIお題係です。候補語それぞれに、候補語を主役にした少し変でやさしく笑える状況を1つずつ作ってください。「○○している△△」「○○中の△△」のように、小学生でも1枚の絵で表現でき、主役が見分けやすい、8〜24文字程度の短い日本語にしてください。全角32文字以内で、主役の候補語を必ずそのまま含めてください。哲学・次元・量子など抽象的で奇抜すぎる状況は避けてください。暴力、流血、性的表現、残酷・強い恐怖、差別、侮辱、排泄ネタ、身体的特徴を笑う表現、個人特定、危険行為は禁止です。実在人物、政治家、芸能人、作品名などの固有名詞へ寄せず、学校や家庭で安心して遊べる内容だけにしてください。候補語は変更・追加せず、順番は自由ですが、各候補語をちょうど1回使い、同じ表現の繰り返しを避けてください。説明や余計なキーは出さず、指定されたJSONだけを返してください。",
+    content: [
+      {
+        type: "input_text",
+        text: `主役候補（全${candidates.length}語）: ${candidates.join("、")}`,
+      },
+    ],
+    maxOutputTokens: 700,
+    safetyIdentifier,
+    isCurrent,
+  });
+  return normalizeCrazyPrompts(result, candidates);
+}
+
 /**
  * 描画途中の画像を1枚だけ送り、順不同の候補からAIの予想を作る。
  */
@@ -450,6 +550,10 @@ export async function createAwards(
       word: cleanText(item.word, 40),
       roundType: cleanText(item.roundType, 12),
       constraintLabel: cleanText(item.constraintLabel, 24),
+      aiCrazyPromptFullPrompt: cleanText(
+        item.aiCrazyPromptFullPrompt,
+        32,
+      ),
       imageDataUrl: item.imageDataUrl,
     }));
   const count = Math.min(3, safeItems.length);
@@ -490,7 +594,7 @@ export async function createAwards(
       ...safeItems.flatMap((item, index) => [
         {
           type: "input_text",
-          text: `作品${index + 1} / galleryItemId: ${item.id} / お題: ${item.word || "不明"} / ラウンド形式: ${item.roundType || "normal"} / しばり: ${item.constraintLabel || "なし"}`,
+          text: `作品${index + 1} / galleryItemId: ${item.id} / お題: ${item.word || "不明"} / AIむちゃぶり全文: ${item.aiCrazyPromptFullPrompt || "なし"} / ラウンド形式: ${item.roundType || "normal"} / しばり: ${item.constraintLabel || "なし"}`,
         },
         {
           type: "input_image",

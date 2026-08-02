@@ -3,13 +3,43 @@ import test from "node:test";
 import {
   OPENAI_TEXT_MODEL,
   createAwards,
+  createCrazyPromptPack,
   createSecretGuess,
   extractResponseText,
   normalizeAwards,
+  normalizeCrazyPrompts,
   normalizeSecretGuess,
   parseImageDataUrl,
   publicAiCapabilities,
 } from "./ai.js";
+
+const crazyMainAnswers = [
+  "ペンギン",
+  "冷蔵庫",
+  "忍者",
+  "ロボット",
+  "ゴリラ",
+  "宇宙人",
+  "おばけ",
+  "消防車",
+];
+
+function crazyPrompts() {
+  const situations = [
+    "ラーメンを作る",
+    "かくれんぼ中の",
+    "遅刻して走る",
+    "温泉に入る",
+    "ダンスを踊る",
+    "宿題を忘れた",
+    "パン屋で働く",
+    "遊園地へ行く",
+  ];
+  return crazyMainAnswers.map((mainAnswer, index) => ({
+    mainAnswer,
+    fullPrompt: `${situations[index]}${mainAnswer}`,
+  }));
+}
 
 function dataUrl(mimeType, bytes) {
   return `data:${mimeType};base64,${Buffer.from(bytes).toString("base64")}`;
@@ -485,6 +515,212 @@ test("createSecretGuess rejects refusal, broken JSON, and incomplete responses",
     );
   } finally {
     globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = originalKey;
+  }
+});
+
+test("normalizeCrazyPrompts returns eight safe normalized prompts", () => {
+  const prompts = crazyPrompts();
+  prompts[0] = {
+    mainAnswer: "\u0000 ペンギン ",
+    fullPrompt: "  ラーメンを作る\n\tペンギン  ",
+    ignoredByServer: "extra",
+  };
+
+  const normalized = normalizeCrazyPrompts({ prompts }, crazyMainAnswers);
+  assert.equal(normalized.prompts.length, 8);
+  assert.deepEqual(normalized.prompts[0], {
+    mainAnswer: "ペンギン",
+    fullPrompt: "ラーメンを作る ペンギン",
+  });
+  assert.equal("ignoredByServer" in normalized.prompts[0], false);
+  assert.deepEqual(
+    new Set(normalized.prompts.map((prompt) => prompt.mainAnswer)),
+    new Set(crazyMainAnswers),
+  );
+});
+
+test("normalizeCrazyPrompts rejects an answer outside the allowlist", () => {
+  const prompts = crazyPrompts();
+  prompts[0] = {
+    mainAnswer: "ドラゴン",
+    fullPrompt: "ケーキを作るドラゴン",
+  };
+  assert.throws(
+    () => normalizeCrazyPrompts({ prompts }, crazyMainAnswers),
+    /invalid answer|incomplete/,
+  );
+});
+
+test("normalizeCrazyPrompts rejects duplicate answers", () => {
+  const prompts = crazyPrompts();
+  prompts[7] = {
+    mainAnswer: "ペンギン",
+    fullPrompt: "遊園地へ行くペンギン",
+  };
+  assert.throws(
+    () => normalizeCrazyPrompts({ prompts }, crazyMainAnswers),
+    /invalid answer|incomplete/,
+  );
+});
+
+test("normalizeCrazyPrompts rejects too few prompts", () => {
+  assert.throws(
+    () =>
+      normalizeCrazyPrompts(
+        { prompts: crazyPrompts().slice(0, 7) },
+        crazyMainAnswers,
+      ),
+    /incomplete/,
+  );
+});
+
+test("normalizeCrazyPrompts rejects too many prompts", () => {
+  assert.throws(
+    () =>
+      normalizeCrazyPrompts(
+        {
+          prompts: [
+            ...crazyPrompts(),
+            { mainAnswer: "ペンギン", fullPrompt: "空を飛ぶペンギン" },
+          ],
+        },
+        crazyMainAnswers,
+      ),
+    /incomplete/,
+  );
+});
+
+test("normalizeCrazyPrompts rejects an empty fullPrompt", () => {
+  const prompts = crazyPrompts();
+  prompts[0] = { mainAnswer: "ペンギン", fullPrompt: " \n\t " };
+  assert.throws(
+    () => normalizeCrazyPrompts({ prompts }, crazyMainAnswers),
+    /incomplete/,
+  );
+});
+
+test("normalizeCrazyPrompts rejects a fullPrompt longer than 32 characters", () => {
+  const prompts = crazyPrompts();
+  prompts[0] = {
+    mainAnswer: "ペンギン",
+    fullPrompt: `${"とても".repeat(12)}ペンギン`,
+  };
+  assert.equal(prompts[0].fullPrompt.length > 32, true);
+  assert.throws(
+    () => normalizeCrazyPrompts({ prompts }, crazyMainAnswers),
+    /incomplete/,
+  );
+});
+
+test("createCrazyPromptPack sends one private text-only structured request", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.OPENAI_API_KEY;
+  const requests = [];
+  process.env.OPENAI_API_KEY = "crazy-api-key-must-not-enter-body";
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return new Response(
+      JSON.stringify({
+        status: "completed",
+        output: [
+          {
+            type: "message",
+            content: [
+              {
+                type: "output_text",
+                text: JSON.stringify({ prompts: crazyPrompts() }),
+              },
+            ],
+          },
+        ],
+      }),
+      { status: 200, headers: { "x-request-id": "req_crazy_prompt" } },
+    );
+  };
+
+  try {
+    const result = await createCrazyPromptPack(crazyMainAnswers, {
+      safetyIdentifier: "safe-crazy-player",
+      isCurrent: () => true,
+      // 呼び出し側が余分な個人・部屋情報を渡しても本文へ混入させない。
+      participantName: "秘密の花子",
+      roomCode: "CRAZY42",
+      playerId: "crazy-private-player-id",
+    });
+
+    assert.equal(result.prompts.length, 8);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url, "https://api.openai.com/v1/responses");
+
+    const body = JSON.parse(requests[0].options.body);
+    assert.equal(body.model, OPENAI_TEXT_MODEL);
+    assert.equal(body.store, false);
+    assert.equal(body.reasoning.effort, "none");
+    assert.equal(body.text.verbosity, "low");
+    assert.equal(body.text.format.type, "json_schema");
+    assert.equal(body.text.format.strict, true);
+    assert.equal(body.text.format.name, "crazy_prompt_pack");
+    assert.equal(body.max_output_tokens >= 500, true);
+    assert.equal(body.max_output_tokens <= 800, true);
+    assert.equal(body.safety_identifier, "safe-crazy-player");
+
+    const schema = body.text.format.schema;
+    assert.equal(schema.additionalProperties, false);
+    assert.equal(schema.properties.prompts.minItems, 8);
+    assert.equal(schema.properties.prompts.maxItems, 8);
+    assert.deepEqual(
+      schema.properties.prompts.items.properties.mainAnswer.enum,
+      crazyMainAnswers,
+    );
+    assert.equal(
+      schema.properties.prompts.items.additionalProperties,
+      false,
+    );
+
+    const serializedBody = JSON.stringify(body);
+    assert.equal(
+      crazyMainAnswers.every((answer) => serializedBody.includes(answer)),
+      true,
+    );
+    assert.equal(serializedBody.includes("秘密の花子"), false);
+    assert.equal(serializedBody.includes("CRAZY42"), false);
+    assert.equal(serializedBody.includes("crazy-private-player-id"), false);
+    assert.equal(
+      serializedBody.includes("crazy-api-key-must-not-enter-body"),
+      false,
+    );
+    assert.equal(
+      body.input[0].content.every((part) => part.type === "input_text"),
+      true,
+    );
+
+    assert.match(body.instructions, /小中学生向け/);
+    assert.match(body.instructions, /主役/);
+    assert.match(body.instructions, /変更・追加せず/);
+    assert.match(body.instructions, /暴力/);
+    assert.match(body.instructions, /性的表現/);
+    assert.match(body.instructions, /差別/);
+    assert.match(body.instructions, /禁止/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = originalKey;
+  }
+});
+
+test("publicAiCapabilities never exposes the API key", () => {
+  const originalKey = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = "public-capability-secret-key";
+  try {
+    const capabilities = publicAiCapabilities();
+    assert.equal(capabilities.enabled, true);
+    assert.equal(
+      JSON.stringify(capabilities).includes("public-capability-secret-key"),
+      false,
+    );
+  } finally {
     if (originalKey === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = originalKey;
   }

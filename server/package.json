@@ -11,6 +11,7 @@
     "dev:gradual": "node --watch dev-gradual.js",
     "dev:constraint": "node --watch dev-constraint.js",
     "dev:ai-secret": "node --watch dev-ai-secret.js",
+    "dev:ai-crazy-prompt": "node --watch dev-ai-crazy-prompt.js",
     "start": "node index.js",
     "test": "node --test"
   },

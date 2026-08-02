@@ -1290,6 +1290,28 @@ input:focus {
     0 0 32px rgba(124, 82, 190, 0.34);
 }
 
+.fanfare-ai-crazy .fanfare-text {
+  background:
+    radial-gradient(circle at 88% 12%, rgba(255, 255, 255, 0.8), transparent 24%),
+    linear-gradient(135deg, #ffe5a8, #ffc4de 58%, #dcd1ff);
+  color: #67215c;
+  border-color: #4d2548;
+  box-shadow:
+    6px 8px 0 rgba(43, 36, 28, 0.24),
+    0 0 34px rgba(255, 126, 181, 0.38);
+}
+
+.ai-crazy-fanfare-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 0.12rem;
+  font-size: 1.05rem;
+}
+
+.ai-crazy-fanfare-sub span {
+  font-size: 0.9rem;
+}
+
 .fanfare-constraint-sub {
   display: flex;
   flex-direction: column;
@@ -1299,6 +1321,73 @@ input:focus {
 
 .fanfare-constraint-sub span {
   font-size: 0.92rem;
+}
+
+/* —— AIむちゃぶりお題 —— */
+.ai-crazy-badge,
+.gallery-ai-crazy-badge {
+  color: #67215c;
+  background: linear-gradient(105deg, #fff0b8, #ffd0e4);
+  border-color: #a24b82;
+  letter-spacing: 0.01em;
+}
+
+.ai-crazy-prompt-card {
+  border-color: #a24b82;
+  background:
+    radial-gradient(circle at 92% 10%, rgba(255, 201, 60, 0.35), transparent 25%),
+    linear-gradient(135deg, #fffaf0, #fff0f7);
+  box-shadow: 3px 4px 0 rgba(162, 75, 130, 0.18);
+}
+
+.ai-crazy-label {
+  color: #792a68;
+}
+
+.ai-crazy-full,
+.ai-crazy-main {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.15rem;
+  text-align: center;
+}
+
+.ai-crazy-full > span,
+.ai-crazy-main > span {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 900;
+}
+
+.ai-crazy-full strong {
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  color: #59224f;
+  font-size: clamp(1.3rem, 6vw, 2rem);
+  line-height: 1.35;
+}
+
+.ai-crazy-main strong {
+  color: var(--paint-coral);
+  font-size: clamp(1.55rem, 7vw, 2.2rem);
+}
+
+.ai-crazy-prompt-card.is-reveal {
+  gap: 0.55rem;
+}
+
+.ai-crazy-prompt-card.is-reveal .ai-crazy-full {
+  width: 100%;
+  padding-top: 0.45rem;
+  border-top: 2px dashed rgba(162, 75, 130, 0.35);
+}
+
+.ai-crazy-sub {
+  margin: 0.35rem 0 0;
+  color: #67215c;
+  font-size: 0.82rem;
+  font-weight: 900;
+  text-align: center;
 }
 
 /* —— AIのひみつ予想 —— */
@@ -1677,6 +1766,21 @@ input:focus {
   color: #ffe9b8;
 }
 
+.highlight-ai-crazy {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.25rem;
+  color: #fff4c9;
+  font-size: 0.82rem;
+  font-weight: 900;
+  text-align: center;
+}
+
+.highlight-ai-crazy .gallery-ai-crazy-badge {
+  margin-left: 0;
+}
+
 .highlight-track {
   width: 100%;
   height: 8px;
@@ -1779,6 +1883,7 @@ input:focus {
 
 .gallery-meta {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.25rem;
   padding: 0.35rem 0.45rem 0.1rem;
@@ -1849,6 +1954,29 @@ input:focus {
   place-items: center;
   font-weight: 900;
   color: var(--paint-coral);
+}
+
+.gallery-ai-crazy-badge {
+  flex-shrink: 0;
+  margin-left: auto;
+  padding: 0.06rem 0.34rem;
+  border: 2px solid #a24b82;
+  border-radius: 999px;
+  font-size: 0.62rem;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.gallery-ai-crazy-subtext {
+  flex: 0 0 100%;
+  min-width: 0;
+  overflow: hidden;
+  color: #67215c;
+  font-size: 0.66rem;
+  font-weight: 800;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* —— みんなで決める3大賞 —— */

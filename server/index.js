@@ -14,6 +14,7 @@ import { Server } from "socket.io";
 import {
   aiErrorLogDetails,
   createAwards,
+  createCrazyPromptPack,
   createSecretGuess,
   isAiConfigured,
   parseImageDataUrl,
@@ -30,7 +31,12 @@ import {
   buildSecretGuessReveal,
   secretGuessFallbackKind,
 } from "./secret-guess.js";
-import { randomWord } from "./words.js";
+import {
+  selectCrazyPromptMainAnswers,
+  shouldEnableAiCrazyPrompt,
+  takeNextCrazyPrompt,
+} from "./ai-crazy-prompt.js";
+import { WORDS, randomWord } from "./words.js";
 
 const PORT = process.env.PORT || 3001;
 const MAX_ROOMS = 100;
@@ -101,6 +107,12 @@ const AI_SECRET_GUESS_MAX_PER_GAME = Math.min(
       : 2,
   ),
 );
+const AI_CRAZY_PROMPT_MIN_GAP = 4;
+const AI_CRAZY_PROMPT_FORCE_GAP = 8;
+const AI_CRAZY_PROMPT_CHANCE = 0.25;
+const AI_CRAZY_PROMPT_MAX_PER_GAME = 2;
+const AI_CRAZY_PROMPT_PACK_SIZE = 8;
+const FORCE_AI_CRAZY_PROMPT = process.env.FORCE_AI_CRAZY_PROMPT === "1";
 const MAX_GALLERY_DATA_URL_LEN = 400_000;
 const MAX_TOTAL_GALLERY_DATA_URL_LEN = 80_000_000;
 const MAX_STROKES = 20_000;
@@ -112,6 +124,10 @@ const AI_RATE_LIMITS = {
   secretGuess: Math.max(
     1,
     Number(process.env.AI_SECRET_GUESS_RATE_LIMIT) || 30,
+  ),
+  crazyPromptPack: Math.max(
+    1,
+    Number(process.env.AI_CRAZY_PROMPT_RATE_LIMIT) || 12,
   ),
 };
 const AI_GLOBAL_RATE_LIMITS = {
@@ -126,6 +142,10 @@ const AI_GLOBAL_RATE_LIMITS = {
   secretGuess: Math.max(
     1,
     Number(process.env.AI_GLOBAL_SECRET_GUESS_RATE_LIMIT) || 120,
+  ),
+  crazyPromptPack: Math.max(
+    1,
+    Number(process.env.AI_GLOBAL_CRAZY_PROMPT_RATE_LIMIT) || 50,
   ),
 };
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -194,6 +214,8 @@ const io = new Server(httpServer, {
  *  createdAt: number,
  *  gameSeq: number,
  *  hasDrawing: boolean,
+ *  aiCrazyPromptMainAnswer: string,
+ *  aiCrazyPromptFullPrompt: string,
  * }} GalleryItem
  */
 /**
@@ -270,6 +292,15 @@ const io = new Server(httpServer, {
  *  aiSecretGuessAnswerRevealed: boolean,
  *  aiSecretGuessCount: number,
  *  aiSecretGuessLastRoundNumber: number | null,
+ *  aiCrazyPromptPackStatus: 'idle' | 'generating' | 'ready' | 'failed',
+ *  aiCrazyPromptPack: { id: string, mainAnswer: string, fullPrompt: string, used: boolean }[],
+ *  aiCrazyPromptEnabled: boolean,
+ *  currentAiCrazyPrompt: { id: string, mainAnswer: string, fullPrompt: string } | null,
+ *  aiCrazyPromptSelectedThisRound: boolean,
+ *  roundsSinceAiCrazyPrompt: number,
+ *  aiCrazyPromptUsedCount: number,
+ *  aiCrazyPromptLastRoundNumber: number | null,
+ *  aiCrazyPromptToken: number,
  * }} Room
  */
 
@@ -696,6 +727,106 @@ function logAiFailure(kind, error) {
   console.error(`[ai] ${kind} failed`, aiErrorLogDetails(error));
 }
 
+function resetAiCrazyPromptForNewGame(room) {
+  room.aiCrazyPromptToken += 1;
+  room.aiCrazyPromptPackStatus = "idle";
+  room.aiCrazyPromptPack = [];
+  room.currentAiCrazyPrompt = null;
+  room.aiCrazyPromptSelectedThisRound = false;
+  room.roundsSinceAiCrazyPrompt = 0;
+  room.aiCrazyPromptUsedCount = 0;
+  room.aiCrazyPromptLastRoundNumber = null;
+  room.aiCrazyPromptEnabled = isAiConfigured();
+}
+
+function startAiCrazyPromptPackGeneration(room, playerId) {
+  if (
+    !room.aiCrazyPromptEnabled ||
+    !isAiConfigured() ||
+    room.aiCrazyPromptPackStatus !== "idle"
+  ) {
+    return;
+  }
+  const socket = room.players.get(playerId)?.socketId
+    ? io.sockets.sockets.get(room.players.get(playerId).socketId)
+    : null;
+  if (!socket || !consumeAiQuota(socket, "crazyPromptPack")) {
+    room.aiCrazyPromptPackStatus = "failed";
+    return;
+  }
+
+  const gameSeq = room.gameSeq;
+  const token = room.aiCrazyPromptToken + 1;
+  room.aiCrazyPromptToken = token;
+  room.aiCrazyPromptPackStatus = "generating";
+  const candidates = selectCrazyPromptMainAnswers(
+    WORDS,
+    AI_CRAZY_PROMPT_PACK_SIZE,
+  );
+  if (candidates.length < AI_CRAZY_PROMPT_PACK_SIZE) {
+    room.aiCrazyPromptPackStatus = "failed";
+    return;
+  }
+  const isCurrent = () => {
+    const current = rooms.get(room.code);
+    return (
+      current === room &&
+      current.gameSeq === gameSeq &&
+      current.aiCrazyPromptToken === token &&
+      current.aiCrazyPromptPackStatus === "generating"
+    );
+  };
+  void createCrazyPromptPack(candidates, {
+    safetyIdentifier: aiSafetyIdentifier(playerId),
+    isCurrent,
+  })
+    .then((result) => {
+      if (!isCurrent()) return;
+      room.aiCrazyPromptPack = result.prompts.map((prompt, index) => ({
+        id: `crazy-${gameSeq}-${index}-${randomUUID().slice(0, 8)}`,
+        mainAnswer: prompt.mainAnswer,
+        fullPrompt: prompt.fullPrompt,
+        used: false,
+      }));
+      room.aiCrazyPromptPackStatus = "ready";
+    })
+    .catch((error) => {
+      if (!isCurrent()) return;
+      room.aiCrazyPromptPackStatus = "failed";
+      room.aiCrazyPromptPack = [];
+      logAiFailure("crazy prompt pack", error);
+    });
+}
+
+function maybeApplyAiCrazyPrompt(room) {
+  const enabled = shouldEnableAiCrazyPrompt({
+    enabled: room.aiCrazyPromptEnabled,
+    configured: isAiConfigured(),
+    packStatus: room.aiCrazyPromptPackStatus,
+    roundType: room.roundType,
+    constraint: room.constraint,
+    completedRounds: room.completedRounds,
+    roundsSinceAiCrazyPrompt: room.roundsSinceAiCrazyPrompt,
+    hasPreviousPrompt: room.aiCrazyPromptLastRoundNumber !== null,
+    usedCount: room.aiCrazyPromptUsedCount,
+    maxPerGame: AI_CRAZY_PROMPT_MAX_PER_GAME,
+    minGap: AI_CRAZY_PROMPT_MIN_GAP,
+    forceGap: AI_CRAZY_PROMPT_FORCE_GAP,
+    chance: AI_CRAZY_PROMPT_CHANCE,
+    force: FORCE_AI_CRAZY_PROMPT,
+  });
+  if (!enabled) return false;
+  const next = takeNextCrazyPrompt(room);
+  if (!next) return false;
+  room.currentAiCrazyPrompt = next;
+  room.aiCrazyPromptSelectedThisRound = true;
+  room.word = next.mainAnswer;
+  room.aiCrazyPromptUsedCount += 1;
+  room.roundsSinceAiCrazyPrompt = 0;
+  room.aiCrazyPromptLastRoundNumber = room.roundSeq;
+  return true;
+}
+
 function clearAiSecretGuessTimer(room) {
   if (room.aiSecretGuessTimer) {
     clearTimeout(room.aiSecretGuessTimer);
@@ -754,7 +885,8 @@ function shouldArmAiSecretGuess(room) {
     !isAiConfigured() ||
     !AI_SECRET_GUESS_ENABLED ||
     room.roundType !== "normal" ||
-    room.constraint
+    room.constraint ||
+    room.currentAiCrazyPrompt
   ) {
     return false;
   }
@@ -1250,6 +1382,24 @@ function canRevealLiar(room, playerId) {
   return room.drawerIds.includes(playerId) || room.hostId === playerId;
 }
 
+function buildAiCrazyPromptPublicState(room, playerId) {
+  const active = Boolean(
+    room.aiCrazyPromptEnabled &&
+      room.currentAiCrazyPrompt &&
+      room.roundType === "normal" &&
+      room.phase === "playing",
+  );
+  const reveal = room.drawPhase === "reveal";
+  const canSee = active && (reveal || room.drawerId === playerId);
+  return {
+    enabled: Boolean(room.aiCrazyPromptEnabled),
+    active,
+    mainAnswer: canSee ? room.currentAiCrazyPrompt.mainAnswer : null,
+    fullPrompt: canSee ? room.currentAiCrazyPrompt.fullPrompt : null,
+    promptLabel: active ? "AIむちゃぶりお題" : null,
+  };
+}
+
 function buildRoundPayload(room, playerId) {
   const players = publicPlayers(room);
   const currentDrawer = room.drawerId
@@ -1277,6 +1427,7 @@ function buildRoundPayload(room, playerId) {
     word: seesWord ? room.word : null,
     canDraw: canPlayerDraw(room, playerId),
     canSeeWord: seesWord,
+    aiCrazyPrompt: buildAiCrazyPromptPublicState(room, playerId),
     canNextRound: canPlayerNextRound(room, playerId),
     turnEndsAt: room.turnEndsAt,
     turnDurationSec:
@@ -1334,10 +1485,13 @@ function emitRoundStart(room, { clear = false, fanfare = false } = {}) {
   const aiSecretGuessActive =
     isCurrentAiSecretGuessRound(room) &&
     room.aiSecretGuessStatus === "armed";
-  if (fanfare || aiSecretGuessActive) {
+  const aiCrazyPromptActive = Boolean(room.currentAiCrazyPrompt);
+  if (fanfare || aiSecretGuessActive || aiCrazyPromptActive) {
     const constraint = room.constraint;
     const message = constraint
       ? "🎲 しばりルーレット！"
+      : aiCrazyPromptActive
+        ? "🤖 AIからのむちゃぶり！"
       : aiSecretGuessActive
         ? "🤖 AIがこっそり予想します！"
       : room.roundType === "relay"
@@ -1357,12 +1511,15 @@ function emitRoundStart(room, { clear = false, fanfare = false } = {}) {
       io.to(room.code).emit("roundFanfare", {
         roundType: constraint
           ? "constraint"
+          : aiCrazyPromptActive
+            ? "normal"
           : aiSecretGuessActive
             ? "ai-secret"
             : room.roundType,
         message,
         names,
         constraint: constraint || null,
+        aiCrazyPrompt: aiCrazyPromptActive,
       });
     }
   }
@@ -1465,6 +1622,8 @@ function scheduleTimedDrawing(room, ms) {
 function resetRoundFields(room) {
   clearTurnTimer(room);
   resetAiSecretGuessRound(room);
+  room.currentAiCrazyPrompt = null;
+  room.aiCrazyPromptSelectedThisRound = false;
   room.roundType = "normal";
   room.drawPhase = "drawing";
   room.drawerId = null;
@@ -1528,7 +1687,19 @@ function passWord(room) {
   const drawerName = room.players.get(drawerId)?.name || "";
   const previousAiSecretGuessStatus = room.aiSecretGuessStatus;
   room.passesUsed += 1;
-  room.word = pickWord(room);
+  const wasCrazy = Boolean(room.currentAiCrazyPrompt);
+  if (wasCrazy) {
+    const nextCrazy = takeNextCrazyPrompt(room);
+    if (nextCrazy) {
+      room.currentAiCrazyPrompt = nextCrazy;
+      room.word = nextCrazy.mainAnswer;
+    } else {
+      room.currentAiCrazyPrompt = null;
+      room.word = pickWord(room);
+    }
+  } else {
+    room.word = pickWord(room);
+  }
   room.strokes = [];
   room.strokeCounts = new Map();
   room.seenWordIds = new Set([drawerId]);
@@ -1591,6 +1762,7 @@ function startRound(room) {
       room.drawerId = drawer.id;
       room.drawerIds = [drawer.id];
       room.seenWordIds = new Set([drawer.id]);
+      maybeApplyAiCrazyPrompt(room);
       armAiSecretGuessForRound(room);
       emitRoundStart(room, { clear: true, fanfare: false });
       return;
@@ -1669,6 +1841,7 @@ function startRound(room) {
   room.drawerIds = [drawer.id];
   room.seenWordIds = new Set([drawer.id]);
   room.drawPhase = "drawing";
+  maybeApplyAiCrazyPrompt(room);
   if (room.constraint?.kind === "time") {
     scheduleTimedDrawing(room, room.constraint.value * 1000);
   }
@@ -1750,6 +1923,7 @@ function removePlayer(room, playerId) {
   if (room.players.size === 0) {
     clearTurnTimer(room);
     clearAiSecretGuessTimer(room);
+    room.aiCrazyPromptToken += 1;
     clearCommunityAwardsTimer(room);
     rooms.delete(room.code);
     return;
@@ -1784,6 +1958,7 @@ function removePlayer(room, playerId) {
     resetGameProgress(room);
     room.drawerStreak = null;
     resetAiWhenReturningToLobby(room);
+    resetAiCrazyPromptForNewGame(room);
     resetCommunityAwards(room);
     io.to(room.code).emit("clearCanvas");
     io.to(room.code).emit("gameEnded", { reason: "alone" });
@@ -1986,6 +2161,8 @@ function addGalleryItem(
     roundType,
     constraintLabel = "",
     hasDrawing = false,
+    aiCrazyPromptMainAnswer = "",
+    aiCrazyPromptFullPrompt = "",
   },
 ) {
   if (
@@ -2009,6 +2186,14 @@ function addGalleryItem(
     createdAt: Date.now(),
     gameSeq: room.gameSeq,
     hasDrawing: Boolean(hasDrawing),
+    aiCrazyPromptMainAnswer: String(aiCrazyPromptMainAnswer || "").slice(
+      0,
+      24,
+    ),
+    aiCrazyPromptFullPrompt: String(aiCrazyPromptFullPrompt || "").slice(
+      0,
+      32,
+    ),
   };
   room.gallery.push(item);
   trimGallery(room);
@@ -2084,6 +2269,15 @@ function createEmptyRoom(code, hostId) {
     aiSecretGuessAnswerRevealed: false,
     aiSecretGuessCount: 0,
     aiSecretGuessLastRoundNumber: null,
+    aiCrazyPromptPackStatus: "idle",
+    aiCrazyPromptPack: [],
+    aiCrazyPromptEnabled: isAiConfigured(),
+    currentAiCrazyPrompt: null,
+    aiCrazyPromptSelectedThisRound: false,
+    roundsSinceAiCrazyPrompt: 0,
+    aiCrazyPromptUsedCount: 0,
+    aiCrazyPromptLastRoundNumber: null,
+    aiCrazyPromptToken: 0,
   };
 }
 
@@ -2289,12 +2483,14 @@ io.on("connection", (socket) => {
     room.gameSeq += 1;
     resetAiForNewGame(room);
     resetAiSecretGuessForNewGame(room);
+    resetAiCrazyPromptForNewGame(room);
     resetCommunityAwards(room);
     room.totalRounds = chooseTotalRounds(activeCount);
     room.completedRounds = 0;
     room.drawCounts = new Map();
     room.lastCompletedRoundSeq = null;
     startRound(room);
+    startAiCrazyPromptPackGeneration(room, playerId);
     emitAiState(room);
     emitCommunityAwardsState(room);
     reply(cb, { ok: true, totalRounds: room.totalRounds });
@@ -2557,7 +2753,12 @@ io.on("connection", (socket) => {
     // 時間しばりのカウントダウンが残っていても、ここで描く時間は終わり
     clearTurnTimer(room);
     room.drawPhase = "reveal";
-    io.to(code).emit("answerReveal", { word: room.word });
+    io.to(code).emit("answerReveal", {
+      word: room.word,
+      aiCrazyPrompt: room.currentAiCrazyPrompt
+        ? { ...room.currentAiCrazyPrompt }
+        : null,
+    });
     emitRoundSync(room);
     revealAiSecretGuessAfterAnswer(room);
     reply(cb, { ok: true });
@@ -2649,6 +2850,8 @@ io.on("connection", (socket) => {
     const constraintLabel = constraint
       ? `${constraint.emoji} ${constraint.label}`
       : "";
+    const aiCrazyPrompt = room.currentAiCrazyPrompt;
+    const wasAiCrazyPromptRound = room.aiCrazyPromptSelectedThisRound;
     // 白紙は授賞式の候補から外す
     const drawn = hasVisibleDrawing(room.strokes);
 
@@ -2660,6 +2863,8 @@ io.on("connection", (socket) => {
         roundType,
         constraintLabel,
         hasDrawing: drawn,
+        aiCrazyPromptMainAnswer: aiCrazyPrompt?.mainAnswer || "",
+        aiCrazyPromptFullPrompt: aiCrazyPrompt?.fullPrompt || "",
       });
     }
 
@@ -2669,6 +2874,11 @@ io.on("connection", (socket) => {
     );
     room.lastCompletedRoundSeq = room.roundSeq;
     room.completedRounds += 1;
+    if (wasAiCrazyPromptRound) {
+      room.roundsSinceAiCrazyPrompt = 0;
+    } else {
+      room.roundsSinceAiCrazyPrompt += 1;
+    }
     if (room.completedRounds >= room.totalRounds) {
       finishGame(room);
       reply(cb, { ok: true, finished: true });
@@ -2743,6 +2953,7 @@ io.on("connection", (socket) => {
     resetGameProgress(room);
     room.drawerStreak = null;
     resetAiWhenReturningToLobby(room);
+    resetAiCrazyPromptForNewGame(room);
     resetCommunityAwards(room);
     io.to(code).emit("clearCanvas");
     io.to(code).emit("gameEnded");
@@ -2919,6 +3130,7 @@ io.on("connection", (socket) => {
       word: item.word,
       roundType: item.roundType,
       constraintLabel: item.constraintLabel,
+      aiCrazyPromptFullPrompt: item.aiCrazyPromptFullPrompt,
       imageDataUrl: item.imageDataUrl,
     }));
     if (candidates.length < 2) {
