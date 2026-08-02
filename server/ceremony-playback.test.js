@@ -8,9 +8,10 @@ import {
   isCeremonyPlaybackAvailable,
   isCeremonyPlaybackInProgress,
   normalizeCeremonyPlayback,
+  transitionCeremonyPlayback,
 } from "../shared/ceremony-playback.js";
 
-test("AI授賞式の共通開始時刻と総時間を作る", () => {
+test("AI授賞式をopeningから開始する", () => {
   const playback = createCeremonyPlayback({
     kind: "ai",
     gameSeq: 3,
@@ -24,56 +25,89 @@ test("AI授賞式の共通開始時刻と総時間を作る", () => {
     gameSeq: 3,
     awardCount: 2,
     runId: 7,
+    phase: "opening",
+    index: 0,
     startedAt: 10_800,
-    expiresAt: 57_000,
+    nextAt: 12_600,
   });
-  assert.equal(ceremonyPlaybackDuration("ai", 2), 16_200);
-  assert.equal(ceremonyPlaybackFinaleAt(playback), 27_000);
+  assert.equal(ceremonyPlaybackDuration("ai", 2), 6_200);
+  assert.equal(ceremonyPlaybackFinaleAt(playback), 0);
 });
 
-test("絶対時刻から全端末共通の発表位置を復元する", () => {
-  const playback = {
+test("短い自動演出の後は、ホスト操作まで受賞作で停止する", () => {
+  const opening = createCeremonyPlayback({
     kind: "community",
     gameSeq: 1,
     awardCount: 2,
     runId: 1,
-    startedAt: 1_000,
-    expiresAt: 48_100,
-  };
+    now: 1_000,
+    leadMs: 0,
+  });
 
-  assert.deepEqual(ceremonyPlaybackPosition(playback, 999).ceremony, null);
-  assert.deepEqual(ceremonyPlaybackPosition(playback, 1_000).ceremony, {
+  assert.deepEqual(ceremonyPlaybackPosition(opening, 999).ceremony, null);
+  assert.deepEqual(ceremonyPlaybackPosition(opening, 1_850).ceremony, {
     phase: "opening",
     index: 0,
-    progress: 0,
+    progress: 0.5,
   });
-  assert.deepEqual(ceremonyPlaybackPosition(playback, 2_700).ceremony, {
+
+  const firstDrumroll = transitionCeremonyPlayback(opening, {
+    trigger: "timer",
+    now: opening.nextAt,
+  });
+  assert.deepEqual(ceremonyPlaybackPosition(firstDrumroll, 3_750).ceremony, {
     phase: "drumroll",
     index: 0,
-    progress: 0,
+    progress: 0.5,
   });
-  assert.deepEqual(ceremonyPlaybackPosition(playback, 4_800).ceremony, {
+  const firstReveal = transitionCeremonyPlayback(firstDrumroll, {
+    trigger: "timer",
+    now: firstDrumroll.nextAt,
+  });
+  assert.equal(firstReveal.phase, "reveal");
+  assert.equal(firstReveal.index, 0);
+  assert.equal(firstReveal.nextAt, null);
+
+  // 30秒以上たっても自動では次へ進まず、同じ受賞作へ復帰できる。
+  assert.deepEqual(ceremonyPlaybackPosition(firstReveal, 100_000).ceremony, {
     phase: "reveal",
     index: 0,
-    progress: 0,
-  });
-  assert.deepEqual(ceremonyPlaybackPosition(playback, 10_400).ceremony, {
-    phase: "drumroll",
-    index: 1,
-    progress: 0,
-  });
-  assert.deepEqual(ceremonyPlaybackPosition(playback, 18_100).ceremony, {
-    phase: "finale",
-    index: 1,
     progress: 1,
   });
-  assert.equal(isCeremonyPlaybackInProgress(playback, 18_099), true);
-  assert.equal(isCeremonyPlaybackInProgress(playback, 18_100), false);
-  assert.equal(isCeremonyPlaybackAvailable(playback, 48_099), true);
-  assert.equal(isCeremonyPlaybackAvailable(playback, 48_100), false);
+  assert.equal(isCeremonyPlaybackInProgress(firstReveal), true);
+  assert.equal(isCeremonyPlaybackAvailable(firstReveal), true);
+
+  const secondDrumroll = transitionCeremonyPlayback(firstReveal, {
+    trigger: "host",
+    now: 100_000,
+  });
+  assert.equal(secondDrumroll.phase, "drumroll");
+  assert.equal(secondDrumroll.index, 1);
+  const secondReveal = transitionCeremonyPlayback(secondDrumroll, {
+    trigger: "timer",
+    now: secondDrumroll.nextAt,
+  });
+  const finale = transitionCeremonyPlayback(secondReveal, {
+    trigger: "host",
+    now: 110_000,
+  });
+  assert.equal(finale.phase, "finale");
+  assert.equal(finale.index, 1);
+  assert.equal(isCeremonyPlaybackInProgress(finale), false);
+  assert.equal(ceremonyPlaybackFinaleAt(finale), 110_000);
 });
 
-test("壊れた上映データは拒否する", () => {
+test("違うphaseの操作と壊れた上映データは拒否する", () => {
+  const opening = createCeremonyPlayback({
+    kind: "ai",
+    gameSeq: 1,
+    awardCount: 3,
+    runId: 1,
+  });
+  assert.equal(
+    transitionCeremonyPlayback(opening, { trigger: "host" }),
+    null,
+  );
   assert.equal(normalizeCeremonyPlayback(null), null);
   assert.equal(
     normalizeCeremonyPlayback({
@@ -81,8 +115,10 @@ test("壊れた上映データは拒否する", () => {
       gameSeq: 1,
       awardCount: 3,
       runId: 1,
+      phase: "opening",
+      index: 0,
       startedAt: 1,
-      expiresAt: 100_000,
+      nextAt: 2,
     }),
     null,
   );

@@ -260,6 +260,7 @@ export default function App() {
   const queuedSecretGuessRevealRef = useRef(null);
   const highlightCloseButtonRef = useRef(null);
   const highlightPreviousFocusRef = useRef(null);
+  const highlightTouchStartRef = useRef(null);
   /** 自分だけ閉じた上映は、同じrunIdの同期更新で開き直さない。 */
   const dismissedCeremonyRunRef = useRef(null);
   /** 再接続・ギャラリー表示中でも未処理の画像依頼を失わないための箱 */
@@ -332,7 +333,7 @@ export default function App() {
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [returnScreen, setReturnScreen] = useState("lobby");
   const [aiState, setAiState] = useState(EMPTY_AI_STATE);
-  /** 今日のハイライト: { ids: string[], index: number } */
+  /** 今日のハイライト: 自動ダイジェスト後は各端末で自由に見返す。 */
   const [highlight, setHighlight] = useState(null);
   /** AI授賞式: { phase: 'opening' | 'drumroll' | 'reveal' | 'finale', index: number } */
   const [awardCeremony, setAwardCeremony] = useState(null);
@@ -351,6 +352,7 @@ export default function App() {
   const [ceremonyPlayback, setCeremonyPlayback] = useState(null);
   const [ceremonyPlaybackRunning, setCeremonyPlaybackRunning] =
     useState(false);
+  const [ceremonyAdvanceBusy, setCeremonyAdvanceBusy] = useState(false);
   const [secretGuessActive, setSecretGuessActive] = useState(false);
   const [secretGuessPending, setSecretGuessPending] = useState(false);
   const [secretGuessReveal, setSecretGuessReveal] = useState(null);
@@ -394,7 +396,7 @@ export default function App() {
     const payloadRoundId = data.roundId ?? null;
     const shouldShowAnswerCelebration = Boolean(
       data.drawPhase === "reveal" &&
-        data.roundType === "normal" &&
+        (data.roundType === "normal" || data.roundType === "gradual") &&
         data.word &&
         String(dismissedAnswerRoundRef.current ?? "") !==
           String(payloadRoundId ?? "")
@@ -596,6 +598,7 @@ export default function App() {
     setAwardCeremony(null);
     setCeremonyPlayback(null);
     setCeremonyPlaybackRunning(false);
+    setCeremonyAdvanceBusy(false);
     dismissedCeremonyRunRef.current = null;
     setCommunityAwardsState(EMPTY_COMMUNITY_AWARDS_STATE);
     setCommunityVoteOpen(false);
@@ -680,34 +683,51 @@ export default function App() {
     };
   }, [secretGuessReveal]);
 
-  // 今日のハイライト: 1枚ずつめくって、最後まで来たら閉じる
+  // 今日のハイライト: 自動で一周したら、各端末の自由な見返しへ切り替える。
   useEffect(() => {
     if (!highlight) return;
-    const perItem = highlightItemDuration(
-      highlight.ids.length,
-      highlight.index
-    );
     function onKeyDown(event) {
       if (event.key === "Escape") {
         dismissHighlight();
+      } else if (highlight.mode === "review" && event.key === "ArrowLeft") {
+        moveHighlight(-1);
+      } else if (highlight.mode === "review" && event.key === "ArrowRight") {
+        moveHighlight(1);
       } else if (event.key === "Tab") {
         event.preventDefault();
         highlightCloseButtonRef.current?.focus();
       }
     }
-    const t = setTimeout(() => {
-      if (highlight.index + 1 >= highlight.ids.length) {
-        dismissHighlight();
-        return;
-      }
-      setHighlight((current) => {
-        if (!current) return null;
-        return { ...current, index: current.index + 1 };
-      });
-    }, perItem);
+    let timer = null;
+    if (highlight.mode === "auto") {
+      const perItem = highlightItemDuration(
+        highlight.ids.length,
+        highlight.index
+      );
+      timer = setTimeout(() => {
+        setHighlight((current) => {
+          if (!current || current.mode !== "auto") return current;
+          if (current.index + 1 >= current.ids.length) {
+            return {
+              ...current,
+              mode: "review",
+              index: 0,
+              direction: "next",
+              navigationSeq: (current.navigationSeq || 0) + 1,
+            };
+          }
+          return {
+            ...current,
+            index: current.index + 1,
+            direction: "next",
+            navigationSeq: (current.navigationSeq || 0) + 1,
+          };
+        });
+      }, perItem);
+    }
     window.addEventListener("keydown", onKeyDown);
     return () => {
-      clearTimeout(t);
+      if (timer) clearTimeout(timer);
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [highlight]);
@@ -743,7 +763,11 @@ export default function App() {
         }
       }
 
-      if (ceremony?.phase !== "finale") {
+      if (
+        !ceremony ||
+        ceremony.phase === "opening" ||
+        ceremony.phase === "drumroll"
+      ) {
         timer = window.setTimeout(tickCeremonyPlayback, 100);
       }
     }
@@ -1065,6 +1089,7 @@ export default function App() {
       setAwardCeremony(null);
       setCeremonyPlayback(null);
       setCeremonyPlaybackRunning(false);
+      setCeremonyAdvanceBusy(false);
       dismissedCeremonyRunRef.current = null;
       setCommunityAwardsState(EMPTY_COMMUNITY_AWARDS_STATE);
       setCommunityVoteOpen(false);
@@ -1300,6 +1325,7 @@ export default function App() {
       setHighlight(null);
       setCeremonyPlayback(null);
       setCeremonyPlaybackRunning(false);
+      setCeremonyAdvanceBusy(false);
       setAwardCeremony(null);
       setCommunityCeremony(null);
       setCommunityVoteOpen(true);
@@ -1322,6 +1348,7 @@ export default function App() {
       }
       const playback = normalizeCeremonyPlayback(data?.playback);
       setCeremonyPlayback(playback);
+      setCeremonyAdvanceBusy(false);
       setCeremonyPlaybackRunning(
         isCeremonyPlaybackInProgress(
           playback,
@@ -1350,9 +1377,16 @@ export default function App() {
       highlightPreviousFocusRef.current = document.activeElement;
       setCeremonyPlayback(null);
       setCeremonyPlaybackRunning(false);
+      setCeremonyAdvanceBusy(false);
       setAwardCeremony(null);
       setCommunityCeremony(null);
-      setHighlight({ ids, index: 0 });
+      setHighlight({
+        ids,
+        index: 0,
+        mode: "auto",
+        direction: "next",
+        navigationSeq: 0,
+      });
     });
 
     socket.on("strokeHistory", (data) => {
@@ -1682,6 +1716,56 @@ export default function App() {
       (res) => {
         if (!res?.ok) {
           setError(res?.error || "AI授賞式を再上映できません");
+        } else if (res.active) {
+          restoreActiveCeremony("ai");
+        }
+      }
+    );
+  }
+
+  function restoreActiveCeremony(kind) {
+    if (ceremonyPlayback?.kind !== kind) return;
+    dismissedCeremonyRunRef.current = null;
+    setHighlight(null);
+    setCeremonyPlayback((current) =>
+      current?.kind === kind ? { ...current } : current
+    );
+  }
+
+  function advanceCeremony(kind, index) {
+    if (ceremonyAdvanceBusy) return;
+    const playback = ceremonyPlayback;
+    if (
+      !playback ||
+      playback.kind !== kind ||
+      playback.phase !== "reveal" ||
+      playback.index !== index
+    ) {
+      return;
+    }
+    const socket = socketRef.current;
+    if (!socket) {
+      setError("通信がつながっていません。少し待ってもう一度どうぞ");
+      return;
+    }
+    setError("");
+    setCeremonyAdvanceBusy(true);
+    socket.timeout(8_000).emit(
+      "advanceCeremonyPlayback",
+      {
+        kind,
+        gameSeq: playback.gameSeq,
+        runId: playback.runId,
+        index,
+      },
+      (timeoutError, res) => {
+        setCeremonyAdvanceBusy(false);
+        if (timeoutError) {
+          setError("次の発表を確認できませんでした。もう一度押してね");
+          return;
+        }
+        if (!res?.ok) {
+          setError(res?.error || "次の発表へ進めませんでした");
         }
       }
     );
@@ -1771,6 +1855,8 @@ export default function App() {
       (res) => {
         if (!res?.ok) {
           setError(res?.error || "投票結果を再上映できません");
+        } else if (res.active) {
+          restoreActiveCeremony("community");
         }
       }
     );
@@ -2062,6 +2148,7 @@ export default function App() {
   function dismissHighlight() {
     const previousFocus = highlightPreviousFocusRef.current;
     highlightPreviousFocusRef.current = null;
+    highlightTouchStartRef.current = null;
     setHighlight(null);
     window.requestAnimationFrame(() => {
       if (
@@ -2072,6 +2159,44 @@ export default function App() {
         previousFocus.focus();
       }
     });
+  }
+
+  function moveHighlight(delta) {
+    setHighlight((current) => {
+      if (!current || current.mode !== "review" || current.ids.length === 0) {
+        return current;
+      }
+      const nextIndex = Math.max(
+        0,
+        Math.min(current.ids.length - 1, current.index + delta)
+      );
+      if (nextIndex === current.index) return current;
+      return {
+        ...current,
+        index: nextIndex,
+        direction: delta > 0 ? "next" : "previous",
+        navigationSeq: (current.navigationSeq || 0) + 1,
+      };
+    });
+  }
+
+  function beginHighlightSwipe(event) {
+    if (highlight?.mode !== "review") return;
+    const touch = event.touches?.[0];
+    if (!touch) return;
+    highlightTouchStartRef.current = { x: touch.clientX, y: touch.clientY };
+  }
+
+  function finishHighlightSwipe(event) {
+    const started = highlightTouchStartRef.current;
+    highlightTouchStartRef.current = null;
+    if (!started || highlight?.mode !== "review") return;
+    const touch = event.changedTouches?.[0];
+    if (!touch) return;
+    const deltaX = touch.clientX - started.x;
+    const deltaY = touch.clientY - started.y;
+    if (Math.abs(deltaX) < 48 || Math.abs(deltaX) <= Math.abs(deltaY)) return;
+    moveHighlight(deltaX < 0 ? 1 : -1);
   }
 
   function dismissCeremony(kind) {
@@ -2087,24 +2212,32 @@ export default function App() {
   function renderHighlight() {
     if (!highlight) return null;
     const total = highlight.ids.length;
+    if (total === 0) return null;
     const shown = highlight.index + 1;
     const item = gallery.find((g) => g.id === highlight.ids[highlight.index]);
     const drawers = (item?.drawerNames || []).join("・");
+    const isReview = highlight.mode === "review";
     return (
       <div
-        className="highlight"
+        className={`highlight${isReview ? " is-review" : ""}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby="highlight-title"
+        onTouchStart={beginHighlightSwipe}
+        onTouchEnd={finishHighlightSwipe}
       >
         <div className="highlight-inner">
           <div className="highlight-eyebrow" id="highlight-title">
-            🎬 今日のハイライト
+            {isReview ? "↔️ 自由に見返しタイム" : "🎬 今日のハイライト"}
           </div>
-          <div className="highlight-frame">
+          <div
+            className={`highlight-frame${
+              isReview ? ` slide-${highlight.direction || "next"}` : ""
+            }`}
+            key={`${item?.id || "missing"}-${highlight.navigationSeq || 0}`}
+          >
             {item ? (
               <img
-                key={item.id}
                 src={item.imageDataUrl}
                 alt={item.word || "絵"}
                 decoding="async"
@@ -2128,15 +2261,46 @@ export default function App() {
             </div>
           )}
           {drawers && <div className="highlight-drawers">{drawers}</div>}
-          <div className="highlight-track">
-            <div
-              className="highlight-fill"
-              style={{ width: `${(shown / total) * 100}%` }}
-            />
-          </div>
-          <div className="highlight-count">
-            {shown} / {total}
-          </div>
+          {isReview ? (
+            <>
+              <div className="highlight-review-controls">
+                <button
+                  type="button"
+                  className="highlight-arrow"
+                  onClick={() => moveHighlight(-1)}
+                  disabled={highlight.index <= 0}
+                  aria-label="前の作品"
+                >
+                  ←
+                </button>
+                <div className="highlight-count" aria-live="polite">
+                  {shown}／{total}
+                </div>
+                <button
+                  type="button"
+                  className="highlight-arrow"
+                  onClick={() => moveHighlight(1)}
+                  disabled={highlight.index >= total - 1}
+                  aria-label="次の作品"
+                >
+                  →
+                </button>
+              </div>
+              <p className="highlight-swipe-hint">左右ボタン・スワイプで見返せます</p>
+            </>
+          ) : (
+            <>
+              <div className="highlight-track">
+                <div
+                  className="highlight-fill"
+                  style={{ width: `${(shown / total) * 100}%` }}
+                />
+              </div>
+              <div className="highlight-count">
+                {shown} / {total}
+              </div>
+            </>
+          )}
           <button
             ref={highlightCloseButtonRef}
             type="button"
@@ -2144,7 +2308,7 @@ export default function App() {
             onClick={dismissHighlight}
             autoFocus
           >
-            とじる
+            {isReview ? "見返しを終わる" : "とじる"}
           </button>
         </div>
       </div>
@@ -2270,18 +2434,31 @@ export default function App() {
                     <p className="award-comment">{award.reason}</p>
                   </div>
                 </div>
-                <div
-                  className="award-auto-progress is-synced"
-                  aria-hidden="true"
-                >
-                  <span
-                    style={{
-                      transform: `scaleX(${Math.max(
-                        0,
-                        1 - (awardCeremony.progress || 0)
-                      )})`,
-                    }}
-                  />
+                <div className="award-manual-controls">
+                  <p>
+                    {isHost
+                      ? "みんなでゆっくり見てから、次の発表へ！"
+                      : "みんなで感想を言いながら見よう！"}
+                  </p>
+                  {isHost ? (
+                    <button
+                      type="button"
+                      className="award-next-button"
+                      onClick={() => advanceCeremony("ai", index)}
+                      disabled={ceremonyAdvanceBusy}
+                      aria-busy={ceremonyAdvanceBusy}
+                    >
+                      {ceremonyAdvanceBusy
+                        ? "次の発表を準備中…"
+                        : index >= awards.length - 1
+                          ? "授賞式を終わる"
+                          : "次の賞を発表！"}
+                    </button>
+                  ) : (
+                    <span className="award-host-wait">
+                      ホストが次の発表へ進めるまで待ってね
+                    </span>
+                  )}
                 </div>
               </div>
             )}
@@ -2789,22 +2966,32 @@ export default function App() {
                 </p>
               </div>
             )
-          ) : word ? (
+          ) : drawPhase === "guessing" ? (
+            word ? (
+              <>
+                <div className="info-block info-prompt">
+                  <div className="info-label">あなたのお題</div>
+                  <div className="prompt-value">{word}</div>
+                </div>
+                <p className="hint">
+                  全部見えた！みんなが正解したら「せいかい！」を押してね
+                </p>
+              </>
+            ) : (
+              <div className="info-block info-drawer">
+                <div className="info-label">👀 ぜんぶ見えた！</div>
+                <div className="drawer-value">わかったら さけぼう！</div>
+                <p className="hint">はやく当てた人の勝ち！</p>
+              </div>
+            )
+          ) : (
             <>
               <div className="info-block info-prompt">
-                <div className="info-label">あなたのお題</div>
-                <div className="prompt-value">{word}</div>
+                <div className="info-label">正解</div>
+                <div className="prompt-value">{word || "？？？"}</div>
               </div>
-              <p className="hint">
-                全部見せたよ。当たったら「つぎのお題へ」！
-              </p>
+              <p className="hint">正解発表！つぎのお題へ進めるよ</p>
             </>
-          ) : (
-            <div className="info-block info-drawer">
-              <div className="info-label">👀 ぜんぶ見えた！</div>
-              <div className="drawer-value">わかったら さけぼう！</div>
-              <p className="hint">はやく当てた人の勝ち！</p>
-            </div>
           )}
           {remainSec != null && drawPhase === "drawing" && (
             <div className="timer-bar" aria-live="polite">
@@ -2974,6 +3161,9 @@ export default function App() {
         ceremony={communityCeremony}
         state={communityAwardsState}
         gallery={gallery}
+        isHost={isHost}
+        advancing={ceremonyAdvanceBusy}
+        onAdvance={(index) => advanceCeremony("community", index)}
         onClose={() => dismissCeremony("community")}
       />
 
@@ -3202,7 +3392,7 @@ export default function App() {
             みんなで{totalRounds}このお題を描きました
           </p>
 
-          {aiState.awardCandidateCount >= 2 && (
+          {aiState.awardCandidateCount >= 1 && (
             <section className="highlight-panel">
               {isHost ? (
                 <>
@@ -3325,9 +3515,15 @@ export default function App() {
                       type="button"
                       className="community-replay-button"
                       onClick={startCommunityAwardCeremony}
-                      disabled={isCeremonyPlaybackRunning}
+                      disabled={
+                        isCeremonyPlaybackRunning &&
+                        ceremonyPlayback?.kind !== "community"
+                      }
                     >
-                      🎬 みんなで投票結果をもう一度見る
+                      {isCeremonyPlaybackRunning &&
+                      ceremonyPlayback?.kind === "community"
+                        ? "🎬 投票結果の上映に戻る"
+                        : "🎬 みんなで投票結果をもう一度見る"}
                     </button>
                   ) : (
                     <p className="hint">
@@ -3368,10 +3564,15 @@ export default function App() {
                         className="ai-awards-replay"
                         onClick={startAwardCeremony}
                         disabled={
-                          isCommunityVoting || isCeremonyPlaybackRunning
+                          isCommunityVoting ||
+                          (isCeremonyPlaybackRunning &&
+                            ceremonyPlayback?.kind !== "ai")
                         }
                       >
-                        🎬 みんなで授賞式をもう一度見る
+                        {isCeremonyPlaybackRunning &&
+                        ceremonyPlayback?.kind === "ai"
+                          ? "🎬 AI授賞式の上映に戻る"
+                          : "🎬 みんなで授賞式をもう一度見る"}
                       </button>
                     ) : (
                       <p className="hint">

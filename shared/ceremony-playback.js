@@ -1,26 +1,28 @@
 export const CEREMONY_START_LEAD_MS = 800;
-/** 発表終了直後に再接続しても、フィナーレへ戻れる猶予。 */
-export const CEREMONY_FINALE_RESUME_MS = 30_000;
 
 export const CEREMONY_TIMINGS = Object.freeze({
-  ai: Object.freeze({ openingMs: 1_800, drumrollMs: 2_200, revealMs: 5_000 }),
-  community: Object.freeze({
-    openingMs: 1_700,
-    drumrollMs: 2_100,
-    revealMs: 5_600,
-  }),
+  ai: Object.freeze({ openingMs: 1_800, drumrollMs: 2_200 }),
+  community: Object.freeze({ openingMs: 1_700, drumrollMs: 2_100 }),
 });
+
+const CEREMONY_PHASES = new Set([
+  "opening",
+  "drumroll",
+  "reveal",
+  "finale",
+]);
 
 function positiveInteger(value) {
   const number = Number(value);
   return Number.isInteger(number) && number > 0 ? number : null;
 }
 
+/** ホストが即時進行した場合に必要な、自動演出部分の最短時間。 */
 export function ceremonyPlaybackDuration(kind, awardCount) {
   const timing = CEREMONY_TIMINGS[kind];
   const count = positiveInteger(awardCount);
   if (!timing || !count) return 0;
-  return timing.openingMs + count * (timing.drumrollMs + timing.revealMs);
+  return timing.openingMs + count * timing.drumrollMs;
 }
 
 export function createCeremonyPlayback({
@@ -34,19 +36,21 @@ export function createCeremonyPlayback({
   const count = positiveInteger(awardCount);
   const sequence = positiveInteger(gameSeq);
   const run = positiveInteger(runId);
-  const duration = ceremonyPlaybackDuration(kind, count);
-  if (!count || !sequence || !run || duration <= 0) return null;
+  const timing = CEREMONY_TIMINGS[kind];
+  if (!count || !sequence || !run || !timing) return null;
 
   const safeNow = Number.isFinite(Number(now)) ? Number(now) : Date.now();
   const safeLead = Math.max(0, Number(leadMs) || 0);
+  const startedAt = safeNow + safeLead;
   return {
     kind,
     gameSeq: sequence,
     awardCount: count,
     runId: run,
-    startedAt: safeNow + safeLead,
-    expiresAt:
-      safeNow + safeLead + duration + CEREMONY_FINALE_RESUME_MS,
+    phase: "opening",
+    index: 0,
+    startedAt,
+    nextAt: startedAt + timing.openingMs,
   };
 }
 
@@ -58,48 +62,62 @@ export function normalizeCeremonyPlayback(value) {
   const gameSeq = positiveInteger(value.gameSeq);
   const awardCount = positiveInteger(value.awardCount);
   const runId = positiveInteger(value.runId);
+  const phase = CEREMONY_PHASES.has(value.phase) ? value.phase : null;
+  const index = Number(value.index);
   const startedAt = Number(value.startedAt);
-  const expiresAt = Number(value.expiresAt);
-  const duration = ceremonyPlaybackDuration(kind, awardCount);
+  const nextAt = value.nextAt == null ? null : Number(value.nextAt);
+  const timedPhase = phase === "opening" || phase === "drumroll";
   if (
     !kind ||
     !gameSeq ||
     !awardCount ||
     !runId ||
+    !phase ||
+    !Number.isInteger(index) ||
+    index < 0 ||
+    index >= awardCount ||
+    (phase === "opening" && index !== 0) ||
+    (phase === "finale" && index !== awardCount - 1) ||
     !Number.isFinite(startedAt) ||
     startedAt <= 0 ||
-    !Number.isFinite(expiresAt) ||
-    expiresAt < startedAt + duration
+    (timedPhase &&
+      (!Number.isFinite(nextAt) || nextAt <= startedAt)) ||
+    (!timedPhase && nextAt !== null)
   ) {
     return null;
   }
-  return { kind, gameSeq, awardCount, runId, startedAt, expiresAt };
+  return {
+    kind,
+    gameSeq,
+    awardCount,
+    runId,
+    phase,
+    index,
+    startedAt,
+    nextAt,
+  };
 }
 
+/** フィナーレへ到達済みなら、その到達時刻を返す。 */
 export function ceremonyPlaybackFinaleAt(value) {
   const playback = normalizeCeremonyPlayback(value);
-  if (!playback) return 0;
-  return (
-    playback.startedAt +
-    ceremonyPlaybackDuration(playback.kind, playback.awardCount)
-  );
+  return playback?.phase === "finale" ? playback.startedAt : 0;
 }
 
-/** 開幕前を含め、まだ発表シーケンスの途中ならtrue。 */
-export function isCeremonyPlaybackInProgress(value, now = Date.now()) {
-  const finaleAt = ceremonyPlaybackFinaleAt(value);
-  return finaleAt > 0 && Number(now) < finaleAt;
-}
-
-/** 再接続で上映またはフィナーレへ復帰できる期間。 */
-export function isCeremonyPlaybackAvailable(value, now = Date.now()) {
+/** 受賞作で停止中の時間も含め、まだホスト進行が必要ならtrue。 */
+export function isCeremonyPlaybackInProgress(value) {
   const playback = normalizeCeremonyPlayback(value);
-  return Boolean(playback && Number(now) < playback.expiresAt);
+  return Boolean(playback && playback.phase !== "finale");
+}
+
+/** 終了画面にいる間は、再接続で現在位置へいつでも復帰できる。 */
+export function isCeremonyPlaybackAvailable(value) {
+  return Boolean(normalizeCeremonyPlayback(value));
 }
 
 /**
- * サーバー絶対時刻から、全端末で同じphase/indexを復元する。
- * 開始前はceremony=null、全賞の発表後はfinaleを返す。
+ * サーバーが保持するphase/indexを表示用に変換する。
+ * opening/drumrollだけ進捗を時刻で描き、revealは時間無制限で停止する。
  */
 export function ceremonyPlaybackPosition(value, now = Date.now()) {
   const playback = normalizeCeremonyPlayback(value);
@@ -110,64 +128,70 @@ export function ceremonyPlaybackPosition(value, now = Date.now()) {
     return { ceremony: null, nextAt: playback.startedAt };
   }
 
-  const timing = CEREMONY_TIMINGS[playback.kind];
-  let boundary = playback.startedAt + timing.openingMs;
-  if (serverNow < boundary) {
-    return {
-      ceremony: {
-        phase: "opening",
-        index: 0,
-        progress: Math.max(
-          0,
-          Math.min(1, (serverNow - playback.startedAt) / timing.openingMs),
-        ),
-      },
-      nextAt: boundary,
-    };
+  let progress = 1;
+  if (playback.nextAt != null) {
+    const duration = playback.nextAt - playback.startedAt;
+    progress = Math.max(
+      0,
+      Math.min(1, (serverNow - playback.startedAt) / duration),
+    );
   }
-
-  for (let index = 0; index < playback.awardCount; index += 1) {
-    const drumrollStartedAt = boundary;
-    boundary += timing.drumrollMs;
-    if (serverNow < boundary) {
-      return {
-        ceremony: {
-          phase: "drumroll",
-          index,
-          progress: Math.max(
-            0,
-            Math.min(
-              1,
-              (serverNow - drumrollStartedAt) / timing.drumrollMs,
-            ),
-          ),
-        },
-        nextAt: boundary,
-      };
-    }
-    const revealStartedAt = boundary;
-    boundary += timing.revealMs;
-    if (serverNow < boundary) {
-      return {
-        ceremony: {
-          phase: "reveal",
-          index,
-          progress: Math.max(
-            0,
-            Math.min(1, (serverNow - revealStartedAt) / timing.revealMs),
-          ),
-        },
-        nextAt: boundary,
-      };
-    }
-  }
-
   return {
     ceremony: {
-      phase: "finale",
-      index: playback.awardCount - 1,
-      progress: 1,
+      phase: playback.phase,
+      index: playback.index,
+      progress,
     },
-    nextAt: null,
+    nextAt: playback.nextAt,
   };
+}
+
+/**
+ * trigger=timer は opening→drumroll→reveal、trigger=host は
+ * reveal→次のdrumroll（最後だけfinale）に限って進める。
+ */
+export function transitionCeremonyPlayback(
+  value,
+  { trigger, now = Date.now() } = {},
+) {
+  const playback = normalizeCeremonyPlayback(value);
+  if (!playback) return null;
+  const timing = CEREMONY_TIMINGS[playback.kind];
+  const safeNow = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+
+  if (trigger === "timer" && playback.phase === "opening") {
+    return {
+      ...playback,
+      phase: "drumroll",
+      startedAt: safeNow,
+      nextAt: safeNow + timing.drumrollMs,
+    };
+  }
+  if (trigger === "timer" && playback.phase === "drumroll") {
+    return {
+      ...playback,
+      phase: "reveal",
+      startedAt: safeNow,
+      nextAt: null,
+    };
+  }
+  if (trigger === "host" && playback.phase === "reveal") {
+    if (playback.index + 1 >= playback.awardCount) {
+      return {
+        ...playback,
+        phase: "finale",
+        index: playback.awardCount - 1,
+        startedAt: safeNow,
+        nextAt: null,
+      };
+    }
+    return {
+      ...playback,
+      phase: "drumroll",
+      index: playback.index + 1,
+      startedAt: safeNow,
+      nextAt: safeNow + timing.drumrollMs,
+    };
+  }
+  return null;
 }

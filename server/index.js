@@ -35,6 +35,7 @@ import {
   isCeremonyPlaybackAvailable,
   isCeremonyPlaybackInProgress,
   normalizeCeremonyPlayback,
+  transitionCeremonyPlayback,
 } from "../shared/ceremony-playback.js";
 import {
   buildSecretGuessCandidates,
@@ -300,13 +301,16 @@ const io = new Server(httpServer, {
  *  communityAwardsResults: null | { awards: object[] },
  *  communityAwardsToken: number,
  *  ceremonyPlaybackSeq: number,
+ *  ceremonyPlaybackTimer: ReturnType<typeof setTimeout> | null,
  *  ceremonyPlayback: null | {
  *    kind: 'ai' | 'community',
  *    gameSeq: number,
  *    awardCount: number,
  *    runId: number,
+ *    phase: 'opening' | 'drumroll' | 'reveal' | 'finale',
+ *    index: number,
  *    startedAt: number,
- *    expiresAt: number,
+ *    nextAt: number | null,
  *  },
  *  aiSecretGuessStatus: 'idle' | 'armed' | 'countdown' | 'requested' | 'generating' | 'ready' | 'revealed' | 'skipped' | 'error',
  *  aiSecretGuessGameSeq: number | null,
@@ -718,7 +722,58 @@ function emitCeremonyPlaybackState(room, targetSocketId = null) {
   io.to(room.code).emit("ceremonyPlaybackUpdate", payload);
 }
 
+function clearCeremonyPlaybackTimer(room) {
+  if (room.ceremonyPlaybackTimer) {
+    clearTimeout(room.ceremonyPlaybackTimer);
+    room.ceremonyPlaybackTimer = null;
+  }
+}
+
+/** openingとdrumrollだけを短い自動演出として進める。受賞作では必ず停止する。 */
+function scheduleCeremonyPlaybackTransition(room) {
+  clearCeremonyPlaybackTimer(room);
+  const playback = normalizeCeremonyPlayback(room.ceremonyPlayback);
+  if (!playback || playback.nextAt == null) return;
+
+  const expected = {
+    gameSeq: playback.gameSeq,
+    runId: playback.runId,
+    phase: playback.phase,
+    index: playback.index,
+    nextAt: playback.nextAt,
+  };
+  const timer = setTimeout(() => {
+    if (room.ceremonyPlaybackTimer === timer) {
+      room.ceremonyPlaybackTimer = null;
+    }
+    const currentRoom = rooms.get(room.code);
+    const current = normalizeCeremonyPlayback(currentRoom?.ceremonyPlayback);
+    if (
+      currentRoom !== room ||
+      !current ||
+      currentRoom.phase !== "finished" ||
+      current.gameSeq !== expected.gameSeq ||
+      current.runId !== expected.runId ||
+      current.phase !== expected.phase ||
+      current.index !== expected.index ||
+      current.nextAt !== expected.nextAt
+    ) {
+      return;
+    }
+    const next = transitionCeremonyPlayback(current, {
+      trigger: "timer",
+      now: current.nextAt,
+    });
+    if (!next) return;
+    currentRoom.ceremonyPlayback = next;
+    emitCeremonyPlaybackState(currentRoom);
+    scheduleCeremonyPlaybackTransition(currentRoom);
+  }, Math.max(0, playback.nextAt - Date.now()));
+  room.ceremonyPlaybackTimer = timer;
+}
+
 function clearCeremonyPlayback(room, { emit = true } = {}) {
+  clearCeremonyPlaybackTimer(room);
   if (!room.ceremonyPlayback) return false;
   room.ceremonyPlayback = null;
   if (emit) emitCeremonyPlaybackState(room);
@@ -738,6 +793,7 @@ function startCeremonyPlayback(room, kind) {
   if (!playback) return null;
   room.ceremonyPlayback = playback;
   emitCeremonyPlaybackState(room);
+  scheduleCeremonyPlaybackTransition(room);
   return playback;
 }
 
@@ -1494,6 +1550,7 @@ function canPlayerSeeWord(room, playerId) {
     return room.drawerId === playerId;
   }
   if (room.roundType === "gradual") {
+    if (room.drawPhase === "reveal") return true;
     return room.drawerId === playerId;
   }
   if (room.roundType === "coop") {
@@ -1516,8 +1573,8 @@ function canPlayerNextRound(room, playerId) {
     return room.drawerId === playerId;
   }
   if (room.roundType === "gradual") {
-    // 公開が始まるまでは「できた！」で公開する（つぎへは公開後）
-    if (room.drawPhase !== "guessing") return false;
+    // 全公開のあとも「せいかい！」で答えを出すまでは進めない。
+    if (room.drawPhase !== "reveal") return false;
     return (
       room.drawerId === playerId &&
       isGradualRevealComplete(room.gradualReveal)
@@ -1538,10 +1595,22 @@ function canPlayerNextRound(room, playerId) {
   return false;
 }
 
-/** ふつうのラウンドの「せいかい！」。時間しばりであてっこタイムに入っていても押せる */
+/** 通常／だんだん見えるの「せいかい！」。 */
 function canRevealAnswer(room, playerId) {
-  if (room.phase !== "playing" || room.roundType !== "normal") return false;
+  if (
+    room.phase !== "playing" ||
+    (room.roundType !== "normal" && room.roundType !== "gradual")
+  ) {
+    return false;
+  }
   if (room.drawPhase === "reveal") return false;
+  if (
+    room.roundType === "gradual" &&
+    (room.drawPhase !== "guessing" ||
+      !isGradualRevealComplete(room.gradualReveal))
+  ) {
+    return false;
+  }
   return room.drawerId === playerId;
 }
 
@@ -1655,6 +1724,7 @@ function buildRoundPayload(room, playerId) {
       room.drawPhase === "drawing" && room.drawerId === playerId;
     payload.gradualReveal = buildGradualRevealPublicState(room);
     payload.batchSeq = room.gradualBatchSeq;
+    payload.canRevealAnswer = canRevealAnswer(room, playerId);
   }
 
   if (room.roundType === "normal") {
@@ -2142,6 +2212,7 @@ function removePlayer(room, playerId) {
     clearAiSecretGuessTimer(room);
     room.aiCrazyPromptToken += 1;
     clearCommunityAwardsTimer(room);
+    clearCeremonyPlaybackTimer(room);
     rooms.delete(room.code);
     return;
   }
@@ -2479,6 +2550,7 @@ function createEmptyRoom(code, hostId) {
     communityAwardsResults: null,
     communityAwardsToken: 0,
     ceremonyPlaybackSeq: 0,
+    ceremonyPlaybackTimer: null,
     ceremonyPlayback: null,
     aiSecretGuessStatus: "idle",
     aiSecretGuessGameSeq: null,
@@ -2937,8 +3009,8 @@ io.on("connection", (socket) => {
       });
     }
     const items = drawnThisGame(room);
-    if (items.length < 2) {
-      return reply(cb, { ok: false, error: "ハイライトには絵が2枚以上必要です" });
+    if (items.length < 1) {
+      return reply(cb, { ok: false, error: "ハイライトにできる絵がありません" });
     }
     const now = Date.now();
     if (now - room.lastHighlightAt < HIGHLIGHT_COOLDOWN_MS) {
@@ -3020,6 +3092,52 @@ io.on("connection", (socket) => {
     reply(cb, { ok: true, runId: playback.runId });
   });
 
+  // 受賞作の表示中だけ、ホストの合図で次の発表へ進める。
+  onSocket(socket, "advanceCeremonyPlayback", (data, cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { room, playerId } = ctx;
+    if (room.hostId !== playerId) {
+      return reply(cb, {
+        ok: false,
+        error: "ホストだけが次の賞を発表できます",
+      });
+    }
+
+    const current = normalizeCeremonyPlayback(room.ceremonyPlayback);
+    if (
+      !current ||
+      room.phase !== "finished" ||
+      data?.kind !== current.kind ||
+      !Number.isInteger(data?.gameSeq) ||
+      data.gameSeq !== current.gameSeq ||
+      !Number.isInteger(data?.runId) ||
+      data.runId !== current.runId ||
+      !Number.isInteger(data?.index) ||
+      data.index !== current.index
+    ) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    // 連打や遅れて届いた同じ操作は、2つ先へ進めず冪等に捨てる。
+    if (current.phase !== "reveal") {
+      return reply(cb, { ok: true, stale: true });
+    }
+
+    const next = transitionCeremonyPlayback(current, {
+      trigger: "host",
+      now: Date.now(),
+    });
+    if (!next) return reply(cb, { ok: true, stale: true });
+    room.ceremonyPlayback = next;
+    emitCeremonyPlaybackState(room);
+    scheduleCeremonyPlaybackTransition(room);
+    reply(cb, {
+      ok: true,
+      phase: next.phase,
+      index: next.index,
+    });
+  });
+
   onSocket(socket, "revealLiar", (cb) => {
     const ctx = getContext(socket);
     if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
@@ -3044,7 +3162,7 @@ io.on("connection", (socket) => {
     reply(cb, { ok: true });
   });
 
-  // ふつうのラウンド: 描き手の「せいかい！」で答えを全員に出す
+  // 通常／だんだん見える: 描き手の「せいかい！」で答えを全員に出す
   onSocket(socket, "revealAnswer", (data, cb) => {
     if (typeof data === "function") {
       cb = data;
@@ -3060,7 +3178,7 @@ io.on("connection", (socket) => {
     // 連打や同時押しでもエラーにしない
     if (
       room.phase === "playing" &&
-      room.roundType === "normal" &&
+      (room.roundType === "normal" || room.roundType === "gradual") &&
       room.drawPhase === "reveal"
     ) {
       return reply(cb, { ok: true, stale: true });

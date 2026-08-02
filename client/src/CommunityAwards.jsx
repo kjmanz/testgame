@@ -251,6 +251,9 @@ export function CommunityAwardCeremony({
   ceremony,
   state,
   gallery,
+  isHost,
+  advancing,
+  onAdvance,
   onClose,
 }) {
   const awards = state.results?.awards || [];
@@ -378,18 +381,31 @@ export function CommunityAwardCeremony({
                 <span>／ 全{award.totalVotes || 0}票</span>
               </div>
               <p className="community-result-comment">{award.comment}</p>
-              <div
-                className="award-auto-progress community-auto-progress is-synced"
-                aria-hidden="true"
-              >
-                <span
-                  style={{
-                    transform: `scaleX(${Math.max(
-                      0,
-                      1 - (ceremony.progress || 0)
-                    )})`,
-                  }}
-                />
+              <div className="award-manual-controls community-manual-controls">
+                <p>
+                  {isHost
+                    ? "みんなでゆっくり見てから、次の発表へ！"
+                    : "みんなで感想を言いながら見よう！"}
+                </p>
+                {isHost ? (
+                  <button
+                    type="button"
+                    className="award-next-button community-next-button"
+                    onClick={() => onAdvance(index)}
+                    disabled={advancing}
+                    aria-busy={advancing}
+                  >
+                    {advancing
+                      ? "次の発表を準備中…"
+                      : index >= awards.length - 1
+                        ? "投票結果の一覧を見る"
+                        : "次の賞を発表！"}
+                  </button>
+                ) : (
+                  <span className="award-host-wait">
+                    ホストが次の発表へ進めるまで待ってね
+                  </span>
+                )}
               </div>
             </div>
           )}

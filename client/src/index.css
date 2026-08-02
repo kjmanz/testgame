@@ -1920,6 +1920,52 @@ input:focus {
   color: #fff;
 }
 
+.highlight.is-review .highlight-inner {
+  touch-action: pan-y;
+}
+
+.highlight-review-controls {
+  display: grid;
+  grid-template-columns: 54px minmax(72px, auto) 54px;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  width: 100%;
+}
+
+.highlight-arrow {
+  min-width: 54px;
+  min-height: 46px;
+  padding: 0.3rem;
+  border-color: #fff;
+  background: #ffc93c;
+  color: var(--ink);
+  font-size: 1.5rem;
+  line-height: 1;
+  box-shadow: 2px 3px 0 rgba(0, 0, 0, 0.4);
+}
+
+.highlight-arrow:disabled {
+  opacity: 0.35;
+  transform: none;
+  box-shadow: none;
+}
+
+.highlight-swipe-hint {
+  margin: -0.2rem 0 0;
+  color: #ffe9b8;
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.highlight-frame.slide-next {
+  animation: highlight-slide-next 0.28s ease both;
+}
+
+.highlight-frame.slide-previous {
+  animation: highlight-slide-previous 0.28s ease both;
+}
+
 .highlight-close {
   min-height: 44px;
   padding: 0.5rem 1.2rem;
@@ -2073,6 +2119,28 @@ input:focus {
   place-items: center;
   font-weight: 900;
   color: var(--paint-coral);
+}
+
+@keyframes highlight-slide-next {
+  from {
+    opacity: 0;
+    transform: translateX(34px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes highlight-slide-previous {
+  from {
+    opacity: 0;
+    transform: translateX(-34px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .gallery-ai-crazy-badge {
@@ -2739,11 +2807,6 @@ input:focus {
   box-shadow: 3px 4px 0 rgba(3, 39, 37, 0.52);
 }
 
-.award-auto-progress.community-auto-progress span {
-  background: linear-gradient(90deg, #ffc93c, #ff7e59);
-  animation-duration: 5.6s;
-}
-
 .award-finale-button.community-finale-button {
   background: linear-gradient(135deg, #ffc93c, #ff8755);
 }
@@ -3280,27 +3343,44 @@ input:focus {
   box-shadow: 3px 4px 0 rgba(20, 10, 31, 0.4);
 }
 
-.award-auto-progress {
-  width: min(72%, 360px);
-  height: 5px;
-  margin-top: 0.35rem;
-  overflow: hidden;
+.award-manual-controls {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.55rem;
+  width: min(100%, 520px);
+  margin-top: 0.25rem;
+}
+
+.award-manual-controls p {
+  margin: 0;
+  color: #ffe9b8;
+  font-size: clamp(0.76rem, 2.6vw, 0.92rem);
+  font-weight: 900;
+}
+
+.award-next-button {
+  min-height: 48px;
+  padding: 0.65rem 1.2rem;
+  border-color: #2b241c;
+  background: linear-gradient(135deg, #ffc93c, #ff7e59);
+  color: #2b241c;
+  font-size: clamp(0.86rem, 3vw, 1rem);
+  box-shadow: 3px 4px 0 rgba(20, 10, 31, 0.55);
+}
+
+.award-next-button:disabled {
+  opacity: 0.72;
+}
+
+.award-host-wait {
+  display: inline-flex;
+  padding: 0.45rem 0.75rem;
+  border: 2px dashed rgba(255, 255, 255, 0.58);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.2);
-}
-
-.award-auto-progress span {
-  display: block;
-  width: 100%;
-  height: 100%;
-  transform-origin: left;
-  background: linear-gradient(90deg, #ffc93c, #ff7eb6);
-  animation: award-reveal-timer 5s linear both;
-}
-
-.award-auto-progress.is-synced span {
-  animation: none;
-  transition: transform 0.12s linear;
+  color: #fff;
+  font-size: 0.75rem;
+  font-weight: 800;
 }
 
 .award-confetti {
@@ -3372,11 +3452,6 @@ input:focus {
 @keyframes award-reveal-in {
   from { opacity: 0; transform: scale(0.76) rotate(-2deg); }
   to { opacity: 1; transform: none; }
-}
-
-@keyframes award-reveal-timer {
-  from { transform: scaleX(1); }
-  to { transform: scaleX(0); }
 }
 
 @keyframes award-confetti-fall {
@@ -4028,8 +4103,13 @@ input:focus {
     line-height: 1.45;
   }
 
-  .award-auto-progress {
-    margin-top: 0.15rem;
+  .award-manual-controls {
+    gap: 0.4rem;
+    margin-top: 0.1rem;
+  }
+
+  .award-next-button {
+    width: min(100%, 360px);
   }
 }
 
@@ -4104,7 +4184,6 @@ input:focus {
   .award-drum-trophy,
   .award-drum-dots span,
   .award-reveal,
-  .award-auto-progress span,
   .award-confetti span,
   .award-finale-icons {
     animation: none;
@@ -4138,8 +4217,7 @@ input:focus {
   }
 
   .canvas-gradual-cover,
-  .highlight-fill,
-  .award-auto-progress.is-synced span {
+  .highlight-fill {
     transition: none;
   }
 
