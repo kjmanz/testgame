@@ -39,6 +39,8 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
   const strokeUsedRef = useRef(0);
   const replayingRef = useRef(false);
   const replayRafRef = useRef(0);
+  /** リサイズ後も段階公開を現在位置から再開するための進行情報 */
+  const gradualReplayRef = useRef(null);
   // 最新の値をハンドラから読むための箱（再購読を避ける）
   const penWidthRef = useRef(penWidth);
   const strokeLimitRef = useRef(strokeLimit);
@@ -93,12 +95,22 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
      * だんだん見える: サーバーから受けた線に履歴を差し替えて、
      * ゆっくり公開する（再生が終わると完成した絵のまま残る）
      */
-    playGradualReveal(strokes) {
+    playGradualReveal(
+      strokes,
+      { durationMs, elapsedMs = 0, stepCount = 0 } = {}
+    ) {
       stopReplay();
       historyRef.current = [...(strokes || [])];
       drawingRef.current = false;
       lastRef.current = null;
-      if (!startReplay({ slow: true })) {
+      if (
+        !startReplay({
+          slow: true,
+          durationMs,
+          elapsedMs,
+          stepCount,
+        })
+      ) {
         redrawFromHistory();
       }
     },
@@ -183,29 +195,49 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
       replayingRef.current = false;
       onReplayChangeRef.current?.(false);
     }
+    gradualReplayRef.current = null;
   }
 
   /** 履歴を先頭から早送りで描き直す。終わったら本来の状態に戻す */
-  function startReplay({ slow = false } = {}) {
+  function startReplay({
+    slow = false,
+    durationMs,
+    elapsedMs = 0,
+    stepCount = 0,
+  } = {}) {
     const events = historyRef.current.slice();
     if (events.length < 2) return false;
 
     stopReplay();
     if (!clearSurface()) return false;
 
-    replayingRef.current = true;
-    onReplayChangeRef.current?.(true);
-
+    const configuredDuration = Number(durationMs);
     const duration = slow
-      ? Math.min(
-          GRADUAL_MAX_MS,
-          Math.max(GRADUAL_MIN_MS, events.length * GRADUAL_MS_PER_EVENT)
-        )
+      ? Number.isFinite(configuredDuration) && configuredDuration > 0
+        ? configuredDuration
+        : Math.min(
+            GRADUAL_MAX_MS,
+            Math.max(GRADUAL_MIN_MS, events.length * GRADUAL_MS_PER_EVENT)
+          )
       : Math.min(
           REPLAY_MAX_MS,
           Math.max(REPLAY_MIN_MS, events.length * REPLAY_MS_PER_EVENT)
         );
-    const startedAt = performance.now();
+    const safeElapsed = Math.max(0, Number(elapsedMs) || 0);
+    const startedAt = performance.now() - safeElapsed;
+    if (safeElapsed >= duration) {
+      redrawFromHistory();
+      return true;
+    }
+    replayingRef.current = true;
+    onReplayChangeRef.current?.(true);
+    if (slow) {
+      gradualReplayRef.current = {
+        durationMs: duration,
+        stepCount: Math.max(0, Math.trunc(stepCount)),
+        startedAt,
+      };
+    }
     const lastMap = new Map();
     let index = 0;
 
@@ -213,14 +245,25 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
       replayRafRef.current = 0;
       if (!replayingRef.current) return;
 
-      const progress = Math.min(1, (now - startedAt) / duration);
+      const rawProgress = Math.min(1, (now - startedAt) / duration);
+      const progress =
+        slow && stepCount > 0
+          ? Math.min(1, Math.floor(rawProgress * stepCount) / stepCount)
+          : rawProgress;
       const target = Math.min(events.length, Math.ceil(progress * events.length));
+      const frameStartedAt = performance.now();
       while (index < target) {
         applyHistoryEvent(events[index], lastMap);
         index += 1;
+        if (
+          index % 50 === 0 &&
+          performance.now() - frameStartedAt >= 8
+        ) {
+          break;
+        }
       }
 
-      if (progress < 1) {
+      if (rawProgress < 1 || index < events.length) {
         replayRafRef.current = requestAnimationFrame(step);
         return;
       }
@@ -258,7 +301,19 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     if (!canvas) return;
     redrawFromHistory();
     const ro = new ResizeObserver(() => {
-      // 再生中にサイズが変わったら、続きは描けないので今の絵に戻す
+      const gradualReplay = gradualReplayRef.current;
+      // 段階公開は、画面回転後もサーバー開始時刻から同じ位置へ戻す。
+      if (replayingRef.current && gradualReplay) {
+        const elapsedMs = performance.now() - gradualReplay.startedAt;
+        stopReplay();
+        startReplay({
+          slow: true,
+          durationMs: gradualReplay.durationMs,
+          elapsedMs,
+          stepCount: gradualReplay.stepCount,
+        });
+        return;
+      }
       stopReplay();
       redrawFromHistory();
     });
@@ -290,7 +345,9 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     stopReplay();
     historyRef.current = [...(historySeed.strokes || [])];
     drawingRef.current = false;
-    redrawFromHistory();
+    // 「描いた順」の公開直前に、完成絵が1フレームだけ見えるのを防ぐ。
+    if (historySeed.deferDraw) clearSurface();
+    else redrawFromHistory();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [historySeed]);
 

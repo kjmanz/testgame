@@ -981,6 +981,139 @@ input:focus {
   color: #17498f;
 }
 
+/* だんだん見える: 完成した絵の上の幕だけを、全端末で同じ段階まで開く */
+@property --gradual-reveal {
+  syntax: "<percentage>";
+  inherits: false;
+  initial-value: 0%;
+}
+
+@property --gradual-cover {
+  syntax: "<percentage>";
+  inherits: false;
+  initial-value: 100%;
+}
+
+.canvas-gradual-cover {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  background:
+    repeating-linear-gradient(
+      -45deg,
+      rgba(77, 143, 217, 0.2) 0 18px,
+      rgba(240, 247, 255, 0.36) 18px 36px
+    ),
+    #f0f7ff;
+  will-change: clip-path, -webkit-mask-image, mask-image;
+  transition:
+    clip-path 0.42s cubic-bezier(0.2, 0.8, 0.25, 1),
+    --gradual-reveal 0.42s cubic-bezier(0.2, 0.8, 0.25, 1),
+    --gradual-cover 0.42s cubic-bezier(0.2, 0.8, 0.25, 1);
+}
+
+.canvas-gradual-cover.is-top-down {
+  clip-path: inset(var(--gradual-reveal) 0 0 0);
+}
+
+.canvas-gradual-cover.is-bottom-up {
+  clip-path: inset(0 0 var(--gradual-reveal) 0);
+}
+
+.canvas-gradual-cover.is-left-right {
+  clip-path: inset(0 0 0 var(--gradual-reveal));
+}
+
+.canvas-gradual-cover.is-right-left {
+  clip-path: inset(0 var(--gradual-reveal) 0 0);
+}
+
+.canvas-gradual-cover.is-center-out {
+  -webkit-mask-image: radial-gradient(
+    circle farthest-corner at 50% 50%,
+    transparent 0 var(--gradual-reveal),
+    #000 calc(var(--gradual-reveal) + 1%) 100%
+  );
+  mask-image: radial-gradient(
+    circle farthest-corner at 50% 50%,
+    transparent 0 var(--gradual-reveal),
+    #000 calc(var(--gradual-reveal) + 1%) 100%
+  );
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-size: 100% 100%;
+  mask-size: 100% 100%;
+}
+
+.canvas-gradual-cover.is-outside-in {
+  -webkit-mask-image: radial-gradient(
+    circle farthest-corner at 50% 50%,
+    #000 0 var(--gradual-cover),
+    transparent calc(var(--gradual-cover) + 1%) 100%
+  );
+  mask-image: radial-gradient(
+    circle farthest-corner at 50% 50%,
+    #000 0 var(--gradual-cover),
+    transparent calc(var(--gradual-cover) + 1%) 100%
+  );
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-size: 100% 100%;
+  mask-size: 100% 100%;
+}
+
+.canvas-gradual-badge {
+  position: absolute;
+  z-index: 4;
+  left: 50%;
+  bottom: 10px;
+  transform: translateX(-50%);
+  min-width: max-content;
+  padding: 0.3rem 0.7rem;
+  border: 2px solid #143f80;
+  border-radius: 999px;
+  color: #123d74;
+  background: rgba(240, 247, 255, 0.94);
+  box-shadow: 2px 3px 0 rgba(20, 63, 128, 0.24);
+  font-size: 0.74rem;
+  font-weight: 1000;
+  pointer-events: none;
+}
+
+.gradual-reveal-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-top: 0.45rem;
+  padding: 0.45rem 0.6rem;
+  border: 2px solid #2b7de0;
+  border-radius: 12px;
+  color: #153f73;
+  background: linear-gradient(135deg, #eef7ff, #e4f0ff);
+  box-shadow: 2px 3px 0 rgba(20, 63, 128, 0.15);
+}
+
+.gradual-reveal-status strong {
+  min-width: 0;
+  font-size: 0.82rem;
+  line-height: 1.3;
+}
+
+.gradual-reveal-status span {
+  flex-shrink: 0;
+  font-size: 0.68rem;
+  font-weight: 900;
+  color: #315c8f;
+}
+
+.gradual-reveal-status.is-finished {
+  border-color: #1f8f52;
+  color: #12683c;
+  background: #effcf3;
+}
+
 /* —— 爆笑リプレイ —— */
 .canvas-replay {
   position: absolute;
@@ -1716,6 +1849,7 @@ input:focus {
   display: grid;
   place-items: center;
   padding: 1rem;
+  overflow-y: auto;
   background: rgba(43, 36, 28, 0.82);
 }
 
@@ -1725,6 +1859,10 @@ input:focus {
   align-items: center;
   gap: 0.5rem;
   width: min(100%, 420px);
+  max-height: calc(100dvh - 2rem);
+  padding: 0.2rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .highlight-eyebrow {
@@ -1735,7 +1873,7 @@ input:focus {
 }
 
 .highlight-frame {
-  width: 100%;
+  width: min(100%, 52dvh);
   aspect-ratio: 1 / 1;
   display: grid;
   place-items: center;
@@ -1815,6 +1953,7 @@ input:focus {
 }
 
 .highlight-close {
+  min-height: 44px;
   padding: 0.5rem 1.2rem;
   font-size: 0.85rem;
   background: #fff;
@@ -3191,6 +3330,11 @@ input:focus {
   animation: award-reveal-timer 5s linear both;
 }
 
+.award-auto-progress.is-synced span {
+  animation: none;
+  transition: transform 0.12s linear;
+}
+
 .award-confetti {
   position: absolute;
   inset: -1.4rem -0.5rem auto;
@@ -4023,5 +4167,16 @@ input:focus {
   .answer-celebration-confetti,
   .answer-celebration-progress {
     display: none;
+  }
+
+  .canvas-gradual-cover,
+  .highlight-fill,
+  .award-auto-progress.is-synced span {
+    transition: none;
+  }
+
+  .highlight-frame,
+  .highlight-word {
+    animation: none;
   }
 }

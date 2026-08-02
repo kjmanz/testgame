@@ -27,6 +27,17 @@ import {
 import { findConstraint, randomConstraint } from "./constraints.js";
 import { hasVisibleDrawing } from "./drawing.js";
 import {
+  createGradualRevealPlan,
+  gradualRevealDuration,
+  isGradualRevealComplete,
+} from "./gradual-reveal.js";
+import {
+  createCeremonyPlayback,
+  isCeremonyPlaybackAvailable,
+  isCeremonyPlaybackInProgress,
+  normalizeCeremonyPlayback,
+} from "../shared/ceremony-playback.js";
+import {
   buildSecretGuessCandidates,
   buildSecretGuessReveal,
   secretGuessFallbackKind,
@@ -236,6 +247,12 @@ const io = new Server(httpServer, {
  *  turnDurations: number[],
  *  turnEndsAt: number | null,
  *  turnTimer: ReturnType<typeof setTimeout> | null,
+ *  gradualReveal: null | {
+ *    pattern: string,
+ *    stepMs: number,
+ *    steps: number,
+ *    startedAt: number | null,
+ *  },
  *  seenWordIds: Set<string>,
  *  roundsSinceSpecial: number,
  *  lastWasSpecial: boolean,
@@ -278,6 +295,15 @@ const io = new Server(httpServer, {
  *  communityAwardsTimer: ReturnType<typeof setTimeout> | null,
  *  communityAwardsResults: null | { awards: object[] },
  *  communityAwardsToken: number,
+ *  ceremonyPlaybackSeq: number,
+ *  ceremonyPlayback: null | {
+ *    kind: 'ai' | 'community',
+ *    gameSeq: number,
+ *    awardCount: number,
+ *    runId: number,
+ *    startedAt: number,
+ *    expiresAt: number,
+ *  },
  *  aiSecretGuessStatus: 'idle' | 'armed' | 'countdown' | 'requested' | 'generating' | 'ready' | 'revealed' | 'skipped' | 'error',
  *  aiSecretGuessGameSeq: number | null,
  *  aiSecretGuessRoundSeq: number | null,
@@ -566,6 +592,72 @@ function emitCommunityAwardsState(
   }
 }
 
+function ceremonyAwardCount(room, kind) {
+  if (kind === "ai") {
+    return room.aiAwardsStatus === "ready" &&
+      Array.isArray(room.aiAwards?.awards)
+      ? room.aiAwards.awards.length
+      : 0;
+  }
+  if (kind === "community") {
+    return room.communityAwardsStatus === "ready" &&
+      Array.isArray(room.communityAwardsResults?.awards)
+      ? room.communityAwardsResults.awards.length
+      : 0;
+  }
+  return 0;
+}
+
+function buildCeremonyPlaybackState(room, now = Date.now()) {
+  const playback = normalizeCeremonyPlayback(room.ceremonyPlayback);
+  if (
+    !playback ||
+    room.phase !== "finished" ||
+    room.communityAwardsStatus === "voting" ||
+    playback.gameSeq !== room.gameSeq ||
+    playback.awardCount !== ceremonyAwardCount(room, playback.kind) ||
+    !isCeremonyPlaybackAvailable(playback, now)
+  ) {
+    return null;
+  }
+  return playback;
+}
+
+function emitCeremonyPlaybackState(room, targetSocketId = null) {
+  const payload = {
+    playback: buildCeremonyPlaybackState(room),
+    serverNow: Date.now(),
+  };
+  if (targetSocketId) {
+    io.to(targetSocketId).emit("ceremonyPlaybackUpdate", payload);
+    return;
+  }
+  io.to(room.code).emit("ceremonyPlaybackUpdate", payload);
+}
+
+function clearCeremonyPlayback(room, { emit = true } = {}) {
+  if (!room.ceremonyPlayback) return false;
+  room.ceremonyPlayback = null;
+  if (emit) emitCeremonyPlaybackState(room);
+  return true;
+}
+
+function startCeremonyPlayback(room, kind) {
+  const awardCount = ceremonyAwardCount(room, kind);
+  if (room.phase !== "finished" || awardCount < 1) return null;
+  room.ceremonyPlaybackSeq += 1;
+  const playback = createCeremonyPlayback({
+    kind,
+    gameSeq: room.gameSeq,
+    awardCount,
+    runId: room.ceremonyPlaybackSeq,
+  });
+  if (!playback) return null;
+  room.ceremonyPlayback = playback;
+  emitCeremonyPlaybackState(room);
+  return playback;
+}
+
 function clearCommunityAwardsTimer(room) {
   if (room.communityAwardsTimer) {
     clearTimeout(room.communityAwardsTimer);
@@ -600,6 +692,7 @@ function finalizeCommunityAwards(room, reason) {
   };
   emitCommunityAwardsState(room);
   io.to(room.code).emit("communityAwardsReady", { gameSeq: room.gameSeq });
+  startCeremonyPlayback(room, "community");
   return true;
 }
 
@@ -669,6 +762,7 @@ function parseCommunityAwardBallot(room, data) {
 }
 
 function resetAiForNewGame(room) {
+  clearCeremonyPlayback(room, { emit: false });
   room.aiAwardsToken += 1;
   room.aiAwardsStatus = "idle";
   room.aiAwards = null;
@@ -677,6 +771,7 @@ function resetAiForNewGame(room) {
 }
 
 function resetAwardsForExtension(room) {
+  clearCeremonyPlayback(room, { emit: false });
   room.aiAwardsToken += 1;
   room.aiAwardsStatus = "idle";
   room.aiAwards = null;
@@ -685,6 +780,7 @@ function resetAwardsForExtension(room) {
 }
 
 function resetAiWhenReturningToLobby(room) {
+  clearCeremonyPlayback(room, { emit: false });
   room.aiAwardsToken += 1;
   room.aiAwardsStatus = "idle";
   room.aiAwards = null;
@@ -1339,7 +1435,10 @@ function canPlayerNextRound(room, playerId) {
   if (room.roundType === "gradual") {
     // 公開が始まるまでは「できた！」で公開する（つぎへは公開後）
     if (room.drawPhase !== "guessing") return false;
-    return room.drawerId === playerId;
+    return (
+      room.drawerId === playerId &&
+      isGradualRevealComplete(room.gradualReveal)
+    );
   }
   if (room.roundType === "relay") {
     if (room.drawPhase !== "guessing") return false;
@@ -1398,6 +1497,11 @@ function buildAiCrazyPromptPublicState(room, playerId) {
     fullPrompt: canSee ? room.currentAiCrazyPrompt.fullPrompt : null,
     promptLabel: active ? "AIむちゃぶりお題" : null,
   };
+}
+
+function buildGradualRevealPublicState(room) {
+  if (room.roundType !== "gradual" || !room.gradualReveal) return null;
+  return { ...room.gradualReveal };
 }
 
 function buildRoundPayload(room, playerId) {
@@ -1466,6 +1570,7 @@ function buildRoundPayload(room, playerId) {
   if (room.roundType === "gradual") {
     payload.canFinishGradual =
       room.drawPhase === "drawing" && room.drawerId === playerId;
+    payload.gradualReveal = buildGradualRevealPublicState(room);
   }
 
   if (room.roundType === "normal") {
@@ -1543,6 +1648,33 @@ function emitRoundSync(room) {
   }
 }
 
+function scheduleGradualRevealCompletion(room) {
+  const plan = room.gradualReveal;
+  const startedAt = Number(plan?.startedAt);
+  const duration = gradualRevealDuration(plan);
+  if (!Number.isFinite(startedAt) || startedAt <= 0 || duration <= 0) return;
+
+  const expectedRoundSeq = room.roundSeq;
+  const timer = setTimeout(() => {
+    // 古いコールバックが遅れて走っても、新ラウンドのtimer参照を消さない。
+    if (room.turnTimer === timer) room.turnTimer = null;
+    const current = rooms.get(room.code);
+    if (
+      current !== room ||
+      current.phase !== "playing" ||
+      current.roundType !== "gradual" ||
+      current.drawPhase !== "guessing" ||
+      current.roundSeq !== expectedRoundSeq ||
+      current.gradualReveal?.startedAt !== startedAt
+    ) {
+      return;
+    }
+    // 公開が終わった瞬間に、描き手の「つぎへ」を有効にする。
+    emitRoundSync(current);
+  }, Math.max(0, startedAt + duration - Date.now()) + 20);
+  room.turnTimer = timer;
+}
+
 function enterGuessing(room) {
   clearTurnTimer(room);
   room.drawPhase = "guessing";
@@ -1550,9 +1682,16 @@ function enterGuessing(room) {
     room.roundType === "relay"
       ? room.drawerIds[room.drawerIds.length - 1] || null
       : room.drawerId;
-  // だんだん見える: ここで初めて線を配り、全員の画面でスロー再生を始める
+  // だんだん見える: ここで初めて完成した線と、全員共通の公開方法を配る。
   if (room.roundType === "gradual") {
-    io.to(room.code).emit("gradualReveal", { strokes: room.strokes });
+    room.gradualReveal ||= createGradualRevealPlan();
+    room.gradualReveal.startedAt = Date.now();
+    io.to(room.code).emit("gradualReveal", {
+      roundId: room.roundSeq,
+      strokes: room.strokes,
+      gradualReveal: { ...room.gradualReveal },
+    });
+    scheduleGradualRevealCompletion(room);
   }
   emitRoundSync(room);
 }
@@ -1631,6 +1770,7 @@ function resetRoundFields(room) {
   room.word = null;
   room.relayIndex = 0;
   room.turnDurations = [];
+  room.gradualReveal = null;
   room.seenWordIds = new Set();
   room.strokes = [];
   room.constraint = null;
@@ -1827,6 +1967,7 @@ function startRound(room) {
     room.drawerIds = [drawer.id];
     room.seenWordIds = new Set([drawer.id]);
     room.drawPhase = "drawing";
+    room.gradualReveal = createGradualRevealPlan();
     scheduleTimedDrawing(room, GRADUAL_DURATION_MS);
     emitRoundStart(room, { clear: true, fanfare: true });
     return;
@@ -1866,10 +2007,13 @@ function syncPlayerState(socket, room, playerId) {
   emitGallery(room, socket.id);
   emitAiState(room, socket.id);
   emitCommunityAwardsState(room, socket.id, playerId);
+  emitCeremonyPlaybackState(room, socket.id);
   if (room.phase === "playing" && room.word) {
     io.to(socket.id).emit("roundStart", buildRoundPayload(room, playerId));
     io.to(socket.id).emit("strokeHistory", {
+      roundId: room.roundSeq,
       strokes: strokesVisibleTo(room, playerId),
+      gradualReveal: buildGradualRevealPublicState(room),
     });
     if (
       playerId === room.aiSecretGuessDrawerId &&
@@ -2082,6 +2226,7 @@ function reconcileRemovedGalleryItems(
   const idSet =
     removedIds instanceof Set ? removedIds : new Set(removedIds || []);
   if (idSet.size === 0) return;
+  clearCeremonyPlayback(room);
 
   if (room.aiAwardsStatus === "ready" && room.aiAwards?.awards) {
     const remainingAwards = room.aiAwards.awards.filter(
@@ -2220,6 +2365,7 @@ function createEmptyRoom(code, hostId) {
     turnDurations: [],
     turnEndsAt: null,
     turnTimer: null,
+    gradualReveal: null,
     seenWordIds: new Set(),
     roundsSinceSpecial: 0,
     lastWasSpecial: false,
@@ -2255,6 +2401,8 @@ function createEmptyRoom(code, hostId) {
     communityAwardsTimer: null,
     communityAwardsResults: null,
     communityAwardsToken: 0,
+    ceremonyPlaybackSeq: 0,
+    ceremonyPlayback: null,
     aiSecretGuessStatus: "idle",
     aiSecretGuessGameSeq: null,
     aiSecretGuessRoundSeq: null,
@@ -2649,7 +2797,9 @@ io.on("connection", (socket) => {
     if (!ctx) return reply(cb, { ok: false, strokes: [] });
     reply(cb, {
       ok: true,
+      roundId: ctx.room.roundSeq,
       strokes: strokesVisibleTo(ctx.room, ctx.playerId),
+      gradualReveal: buildGradualRevealPublicState(ctx.room),
     });
   });
 
@@ -2705,9 +2855,80 @@ io.on("connection", (socket) => {
     if (now - room.lastHighlightAt < HIGHLIGHT_COOLDOWN_MS) {
       return reply(cb, { ok: true, stale: true });
     }
+    clearCeremonyPlayback(room);
     room.lastHighlightAt = now;
     io.to(code).emit("highlightStart", { ids: items.map((item) => item.id) });
     reply(cb, { ok: true });
+  });
+
+  // AI／会場投票の授賞式を、ホストの合図で全端末へ同時に再上映する。
+  onSocket(socket, "startCeremonyPlayback", (data, cb) => {
+    if (typeof data === "function") {
+      cb = data;
+      data = {};
+    }
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { room, playerId } = ctx;
+    if (room.hostId !== playerId) {
+      return reply(cb, {
+        ok: false,
+        error: "ホストだけが授賞式を再上映できます",
+      });
+    }
+    if (room.phase !== "finished") {
+      return reply(cb, {
+        ok: false,
+        error: "ゲーム終了後に授賞式を見られます",
+      });
+    }
+    if (!Number.isInteger(data?.gameSeq) || data.gameSeq !== room.gameSeq) {
+      return reply(cb, {
+        ok: false,
+        error: "授賞式の情報が古くなりました。画面を開き直してください",
+      });
+    }
+    const kind = data?.kind;
+    if (kind !== "ai" && kind !== "community") {
+      return reply(cb, { ok: false, error: "授賞式を選べませんでした" });
+    }
+    if (room.communityAwardsStatus === "voting") {
+      return reply(cb, {
+        ok: false,
+        error: "みんなの投票が終わってから再上映できます",
+      });
+    }
+
+    const existing = normalizeCeremonyPlayback(room.ceremonyPlayback);
+    if (existing && isCeremonyPlaybackInProgress(existing)) {
+      if (existing.kind === kind && existing.gameSeq === room.gameSeq) {
+        // 二重押しは全員の画面を触らず、現在の上映をそのまま続ける。
+        return reply(cb, {
+          ok: true,
+          active: true,
+          runId: existing.runId,
+        });
+      }
+      return reply(cb, {
+        ok: false,
+        error: "いま別の授賞式を上映中です",
+      });
+    }
+    if (ceremonyAwardCount(room, kind) < 1) {
+      return reply(cb, {
+        ok: false,
+        error:
+          kind === "ai"
+            ? "AI授賞式がまだ完成していません"
+            : "投票結果がまだ完成していません",
+      });
+    }
+
+    const playback = startCeremonyPlayback(room, kind);
+    if (!playback) {
+      return reply(cb, { ok: false, error: "授賞式を開始できませんでした" });
+    }
+    reply(cb, { ok: true, runId: playback.runId });
   });
 
   onSocket(socket, "revealLiar", (cb) => {
@@ -2803,10 +3024,18 @@ io.on("connection", (socket) => {
   });
 
   // だんだん見える: 描き手の「できた！」で公開スタート
-  onSocket(socket, "finishGradualDrawing", (cb) => {
+  onSocket(socket, "finishGradualDrawing", (data, cb) => {
+    if (typeof data === "function") {
+      cb = data;
+      data = {};
+    }
     const ctx = getContext(socket);
     if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
     const { room, playerId } = ctx;
+    const clientRoundId = data?.roundId;
+    if (Number.isInteger(clientRoundId) && clientRoundId !== room.roundSeq) {
+      return reply(cb, { ok: true, stale: true });
+    }
     if (
       room.phase !== "playing" ||
       room.roundType !== "gradual" ||
@@ -3024,6 +3253,7 @@ io.on("connection", (socket) => {
       return reply(cb, { ok: false, error: "投票できる参加者がいません" });
     }
 
+    clearCeremonyPlayback(room);
     room.communityAwardsToken += 1;
     room.communityAwardsStatus = "voting";
     room.communityAwardCategories = categories;
@@ -3156,6 +3386,7 @@ io.on("connection", (socket) => {
     const gameSeq = room.gameSeq;
     const token = room.aiAwardsToken + 1;
     const safetyIdentifier = aiSafetyIdentifier(playerId);
+    clearCeremonyPlayback(room);
     room.aiAwardsToken = token;
     room.aiAwardsStatus = "generating";
     room.aiAwards = null;
@@ -3202,6 +3433,7 @@ io.on("connection", (socket) => {
         currentRoom.aiAwardsError = "";
         emitAiState(currentRoom);
         io.to(currentRoom.code).emit("aiAwardsReady", { gameSeq });
+        startCeremonyPlayback(currentRoom, "ai");
       })
       .catch((error) => {
         logAiFailure("awards", error);
@@ -3275,6 +3507,7 @@ io.on("connection", (socket) => {
       });
     }
     room.gallery = [];
+    clearCeremonyPlayback(room);
     room.aiAwardsToken += 1;
     room.aiAwardsStatus = "idle";
     room.aiAwards = null;

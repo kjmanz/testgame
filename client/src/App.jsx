@@ -7,22 +7,20 @@ import {
   CommunityVoteOverlay,
 } from "./CommunityAwards.jsx";
 import DrawingCanvas from "./DrawingCanvas.jsx";
+import {
+  ceremonyPlaybackPosition,
+  isCeremonyPlaybackInProgress,
+  normalizeCeremonyPlayback,
+} from "../../shared/ceremony-playback.js";
 
 const SESSION_KEY = "oekaki-session";
 /** ブラウザを閉じても3時間は同じ部屋に戻れる */
 const SESSION_TTL_MS = 3 * 60 * 60 * 1000;
-/** 今日のハイライト: 1枚あたりの表示時間。枚数が多いときは早送りして全体を収める */
-const HIGHLIGHT_MS_PER_ITEM = 1100;
-const HIGHLIGHT_MIN_MS_PER_ITEM = 500;
-const HIGHLIGHT_TOTAL_MS = 24_000;
-/** AI授賞式: 無音のドラムロールをはさんで1作品ずつ発表する */
-const AWARD_OPENING_MS = 1800;
-const AWARD_DRUMROLL_MS = 2200;
-const AWARD_REVEAL_MS = 5000;
-/** みんなの投票授賞式も、1賞ずつ間を取って発表する */
-const COMMUNITY_AWARD_OPENING_MS = 1700;
-const COMMUNITY_AWARD_DRUMROLL_MS = 2100;
-const COMMUNITY_AWARD_REVEAL_MS = 5600;
+/** 今日のハイライト: 作品を読める間を取り、最後の1枚は余韻を長めに残す。 */
+const HIGHLIGHT_MS_PER_ITEM = 1800;
+const HIGHLIGHT_FINAL_MS = 3200;
+const HIGHLIGHT_MIN_MS_PER_ITEM = 700;
+const HIGHLIGHT_TOTAL_MS = 45_000;
 /** AIのひみつ予想: APIの都合でゲームを待たせず、結果だけ短く見せる */
 const AI_SECRET_GUESS_ACK_TIMEOUT_MS = 6000;
 const AI_SECRET_GUESS_REVEAL_MS = 7000;
@@ -64,6 +62,74 @@ const EMPTY_AI_CRAZY_PROMPT_STATE = {
   fullPrompt: null,
   promptLabel: null,
 };
+
+const GRADUAL_REVEAL_PRESENTATIONS = Object.freeze({
+  "line-order": { icon: "✏️", label: "描いた順に見える" },
+  "top-down": { icon: "⬇️", label: "上から見える" },
+  "bottom-up": { icon: "⬆️", label: "下から見える" },
+  "left-right": { icon: "➡️", label: "左から見える" },
+  "right-left": { icon: "⬅️", label: "右から見える" },
+  "center-out": { icon: "🎯", label: "中心から広がる" },
+  "outside-in": { icon: "🌀", label: "外側から中心へ" },
+});
+
+function supportsGradualRadialMask() {
+  if (typeof CSS === "undefined" || typeof CSS.supports !== "function") {
+    return false;
+  }
+  const value = "radial-gradient(circle, transparent 50%, #000 51%)";
+  return (
+    CSS.supports("mask-image", value) ||
+    CSS.supports("-webkit-mask-image", value)
+  );
+}
+
+function normalizeGradualReveal(value) {
+  if (!value || typeof value !== "object") return null;
+  let pattern = Object.prototype.hasOwnProperty.call(
+    GRADUAL_REVEAL_PRESENTATIONS,
+    value.pattern
+  )
+    ? value.pattern
+    : "line-order";
+  if (
+    (pattern === "center-out" || pattern === "outside-in") &&
+    !supportsGradualRadialMask()
+  ) {
+    pattern = pattern === "center-out" ? "top-down" : "bottom-up";
+  }
+  const stepMs = value.stepMs === 2000 ? 2000 : 1000;
+  const steps = stepMs === 2000 ? 7 : 8;
+  const startedAt = Number(value.startedAt);
+  return {
+    pattern,
+    stepMs,
+    steps,
+    startedAt:
+      Number.isFinite(startedAt) && startedAt > 0 ? startedAt : null,
+  };
+}
+
+function gradualRevealCoverStyle(step, steps) {
+  const progress = Math.max(0, Math.min(1, step / Math.max(1, steps)));
+  return {
+    "--gradual-reveal": `${progress * 100}%`,
+    "--gradual-cover": `${(1 - progress) * 100}%`,
+  };
+}
+
+function shouldDeferGradualHistory(reveal) {
+  return reveal?.pattern === "line-order" && Boolean(reveal.startedAt);
+}
+
+function highlightItemDuration(total, index) {
+  if (total <= 1 || index >= total - 1) return HIGHLIGHT_FINAL_MS;
+  const regularBudget = Math.max(0, HIGHLIGHT_TOTAL_MS - HIGHLIGHT_FINAL_MS);
+  return Math.max(
+    HIGHLIGHT_MIN_MS_PER_ITEM,
+    Math.min(HIGHLIGHT_MS_PER_ITEM, Math.floor(regularBudget / (total - 1)))
+  );
+}
 
 function createSocket() {
   const url = import.meta.env.VITE_SOCKET_URL || undefined;
@@ -191,6 +257,10 @@ export default function App() {
   const answerCloseButtonRef = useRef(null);
   const answerPreviousFocusRef = useRef(null);
   const queuedSecretGuessRevealRef = useRef(null);
+  const highlightCloseButtonRef = useRef(null);
+  const highlightPreviousFocusRef = useRef(null);
+  /** 自分だけ閉じた上映は、同じrunIdの同期更新で開き直さない。 */
+  const dismissedCeremonyRunRef = useRef(null);
   /** 再接続・ギャラリー表示中でも未処理の画像依頼を失わないための箱 */
   const pendingSecretGuessCaptureRef = useRef(null);
   const trySecretGuessCaptureRef = useRef(() => {});
@@ -198,6 +268,7 @@ export default function App() {
   const hasDrawingRef = useRef(false);
   /** サーバー時刻 - 端末時刻（タイマー表示のずれ補正用） */
   const serverOffsetRef = useRef(0);
+  const serverClockSyncedRef = useRef(false);
   const [initialInviteCode] = useState(readInviteRoomCode);
   const [screen, setScreen] = useState("home"); // home | lobby | play | finished | gallery
   // 期限切れセッションでも名前だけは引き継いで入力の手間を省く
@@ -226,6 +297,8 @@ export default function App() {
   });
   const [roundType, setRoundType] = useState("normal");
   const [drawPhase, setDrawPhase] = useState("drawing");
+  const [gradualRevealState, setGradualRevealState] = useState(null);
+  const [gradualRevealStep, setGradualRevealStep] = useState(0);
   const [canDraw, setCanDraw] = useState(false);
   const [canNextRound, setCanNextRound] = useState(false);
   const [turnEndsAt, setTurnEndsAt] = useState(null);
@@ -273,6 +346,10 @@ export default function App() {
   const [communityVoteRemainSec, setCommunityVoteRemainSec] = useState(null);
   /** 会場投票の結果発表: opening | drumroll | reveal | finale */
   const [communityCeremony, setCommunityCeremony] = useState(null);
+  /** サーバーが管理する、AI／会場投票共通の上映セッション。 */
+  const [ceremonyPlayback, setCeremonyPlayback] = useState(null);
+  const [ceremonyPlaybackRunning, setCeremonyPlaybackRunning] =
+    useState(false);
   const [secretGuessActive, setSecretGuessActive] = useState(false);
   const [secretGuessPending, setSecretGuessPending] = useState(false);
   const [secretGuessReveal, setSecretGuessReveal] = useState(null);
@@ -284,6 +361,7 @@ export default function App() {
   const isAiFinishBusy = aiState.awardsStatus === "generating";
   const isCommunityVoting = communityAwardsState.status === "voting";
   const isFinishCeremonyBusy = isAiFinishBusy || isCommunityVoting;
+  const isCeremonyPlaybackRunning = ceremonyPlaybackRunning;
   const communityVoteSessionKey =
     communityAwardsState.status === "voting"
       ? `${communityAwardsState.gameSeq}:${(communityAwardsState.categories || [])
@@ -374,6 +452,11 @@ export default function App() {
     }
     setRoundType(data.roundType || "normal");
     setDrawPhase(data.drawPhase || "drawing");
+    const nextGradualReveal = normalizeGradualReveal(data.gradualReveal);
+    setGradualRevealState(nextGradualReveal);
+    if (isNewRound || !nextGradualReveal?.startedAt) {
+      setGradualRevealStep(0);
+    }
     setDrawerId(data.drawerId || "");
     setDrawerName(data.drawerName || "");
     setDrawerNames(data.drawerNames || data.coopNames || []);
@@ -425,6 +508,8 @@ export default function App() {
     setWord(null);
     setRoundType("normal");
     setDrawPhase("drawing");
+    setGradualRevealState(null);
+    setGradualRevealStep(0);
     setCanDraw(false);
     setCanNextRound(false);
     setTurnEndsAt(null);
@@ -501,7 +586,11 @@ export default function App() {
     setExtensionRounds(3);
     setFinishBusy(false);
     setHighlight(null);
+    highlightPreviousFocusRef.current = null;
     setAwardCeremony(null);
+    setCeremonyPlayback(null);
+    setCeremonyPlaybackRunning(false);
+    dismissedCeremonyRunRef.current = null;
     setCommunityAwardsState(EMPTY_COMMUNITY_AWARDS_STATE);
     setCommunityVoteOpen(false);
     setCommunityVoteStep(0);
@@ -588,55 +677,76 @@ export default function App() {
   // 今日のハイライト: 1枚ずつめくって、最後まで来たら閉じる
   useEffect(() => {
     if (!highlight) return;
-    const perItem = Math.max(
-      HIGHLIGHT_MIN_MS_PER_ITEM,
-      Math.min(
-        HIGHLIGHT_MS_PER_ITEM,
-        Math.round(HIGHLIGHT_TOTAL_MS / Math.max(1, highlight.ids.length))
-      )
+    const perItem = highlightItemDuration(
+      highlight.ids.length,
+      highlight.index
     );
+    function onKeyDown(event) {
+      if (event.key === "Escape") {
+        dismissHighlight();
+      } else if (event.key === "Tab") {
+        event.preventDefault();
+        highlightCloseButtonRef.current?.focus();
+      }
+    }
     const t = setTimeout(() => {
+      if (highlight.index + 1 >= highlight.ids.length) {
+        dismissHighlight();
+        return;
+      }
       setHighlight((current) => {
         if (!current) return null;
-        const next = current.index + 1;
-        if (next >= current.ids.length) return null;
-        return { ...current, index: next };
+        return { ...current, index: current.index + 1 };
       });
     }, perItem);
-    return () => clearTimeout(t);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      clearTimeout(t);
+      window.removeEventListener("keydown", onKeyDown);
+    };
   }, [highlight]);
 
-  // AI授賞式: 開幕 → ためる → 1作品発表、を受賞数だけくり返す
+  // 授賞式はサーバー開始時刻から現在位置を算出し、全端末を同じ発表へそろえる。
   useEffect(() => {
-    if (!awardCeremony) return;
-    const awardCount = aiState.awards?.awards?.length || 0;
-    if (awardCount === 0 || awardCeremony.phase === "finale") return;
+    if (!ceremonyPlayback) return;
+    const runKey = `${ceremonyPlayback.gameSeq}:${ceremonyPlayback.runId}`;
+    let timer = null;
 
-    const delay =
-      awardCeremony.phase === "opening"
-        ? AWARD_OPENING_MS
-        : awardCeremony.phase === "drumroll"
-          ? AWARD_DRUMROLL_MS
-          : AWARD_REVEAL_MS;
+    function tickCeremonyPlayback() {
+      const serverNow = Date.now() + serverOffsetRef.current;
+      const { ceremony } = ceremonyPlaybackPosition(
+        ceremonyPlayback,
+        serverNow
+      );
+      setCeremonyPlaybackRunning(
+        isCeremonyPlaybackInProgress(ceremonyPlayback, serverNow)
+      );
+      const dismissed = dismissedCeremonyRunRef.current === runKey;
 
-    const timer = setTimeout(() => {
-      setAwardCeremony((current) => {
-        if (!current) return null;
-        if (current.phase === "opening") {
-          return { phase: "drumroll", index: 0 };
+      if (!ceremony) {
+        setAwardCeremony(null);
+        setCommunityCeremony(null);
+      } else if (!dismissed) {
+        const frame = { ...ceremony, runId: ceremonyPlayback.runId };
+        if (ceremonyPlayback.kind === "ai") {
+          setCommunityCeremony(null);
+          setAwardCeremony(frame);
+        } else {
+          setAwardCeremony(null);
+          setCommunityCeremony(frame);
         }
-        if (current.phase === "drumroll") {
-          return { ...current, phase: "reveal" };
-        }
-        const nextIndex = current.index + 1;
-        if (nextIndex >= awardCount) {
-          return { phase: "finale", index: current.index };
-        }
-        return { phase: "drumroll", index: nextIndex };
-      });
-    }, delay);
-    return () => clearTimeout(timer);
-  }, [awardCeremony, aiState.awards]);
+      }
+
+      if (ceremony?.phase !== "finale") {
+        timer = window.setTimeout(tickCeremonyPlayback, 100);
+      }
+    }
+
+    tickCeremonyPlayback();
+    return () => {
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [ceremonyPlayback]);
 
   // 新しい会場投票が始まったときだけ下書きを初期化する。
   // 進捗更新のたびに投票画面を勝手に開き直さないため、文字列キーで判定する。
@@ -687,38 +797,6 @@ export default function App() {
     return () => clearInterval(timer);
   }, [communityAwardsState.status, communityAwardsState.closesAt]);
 
-  // みんなの投票結果も、開幕 → ドラムロール → 発表の順に1賞ずつ見せる
-  useEffect(() => {
-    if (!communityCeremony) return;
-    const awardCount = communityAwardsState.results?.awards?.length || 0;
-    if (awardCount === 0 || communityCeremony.phase === "finale") return;
-
-    const delay =
-      communityCeremony.phase === "opening"
-        ? COMMUNITY_AWARD_OPENING_MS
-        : communityCeremony.phase === "drumroll"
-          ? COMMUNITY_AWARD_DRUMROLL_MS
-          : COMMUNITY_AWARD_REVEAL_MS;
-
-    const timer = setTimeout(() => {
-      setCommunityCeremony((current) => {
-        if (!current) return null;
-        if (current.phase === "opening") {
-          return { phase: "drumroll", index: 0 };
-        }
-        if (current.phase === "drumroll") {
-          return { ...current, phase: "reveal" };
-        }
-        const nextIndex = current.index + 1;
-        if (nextIndex >= awardCount) {
-          return { phase: "finale", index: current.index };
-        }
-        return { phase: "drumroll", index: nextIndex };
-      });
-    }, delay);
-    return () => clearTimeout(timer);
-  }, [communityCeremony, communityAwardsState.results]);
-
   useEffect(() => {
     window.scrollTo(0, 0);
   }, [screen]);
@@ -737,6 +815,91 @@ export default function App() {
     const id = setInterval(tick, 200);
     return () => clearInterval(id);
   }, [turnEndsAt]);
+
+  // だんだん見える: 端末ごとの加算ではなく、サーバー開始時刻から段階を復元する。
+  useEffect(() => {
+    const startedAt = gradualRevealState?.startedAt;
+    const stepMs = gradualRevealState?.stepMs;
+    const steps = gradualRevealState?.steps;
+    if (
+      roundType !== "gradual" ||
+      drawPhase !== "guessing" ||
+      !startedAt ||
+      !stepMs ||
+      !steps
+    ) {
+      setGradualRevealStep(0);
+      return;
+    }
+
+    let timer = null;
+    function tick() {
+      const serverNow = Date.now() + serverOffsetRef.current;
+      const nextStep = Math.max(
+        0,
+        Math.min(steps, Math.floor((serverNow - startedAt) / stepMs))
+      );
+      setGradualRevealStep(nextStep);
+      if (nextStep >= steps && timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    }
+    tick();
+    if (
+      Date.now() + serverOffsetRef.current <
+      startedAt + stepMs * steps
+    ) {
+      timer = setInterval(tick, 100);
+    }
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [
+    roundType,
+    drawPhase,
+    gradualRevealState?.startedAt,
+    gradualRevealState?.stepMs,
+    gradualRevealState?.steps,
+  ]);
+
+  // 「描いた順」の回だけ、完成画像のマスクではなく線の履歴を段階再生する。
+  useEffect(() => {
+    if (
+      screen !== "play" ||
+      roundType !== "gradual" ||
+      drawPhase !== "guessing" ||
+      gradualRevealState?.pattern !== "line-order" ||
+      !gradualRevealState.startedAt ||
+      !historySeed.token
+    ) {
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      const elapsedMs = Math.max(
+        0,
+        Date.now() +
+          serverOffsetRef.current -
+          gradualRevealState.startedAt
+      );
+      canvasApiRef.current?.playGradualReveal(historySeed.strokes, {
+        durationMs:
+          gradualRevealState.stepMs * gradualRevealState.steps,
+        elapsedMs,
+        stepCount: gradualRevealState.steps,
+      });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [
+    screen,
+    roundType,
+    drawPhase,
+    gradualRevealState?.pattern,
+    gradualRevealState?.startedAt,
+    gradualRevealState?.stepMs,
+    gradualRevealState?.steps,
+    historySeed.token,
+  ]);
 
   useEffect(() => {
     let released = false;
@@ -926,6 +1089,9 @@ export default function App() {
       setTotalRounds(data?.totalRounds ?? 0);
       setFinishBusy(false);
       setAwardCeremony(null);
+      setCeremonyPlayback(null);
+      setCeremonyPlaybackRunning(false);
+      dismissedCeremonyRunRef.current = null;
       setCommunityAwardsState(EMPTY_COMMUNITY_AWARDS_STATE);
       setCommunityVoteOpen(false);
       setCommunityCeremony(null);
@@ -941,10 +1107,24 @@ export default function App() {
       canvasApiRef.current?.playReplay();
     });
 
-    // だんだん見える: サーバーから線が届いたら、ゆっくり公開再生する
+    // だんだん見える: 完成した線と全員共通の公開方法を同時に受け取る。
     socket.on("gradualReveal", (data) => {
+      if (
+        data?.roundId == null ||
+        String(data.roundId) !== String(roundIdRef.current ?? "")
+      ) {
+        return;
+      }
       const strokes = data?.strokes || [];
-      canvasApiRef.current?.playGradualReveal(strokes);
+      const reveal = normalizeGradualReveal(data?.gradualReveal);
+      if (!reveal?.startedAt) return;
+      setGradualRevealState(reveal);
+      setGradualRevealStep(0);
+      setHistorySeed((prev) => ({
+        token: prev.token + 1,
+        strokes,
+        deferDraw: shouldDeferGradualHistory(reveal),
+      }));
       markDrawing(strokes.some((ev) => ev?.type === "move"));
     });
 
@@ -1094,7 +1274,7 @@ export default function App() {
     socket.on("aiAwardsReady", () => {
       setHighlight(null);
       setCommunityCeremony(null);
-      setAwardCeremony({ phase: "opening", index: 0 });
+      setAwardCeremony(null);
     });
 
     socket.on("communityAwardsStateUpdate", (data) => {
@@ -1106,6 +1286,8 @@ export default function App() {
 
     socket.on("communityAwardsStarted", () => {
       setHighlight(null);
+      setCeremonyPlayback(null);
+      setCeremonyPlaybackRunning(false);
       setAwardCeremony(null);
       setCommunityCeremony(null);
       setCommunityVoteOpen(true);
@@ -1116,7 +1298,30 @@ export default function App() {
       setAwardCeremony(null);
       setCommunityVoteOpen(false);
       setCommunityVoteSubmitting(false);
-      setCommunityCeremony({ phase: "opening", index: 0 });
+      setCommunityCeremony(null);
+    });
+
+    socket.on("ceremonyPlaybackUpdate", (data) => {
+      if (
+        !serverClockSyncedRef.current &&
+        Number.isFinite(Number(data?.serverNow))
+      ) {
+        serverOffsetRef.current = Number(data.serverNow) - Date.now();
+      }
+      const playback = normalizeCeremonyPlayback(data?.playback);
+      setCeremonyPlayback(playback);
+      setCeremonyPlaybackRunning(
+        isCeremonyPlaybackInProgress(
+          playback,
+          Date.now() + serverOffsetRef.current
+        )
+      );
+      setAwardCeremony(null);
+      setCommunityCeremony(null);
+      if (!playback) return;
+      setHighlight(null);
+      setCommunityVoteOpen(false);
+      setCommunityVoteSubmitting(false);
     });
 
     socket.on("communityAwardsNoVotes", () => {
@@ -1130,16 +1335,33 @@ export default function App() {
     socket.on("highlightStart", (data) => {
       const ids = Array.isArray(data?.ids) ? data.ids : [];
       if (ids.length === 0) return;
+      highlightPreviousFocusRef.current = document.activeElement;
+      setCeremonyPlayback(null);
+      setCeremonyPlaybackRunning(false);
       setAwardCeremony(null);
       setCommunityCeremony(null);
       setHighlight({ ids, index: 0 });
     });
 
     socket.on("strokeHistory", (data) => {
+      if (
+        data?.roundId != null &&
+        String(data.roundId) !== String(roundIdRef.current ?? "")
+      ) {
+        return;
+      }
       const strokes = data?.strokes || [];
+      let reveal = null;
+      if (
+        Object.prototype.hasOwnProperty.call(data || {}, "gradualReveal")
+      ) {
+        reveal = normalizeGradualReveal(data.gradualReveal);
+        setGradualRevealState(reveal);
+      }
       setHistorySeed((prev) => ({
         token: prev.token + 1,
         strokes,
+        deferDraw: shouldDeferGradualHistory(reveal),
       }));
       markDrawing(strokes.some((ev) => ev?.type === "move"));
     });
@@ -1150,6 +1372,7 @@ export default function App() {
         if (!res?.now) return;
         const t1 = Date.now();
         serverOffsetRef.current = res.now - (t0 + t1) / 2;
+        serverClockSyncedRef.current = true;
       });
     }
 
@@ -1427,10 +1650,23 @@ export default function App() {
   }
 
   function startAwardCeremony() {
-    if (isCommunityVoting || !aiState.awards?.awards?.length) return;
-    setHighlight(null);
-    setCommunityCeremony(null);
-    setAwardCeremony({ phase: "opening", index: 0 });
+    if (
+      !isHost ||
+      isCommunityVoting ||
+      !aiState.awards?.awards?.length
+    ) {
+      return;
+    }
+    setError("");
+    socketRef.current?.emit(
+      "startCeremonyPlayback",
+      { kind: "ai", gameSeq: aiState.gameSeq },
+      (res) => {
+        if (!res?.ok) {
+          setError(res?.error || "AI授賞式を再上映できません");
+        }
+      }
+    );
   }
 
   function startCommunityAwards() {
@@ -1509,11 +1745,17 @@ export default function App() {
   }
 
   function startCommunityAwardCeremony() {
-    if (!communityAwardsState.results?.awards?.length) return;
-    setHighlight(null);
-    setAwardCeremony(null);
-    setCommunityVoteOpen(false);
-    setCommunityCeremony({ phase: "opening", index: 0 });
+    if (!isHost || !communityAwardsState.results?.awards?.length) return;
+    setError("");
+    socketRef.current?.emit(
+      "startCeremonyPlayback",
+      { kind: "community", gameSeq: communityAwardsState.gameSeq },
+      (res) => {
+        if (!res?.ok) {
+          setError(res?.error || "投票結果を再上映できません");
+        }
+      }
+    );
   }
 
   function revealLiar() {
@@ -1525,9 +1767,13 @@ export default function App() {
 
   function finishGradualDrawing() {
     setError("");
-    socketRef.current?.emit("finishGradualDrawing", (res) => {
-      if (!res?.ok) setError(res?.error || "公開できません");
-    });
+    socketRef.current?.emit(
+      "finishGradualDrawing",
+      { roundId },
+      (res) => {
+        if (!res?.ok) setError(res?.error || "公開できません");
+      }
+    );
   }
 
   function revealAnswer() {
@@ -1612,10 +1858,19 @@ export default function App() {
       // ギャラリー表示中はキャンバスが外れているので描き直す
       socketRef.current?.emit("requestStrokeHistory", (res) => {
         if (!res?.ok) return;
+        if (
+          res.roundId != null &&
+          String(res.roundId) !== String(roundIdRef.current ?? "")
+        ) {
+          return;
+        }
         const strokes = res.strokes || [];
+        const reveal = normalizeGradualReveal(res.gradualReveal);
+        setGradualRevealState(reveal);
         setHistorySeed((prev) => ({
           token: prev.token + 1,
           strokes,
+          deferDraw: shouldDeferGradualHistory(reveal),
         }));
         markDrawing(strokes.some((ev) => ev?.type === "move"));
       });
@@ -1780,6 +2035,30 @@ export default function App() {
     );
   }
 
+  function dismissHighlight() {
+    const previousFocus = highlightPreviousFocusRef.current;
+    highlightPreviousFocusRef.current = null;
+    setHighlight(null);
+    window.requestAnimationFrame(() => {
+      if (
+        previousFocus?.isConnected &&
+        !previousFocus.disabled &&
+        typeof previousFocus.focus === "function"
+      ) {
+        previousFocus.focus();
+      }
+    });
+  }
+
+  function dismissCeremony(kind) {
+    if (ceremonyPlayback?.kind === kind) {
+      dismissedCeremonyRunRef.current =
+        `${ceremonyPlayback.gameSeq}:${ceremonyPlayback.runId}`;
+    }
+    if (kind === "ai") setAwardCeremony(null);
+    else setCommunityCeremony(null);
+  }
+
   /** 今日のハイライト: 全員の画面で同時に、今日の絵を1枚ずつめくる */
   function renderHighlight() {
     if (!highlight) return null;
@@ -1788,9 +2067,16 @@ export default function App() {
     const item = gallery.find((g) => g.id === highlight.ids[highlight.index]);
     const drawers = (item?.drawerNames || []).join("・");
     return (
-      <div className="highlight" role="status" aria-live="polite">
+      <div
+        className="highlight"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="highlight-title"
+      >
         <div className="highlight-inner">
-          <div className="highlight-eyebrow">🎬 今日のハイライト</div>
+          <div className="highlight-eyebrow" id="highlight-title">
+            🎬 今日のハイライト
+          </div>
           <div className="highlight-frame">
             {item ? (
               <img
@@ -1803,7 +2089,14 @@ export default function App() {
               <div className="highlight-missing">この絵はもうないよ</div>
             )}
           </div>
-          <div className="highlight-word">{item?.word || "？？？"}</div>
+          <div
+            className="highlight-word"
+            aria-live="polite"
+            aria-atomic="true"
+            aria-label={`${item?.word || "？？？"}、${shown}枚目、全${total}枚`}
+          >
+            {item?.word || "？？？"}
+          </div>
           {item?.aiCrazyPromptFullPrompt && (
             <div className="highlight-ai-crazy">
               <span className="gallery-ai-crazy-badge">🤖 AIむちゃぶり</span>
@@ -1821,9 +2114,11 @@ export default function App() {
             {shown} / {total}
           </div>
           <button
+            ref={highlightCloseButtonRef}
             type="button"
             className="highlight-close"
-            onClick={() => setHighlight(null)}
+            onClick={dismissHighlight}
+            autoFocus
           >
             とじる
           </button>
@@ -1863,7 +2158,7 @@ export default function App() {
             ref={answerCloseButtonRef}
             type="button"
             className="award-show-close"
-            onClick={() => setAwardCeremony(null)}
+            onClick={() => dismissCeremony("ai")}
             aria-label="授賞式を閉じる"
           >
             × とじる
@@ -1951,8 +2246,18 @@ export default function App() {
                     <p className="award-comment">{award.reason}</p>
                   </div>
                 </div>
-                <div className="award-auto-progress" aria-hidden="true">
-                  <span />
+                <div
+                  className="award-auto-progress is-synced"
+                  aria-hidden="true"
+                >
+                  <span
+                    style={{
+                      transform: `scaleX(${Math.max(
+                        0,
+                        1 - (awardCeremony.progress || 0)
+                      )})`,
+                    }}
+                  />
                 </div>
               </div>
             )}
@@ -1967,7 +2272,7 @@ export default function App() {
                 <button
                   type="button"
                   className="award-finale-button"
-                  onClick={() => setAwardCeremony(null)}
+                  onClick={() => dismissCeremony("ai")}
                 >
                   受賞作を一覧で見る
                 </button>
@@ -2407,6 +2712,13 @@ export default function App() {
     }
 
     if (roundType === "gradual") {
+      const revealPresentation =
+        GRADUAL_REVEAL_PRESENTATIONS[
+          gradualRevealState?.pattern || "line-order"
+        ];
+      const revealFinished =
+        gradualRevealState?.startedAt &&
+        gradualRevealStep >= gradualRevealState.steps;
       return (
         <>
           <div className="meta row-meta">
@@ -2414,6 +2726,22 @@ export default function App() {
             {renderRoundProgress()}
             <span className="mode-pill gradual-pill">だんだん</span>
           </div>
+          {drawPhase === "guessing" && gradualRevealState?.startedAt && (
+            <div
+              className={`gradual-reveal-status${revealFinished ? " is-finished" : ""}`}
+              role="status"
+              aria-live="polite"
+            >
+              <strong>
+                {revealPresentation.icon} {revealPresentation.label}
+              </strong>
+              <span>
+                {revealFinished
+                  ? "ぜんぶ見えた！"
+                  : `${gradualRevealState.stepMs / 1000}秒ごと・公開 ${gradualRevealStep}/${gradualRevealState.steps}`}
+              </span>
+            </div>
+          )}
           {drawPhase === "drawing" ? (
             word ? (
               <>
@@ -2619,7 +2947,7 @@ export default function App() {
         ceremony={communityCeremony}
         state={communityAwardsState}
         gallery={gallery}
-        onClose={() => setCommunityCeremony(null)}
+        onClose={() => dismissCeremony("community")}
       />
 
       {renderAnswerCelebration()}
@@ -2965,13 +3293,20 @@ export default function App() {
                   <p className="community-panel-note">
                     みんなの票で決まった、本日の3大賞です！
                   </p>
-                  <button
-                    type="button"
-                    className="community-replay-button"
-                    onClick={startCommunityAwardCeremony}
-                  >
-                    🎬 投票結果をもう一度見る
-                  </button>
+                  {isHost ? (
+                    <button
+                      type="button"
+                      className="community-replay-button"
+                      onClick={startCommunityAwardCeremony}
+                      disabled={isCeremonyPlaybackRunning}
+                    >
+                      🎬 みんなで投票結果をもう一度見る
+                    </button>
+                  ) : (
+                    <p className="hint">
+                      🎬 ホストが投票結果を全員に再上映できます
+                    </p>
+                  )}
                   <CommunityAwardsSummary
                     state={communityAwardsState}
                     gallery={gallery}
@@ -3000,14 +3335,22 @@ export default function App() {
                     <p className="ai-ceremony-intro">
                       {aiState.awards.intro}
                     </p>
-                    <button
-                      type="button"
-                      className="ai-awards-replay"
-                      onClick={startAwardCeremony}
-                      disabled={isCommunityVoting}
-                    >
-                      🎬 授賞式をもう一度見る
-                    </button>
+                    {isHost ? (
+                      <button
+                        type="button"
+                        className="ai-awards-replay"
+                        onClick={startAwardCeremony}
+                        disabled={
+                          isCommunityVoting || isCeremonyPlaybackRunning
+                        }
+                      >
+                        🎬 みんなで授賞式をもう一度見る
+                      </button>
+                    ) : (
+                      <p className="hint">
+                        🎬 ホストがAI授賞式を全員に再上映できます
+                      </p>
+                    )}
                     <ol className="ai-award-list">
                       {aiState.awards.awards.map((award) => {
                         const item = gallery.find(
@@ -3355,7 +3698,34 @@ export default function App() {
                     </span>
                   </div>
                 )}
-              {replaying && (
+              {roundType === "gradual" &&
+                drawPhase === "guessing" &&
+                gradualRevealState?.startedAt &&
+                gradualRevealState.pattern !== "line-order" &&
+                gradualRevealStep < gradualRevealState.steps && (
+                  <div
+                    className={`canvas-gradual-cover is-${gradualRevealState.pattern}`}
+                    style={gradualRevealCoverStyle(
+                      gradualRevealStep,
+                      gradualRevealState.steps
+                    )}
+                    aria-hidden="true"
+                  />
+                )}
+              {roundType === "gradual" &&
+                drawPhase === "guessing" &&
+                gradualRevealState?.startedAt &&
+                gradualRevealStep < gradualRevealState.steps && (
+                  <div className="canvas-gradual-badge" aria-hidden="true">
+                    {
+                      GRADUAL_REVEAL_PRESENTATIONS[
+                        gradualRevealState.pattern
+                      ].icon
+                    }{" "}
+                    公開 {gradualRevealStep}/{gradualRevealState.steps}
+                  </div>
+                )}
+              {replaying && roundType !== "gradual" && (
                 <div className="canvas-replay" aria-hidden="true">
                   ▶ リプレイ
                 </div>

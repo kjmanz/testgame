@@ -378,8 +378,18 @@ export function CommunityAwardCeremony({
                 <span>／ 全{award.totalVotes || 0}票</span>
               </div>
               <p className="community-result-comment">{award.comment}</p>
-              <div className="award-auto-progress community-auto-progress" aria-hidden="true">
-                <span />
+              <div
+                className="award-auto-progress community-auto-progress is-synced"
+                aria-hidden="true"
+              >
+                <span
+                  style={{
+                    transform: `scaleX(${Math.max(
+                      0,
+                      1 - (ceremony.progress || 0)
+                    )})`,
+                  }}
+                />
               </div>
             </div>
           )}
