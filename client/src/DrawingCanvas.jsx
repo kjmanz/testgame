@@ -345,9 +345,7 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     stopReplay();
     historyRef.current = [...(historySeed.strokes || [])];
     drawingRef.current = false;
-    // 「描いた順」の公開直前に、完成絵が1フレームだけ見えるのを防ぐ。
-    if (historySeed.deferDraw) clearSurface();
-    else redrawFromHistory();
+    redrawFromHistory();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [historySeed]);
 

@@ -37,24 +37,28 @@ test("1秒公開は8段階、2秒公開は7段階になる", () => {
     stepMs: 1_000,
     steps: 8,
     startedAt: null,
+    completedAt: null,
   });
   assert.deepEqual(slow, {
     pattern: "line-order",
     stepMs: 2_000,
     steps: 7,
     startedAt: null,
+    completedAt: null,
   });
   assert.equal(gradualRevealDuration(fast), 8_000);
   assert.equal(gradualRevealDuration(slow), 14_000);
 });
 
-test("公開完了はサーバー開始時刻から判定する", () => {
+test("描画終了時刻が入るまで公開完了にしない", () => {
   const plan = {
     pattern: "center-out",
     stepMs: 2_000,
     steps: 7,
     startedAt: 10_000,
+    completedAt: null,
   };
-  assert.equal(isGradualRevealComplete(plan, 23_999), false);
-  assert.equal(isGradualRevealComplete(plan, 24_000), true);
+  assert.equal(isGradualRevealComplete(plan), false);
+  plan.completedAt = 12_345;
+  assert.equal(isGradualRevealComplete(plan), true);
 });

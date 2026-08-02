@@ -101,12 +101,15 @@ function normalizeGradualReveal(value) {
   const stepMs = value.stepMs === 2000 ? 2000 : 1000;
   const steps = stepMs === 2000 ? 7 : 8;
   const startedAt = Number(value.startedAt);
+  const completedAt = Number(value.completedAt);
   return {
     pattern,
     stepMs,
     steps,
     startedAt:
       Number.isFinite(startedAt) && startedAt > 0 ? startedAt : null,
+    completedAt:
+      Number.isFinite(completedAt) && completedAt > 0 ? completedAt : null,
   };
 }
 
@@ -116,10 +119,6 @@ function gradualRevealCoverStyle(step, steps) {
     "--gradual-reveal": `${progress * 100}%`,
     "--gradual-cover": `${(1 - progress) * 100}%`,
   };
-}
-
-function shouldDeferGradualHistory(reveal) {
-  return reveal?.pattern === "line-order" && Boolean(reveal.startedAt);
 }
 
 function highlightItemDuration(total, index) {
@@ -249,6 +248,8 @@ export default function App() {
   const playerIdRef = useRef("");
   /** Socket listener から最新ラウンドだけを判定するための箱 */
   const roundIdRef = useRef(null);
+  /** だんだん公開の再送・再接続で同じ線を重ね描きしないための連番 */
+  const gradualBatchSeqRef = useRef(0);
   /** 閉じた結果が roundUpdate で再び開かないようにする */
   const dismissedSecretGuessRoundRef = useRef(null);
   /** 正解演出のあとにAI予想を順番に見せるための待ち行列 */
@@ -400,6 +401,10 @@ export default function App() {
     );
     if (isNewRound) {
       roundIdRef.current = payloadRoundId;
+      gradualBatchSeqRef.current = Math.max(
+        0,
+        Number.isInteger(Number(data.batchSeq)) ? Number(data.batchSeq) : 0
+      );
       answerCelebrationRef.current = null;
       dismissedAnswerRoundRef.current = null;
       queuedSecretGuessRevealRef.current = null;
@@ -530,6 +535,7 @@ export default function App() {
     setStrokesUsed(0);
     markDrawing(false);
     roundIdRef.current = null;
+    gradualBatchSeqRef.current = 0;
     dismissedSecretGuessRoundRef.current = null;
     answerCelebrationRef.current = null;
     dismissedAnswerRoundRef.current = null;
@@ -816,19 +822,24 @@ export default function App() {
     return () => clearInterval(id);
   }, [turnEndsAt]);
 
-  // だんだん見える: 端末ごとの加算ではなく、サーバー開始時刻から段階を復元する。
+  // だんだん見える: 描画開始と同時に、全端末で同じ段階を進める。
   useEffect(() => {
     const startedAt = gradualRevealState?.startedAt;
+    const completedAt = gradualRevealState?.completedAt;
     const stepMs = gradualRevealState?.stepMs;
     const steps = gradualRevealState?.steps;
     if (
       roundType !== "gradual" ||
-      drawPhase !== "guessing" ||
       !startedAt ||
       !stepMs ||
       !steps
     ) {
       setGradualRevealStep(0);
+      return;
+    }
+
+    if (completedAt) {
+      setGradualRevealStep(steps);
       return;
     }
 
@@ -857,48 +868,10 @@ export default function App() {
     };
   }, [
     roundType,
-    drawPhase,
     gradualRevealState?.startedAt,
+    gradualRevealState?.completedAt,
     gradualRevealState?.stepMs,
     gradualRevealState?.steps,
-  ]);
-
-  // 「描いた順」の回だけ、完成画像のマスクではなく線の履歴を段階再生する。
-  useEffect(() => {
-    if (
-      screen !== "play" ||
-      roundType !== "gradual" ||
-      drawPhase !== "guessing" ||
-      gradualRevealState?.pattern !== "line-order" ||
-      !gradualRevealState.startedAt ||
-      !historySeed.token
-    ) {
-      return;
-    }
-    const frame = window.requestAnimationFrame(() => {
-      const elapsedMs = Math.max(
-        0,
-        Date.now() +
-          serverOffsetRef.current -
-          gradualRevealState.startedAt
-      );
-      canvasApiRef.current?.playGradualReveal(historySeed.strokes, {
-        durationMs:
-          gradualRevealState.stepMs * gradualRevealState.steps,
-        elapsedMs,
-        stepCount: gradualRevealState.steps,
-      });
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [
-    screen,
-    roundType,
-    drawPhase,
-    gradualRevealState?.pattern,
-    gradualRevealState?.startedAt,
-    gradualRevealState?.stepMs,
-    gradualRevealState?.steps,
-    historySeed.token,
   ]);
 
   useEffect(() => {
@@ -1065,6 +1038,7 @@ export default function App() {
     });
 
     socket.on("clearCanvas", () => {
+      gradualBatchSeqRef.current = 0;
       setClearToken((n) => n + 1);
       setHistorySeed({ token: 0, strokes: [] });
       markDrawing(false);
@@ -1099,15 +1073,48 @@ export default function App() {
     });
 
     socket.on("stroke", (data) => {
+      if (
+        data?.roundId == null ||
+        String(data.roundId) !== String(roundIdRef.current ?? "")
+      ) {
+        return;
+      }
       window.dispatchEvent(new CustomEvent("remote-stroke", { detail: data }));
       if (data?.type === "move") markDrawing(true);
+    });
+
+    // だんだん見える: サーバーが1秒／2秒ごとにまとめた線だけを公開する。
+    socket.on("gradualStrokeBatch", (data) => {
+      if (
+        data?.roundId == null ||
+        String(data.roundId) !== String(roundIdRef.current ?? "")
+      ) {
+        return;
+      }
+      const batchSeq = Number(data?.batchSeq);
+      if (
+        !Number.isInteger(batchSeq) ||
+        batchSeq <= gradualBatchSeqRef.current
+      ) {
+        return;
+      }
+      gradualBatchSeqRef.current = batchSeq;
+      const strokes = Array.isArray(data?.strokes) ? data.strokes : [];
+      for (const stroke of strokes) {
+        window.dispatchEvent(
+          new CustomEvent("remote-stroke", { detail: stroke })
+        );
+      }
+      if (strokes.some((stroke) => stroke?.type === "move")) {
+        markDrawing(true);
+      }
     });
 
     socket.on("replayStart", () => {
       canvasApiRef.current?.playReplay();
     });
 
-    // だんだん見える: 完成した線と全員共通の公開方法を同時に受け取る。
+    // だんだん見える: 完了時の全履歴と全員共通の公開状態を受け取る。
     socket.on("gradualReveal", (data) => {
       if (
         data?.roundId == null ||
@@ -1118,12 +1125,17 @@ export default function App() {
       const strokes = data?.strokes || [];
       const reveal = normalizeGradualReveal(data?.gradualReveal);
       if (!reveal?.startedAt) return;
+      const batchSeq = Number(data?.batchSeq);
+      if (Number.isInteger(batchSeq) && batchSeq >= 0) {
+        gradualBatchSeqRef.current = Math.max(
+          gradualBatchSeqRef.current,
+          batchSeq
+        );
+      }
       setGradualRevealState(reveal);
-      setGradualRevealStep(0);
       setHistorySeed((prev) => ({
         token: prev.token + 1,
         strokes,
-        deferDraw: shouldDeferGradualHistory(reveal),
       }));
       markDrawing(strokes.some((ev) => ev?.type === "move"));
     });
@@ -1358,10 +1370,16 @@ export default function App() {
         reveal = normalizeGradualReveal(data.gradualReveal);
         setGradualRevealState(reveal);
       }
+      const batchSeq = Number(data?.batchSeq);
+      if (Number.isInteger(batchSeq) && batchSeq >= 0) {
+        gradualBatchSeqRef.current = Math.max(
+          gradualBatchSeqRef.current,
+          batchSeq
+        );
+      }
       setHistorySeed((prev) => ({
         token: prev.token + 1,
         strokes,
-        deferDraw: shouldDeferGradualHistory(reveal),
       }));
       markDrawing(strokes.some((ev) => ev?.type === "move"));
     });
@@ -1866,11 +1884,17 @@ export default function App() {
         }
         const strokes = res.strokes || [];
         const reveal = normalizeGradualReveal(res.gradualReveal);
+        const batchSeq = Number(res.batchSeq);
+        if (Number.isInteger(batchSeq) && batchSeq >= 0) {
+          gradualBatchSeqRef.current = Math.max(
+            gradualBatchSeqRef.current,
+            batchSeq
+          );
+        }
         setGradualRevealState(reveal);
         setHistorySeed((prev) => ({
           token: prev.token + 1,
           strokes,
-          deferDraw: shouldDeferGradualHistory(reveal),
         }));
         markDrawing(strokes.some((ev) => ev?.type === "move"));
       });
@@ -2716,7 +2740,8 @@ export default function App() {
         GRADUAL_REVEAL_PRESENTATIONS[
           gradualRevealState?.pattern || "line-order"
         ];
-      const revealFinished =
+      const revealFinished = Boolean(gradualRevealState?.completedAt);
+      const revealMaskOpened =
         gradualRevealState?.startedAt &&
         gradualRevealStep >= gradualRevealState.steps;
       return (
@@ -2726,7 +2751,7 @@ export default function App() {
             {renderRoundProgress()}
             <span className="mode-pill gradual-pill">だんだん</span>
           </div>
-          {drawPhase === "guessing" && gradualRevealState?.startedAt && (
+          {gradualRevealState?.startedAt && (
             <div
               className={`gradual-reveal-status${revealFinished ? " is-finished" : ""}`}
               role="status"
@@ -2738,7 +2763,9 @@ export default function App() {
               <span>
                 {revealFinished
                   ? "ぜんぶ見えた！"
-                  : `${gradualRevealState.stepMs / 1000}秒ごと・公開 ${gradualRevealStep}/${gradualRevealState.steps}`}
+                  : revealMaskOpened
+                    ? `${gradualRevealState.stepMs / 1000}秒ごと・ライブ公開中`
+                    : `${gradualRevealState.stepMs / 1000}秒ごと・公開 ${gradualRevealStep}/${gradualRevealState.steps}`}
               </span>
             </div>
           )}
@@ -2750,15 +2777,15 @@ export default function App() {
                   <div className="prompt-value">{word}</div>
                 </div>
                 <p className="hint">
-                  みんなには まだ見えてないよ。描きおわったら「できた！」を押そう
+                  描いているそばから、みんなに少しずつ見えてるよ。できたら「全部見せる」！
                 </p>
               </>
             ) : (
               <div className="info-block info-drawer">
-                <div className="info-label">🤫 こっそり おえかき中</div>
+                <div className="info-label">👀 ライブでだんだん公開中</div>
                 <div className="drawer-value">{drawerName}</div>
                 <p className="hint">
-                  できあがると、絵が だんだん見えてくるよ…！
+                  描いているそばから、絵が少しずつ見えてくるよ！
                 </p>
               </div>
             )
@@ -2769,12 +2796,12 @@ export default function App() {
                 <div className="prompt-value">{word}</div>
               </div>
               <p className="hint">
-                みんなの画面に じわじわ出てるよ。当たったら「つぎのお題へ」！
+                全部見せたよ。当たったら「つぎのお題へ」！
               </p>
             </>
           ) : (
             <div className="info-block info-drawer">
-              <div className="info-label">👀 だんだん見えてくる…</div>
+              <div className="info-label">👀 ぜんぶ見えた！</div>
               <div className="drawer-value">わかったら さけぼう！</div>
               <p className="hint">はやく当てた人の勝ち！</p>
             </div>
@@ -3687,20 +3714,11 @@ export default function App() {
                   <span className="canvas-blind-text">見ないで描こう！</span>
                 </div>
               )}
-              {/* だんだん見える: 公開までは見ている側に幕をかける */}
+              {/* だんだん見える: 描いている最中から観客側の幕を段階的に開く */}
               {roundType === "gradual" &&
-                drawPhase === "drawing" &&
-                !canDraw && (
-                  <div className="canvas-curtain" aria-hidden="true">
-                    <span className="canvas-curtain-face">🤫</span>
-                    <span className="canvas-curtain-text">
-                      こっそり おえかき中…
-                    </span>
-                  </div>
-                )}
-              {roundType === "gradual" &&
-                drawPhase === "guessing" &&
+                playerId !== drawerId &&
                 gradualRevealState?.startedAt &&
+                !gradualRevealState.completedAt &&
                 gradualRevealState.pattern !== "line-order" &&
                 gradualRevealStep < gradualRevealState.steps && (
                   <div
@@ -3713,16 +3731,18 @@ export default function App() {
                   />
                 )}
               {roundType === "gradual" &&
-                drawPhase === "guessing" &&
+                playerId !== drawerId &&
                 gradualRevealState?.startedAt &&
-                gradualRevealStep < gradualRevealState.steps && (
+                !gradualRevealState.completedAt && (
                   <div className="canvas-gradual-badge" aria-hidden="true">
                     {
                       GRADUAL_REVEAL_PRESENTATIONS[
                         gradualRevealState.pattern
                       ].icon
                     }{" "}
-                    公開 {gradualRevealStep}/{gradualRevealState.steps}
+                    {gradualRevealStep >= gradualRevealState.steps
+                      ? "ライブ公開中"
+                      : `公開 ${gradualRevealStep}/${gradualRevealState.steps}`}
                   </div>
                 )}
               {replaying && roundType !== "gradual" && (
@@ -3749,7 +3769,7 @@ export default function App() {
             )}
             {canFinishGradual && (
               <button type="button" onClick={finishGradualDrawing}>
-                できた！みんなに見せる
+                できた！全部見せる
               </button>
             )}
             {canRevealAnswer && (

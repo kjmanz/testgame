@@ -37,6 +37,7 @@ export function createGradualRevealPlan({ random = Math.random } = {}) {
         ? GRADUAL_REVEAL_FAST_STEPS
         : GRADUAL_REVEAL_SLOW_STEPS,
     startedAt: null,
+    completedAt: null,
   };
 }
 
@@ -47,13 +48,7 @@ export function gradualRevealDuration(plan) {
   return Math.max(0, stepMs) * Math.max(0, Math.trunc(steps));
 }
 
-export function isGradualRevealComplete(plan, now = Date.now()) {
-  const startedAt = Number(plan?.startedAt);
-  const duration = gradualRevealDuration(plan);
-  return (
-    Number.isFinite(startedAt) &&
-    startedAt > 0 &&
-    duration > 0 &&
-    Number(now) >= startedAt + duration
-  );
+export function isGradualRevealComplete(plan) {
+  const completedAt = Number(plan?.completedAt);
+  return Number.isFinite(completedAt) && completedAt > 0;
 }

@@ -28,7 +28,6 @@ import { findConstraint, randomConstraint } from "./constraints.js";
 import { hasVisibleDrawing } from "./drawing.js";
 import {
   createGradualRevealPlan,
-  gradualRevealDuration,
   isGradualRevealComplete,
 } from "./gradual-reveal.js";
 import {
@@ -247,12 +246,17 @@ const io = new Server(httpServer, {
  *  turnDurations: number[],
  *  turnEndsAt: number | null,
  *  turnTimer: ReturnType<typeof setTimeout> | null,
+ *  gradualRevealTimer: ReturnType<typeof setTimeout> | null,
  *  gradualReveal: null | {
  *    pattern: string,
  *    stepMs: number,
  *    steps: number,
  *    startedAt: number | null,
+ *    completedAt: number | null,
  *  },
+ *  gradualPendingStrokes: object[],
+ *  gradualPublishedStrokes: object[],
+ *  gradualBatchSeq: number,
  *  seenWordIds: Set<string>,
  *  roundsSinceSpecial: number,
  *  lastWasSpecial: boolean,
@@ -490,6 +494,85 @@ function clearTurnTimer(room) {
     room.turnTimer = null;
   }
   room.turnEndsAt = null;
+}
+
+function clearGradualRevealTimer(room) {
+  if (room.gradualRevealTimer) {
+    clearTimeout(room.gradualRevealTimer);
+    room.gradualRevealTimer = null;
+  }
+}
+
+/** 描画中にたまった線を、描き手以外へ同じまとまりで公開する。 */
+function publishGradualPendingStrokes(room) {
+  const strokes = room.gradualPendingStrokes;
+  room.gradualPendingStrokes = [];
+  if (strokes.length === 0) return;
+
+  room.gradualPublishedStrokes.push(...strokes);
+  if (room.gradualPublishedStrokes.length > MAX_STROKES) {
+    room.gradualPublishedStrokes =
+      room.gradualPublishedStrokes.slice(-MAX_STROKES);
+  }
+
+  const payload = {
+    roundId: room.roundSeq,
+    batchSeq: room.gradualBatchSeq,
+    strokes,
+  };
+  for (const player of room.players.values()) {
+    if (!player.socketId || player.id === room.drawerId) continue;
+    io.to(player.socketId).emit("gradualStrokeBatch", payload);
+  }
+}
+
+/**
+ * だんだん見える専用の公開時計。
+ * 描画終了の20秒タイマーとは分け、開始時刻から1秒/2秒の絶対境界で刻む。
+ */
+function scheduleGradualStrokeBatch(room) {
+  clearGradualRevealTimer(room);
+  const plan = room.gradualReveal;
+  const startedAt = Number(plan?.startedAt);
+  const stepMs = Number(plan?.stepMs);
+  if (
+    !Number.isFinite(startedAt) ||
+    startedAt <= 0 ||
+    !Number.isFinite(stepMs) ||
+    stepMs <= 0
+  ) {
+    return;
+  }
+
+  const expectedRoundSeq = room.roundSeq;
+  const scheduleNext = () => {
+    const nextBatchSeq = room.gradualBatchSeq + 1;
+    const nextAt = startedAt + nextBatchSeq * stepMs;
+    const timer = setTimeout(() => {
+      if (room.gradualRevealTimer === timer) {
+        room.gradualRevealTimer = null;
+      }
+      const current = rooms.get(room.code);
+      if (
+        current !== room ||
+        current.phase !== "playing" ||
+        current.roundType !== "gradual" ||
+        current.drawPhase !== "drawing" ||
+        current.roundSeq !== expectedRoundSeq ||
+        current.gradualReveal?.startedAt !== startedAt ||
+        current.gradualReveal?.completedAt
+      ) {
+        return;
+      }
+
+      current.gradualBatchSeq = nextBatchSeq;
+      publishGradualPendingStrokes(current);
+      scheduleNext();
+    }, Math.max(0, nextAt - Date.now()));
+    room.gradualRevealTimer = timer;
+  };
+
+  scheduleNext();
 }
 
 function emitLobby(room) {
@@ -1571,6 +1654,7 @@ function buildRoundPayload(room, playerId) {
     payload.canFinishGradual =
       room.drawPhase === "drawing" && room.drawerId === playerId;
     payload.gradualReveal = buildGradualRevealPublicState(room);
+    payload.batchSeq = room.gradualBatchSeq;
   }
 
   if (room.roundType === "normal") {
@@ -1648,50 +1732,28 @@ function emitRoundSync(room) {
   }
 }
 
-function scheduleGradualRevealCompletion(room) {
-  const plan = room.gradualReveal;
-  const startedAt = Number(plan?.startedAt);
-  const duration = gradualRevealDuration(plan);
-  if (!Number.isFinite(startedAt) || startedAt <= 0 || duration <= 0) return;
-
-  const expectedRoundSeq = room.roundSeq;
-  const timer = setTimeout(() => {
-    // 古いコールバックが遅れて走っても、新ラウンドのtimer参照を消さない。
-    if (room.turnTimer === timer) room.turnTimer = null;
-    const current = rooms.get(room.code);
-    if (
-      current !== room ||
-      current.phase !== "playing" ||
-      current.roundType !== "gradual" ||
-      current.drawPhase !== "guessing" ||
-      current.roundSeq !== expectedRoundSeq ||
-      current.gradualReveal?.startedAt !== startedAt
-    ) {
-      return;
-    }
-    // 公開が終わった瞬間に、描き手の「つぎへ」を有効にする。
-    emitRoundSync(current);
-  }, Math.max(0, startedAt + duration - Date.now()) + 20);
-  room.turnTimer = timer;
-}
-
 function enterGuessing(room) {
   clearTurnTimer(room);
+  clearGradualRevealTimer(room);
   room.drawPhase = "guessing";
   room.drawerId =
     room.roundType === "relay"
       ? room.drawerIds[room.drawerIds.length - 1] || null
       : room.drawerId;
-  // だんだん見える: ここで初めて完成した線と、全員共通の公開方法を配る。
+  // だんだん見える: 描画中の定期公開を止め、残りを即座に全部見せる。
   if (room.roundType === "gradual") {
     room.gradualReveal ||= createGradualRevealPlan();
-    room.gradualReveal.startedAt = Date.now();
+    room.gradualReveal.startedAt ||= Date.now();
+    room.gradualReveal.completedAt = Date.now();
+    room.gradualBatchSeq += 1;
+    room.gradualPendingStrokes = [];
+    room.gradualPublishedStrokes = [...room.strokes];
     io.to(room.code).emit("gradualReveal", {
       roundId: room.roundSeq,
+      batchSeq: room.gradualBatchSeq,
       strokes: room.strokes,
       gradualReveal: { ...room.gradualReveal },
     });
-    scheduleGradualRevealCompletion(room);
   }
   emitRoundSync(room);
 }
@@ -1760,6 +1822,7 @@ function scheduleTimedDrawing(room, ms) {
 
 function resetRoundFields(room) {
   clearTurnTimer(room);
+  clearGradualRevealTimer(room);
   resetAiSecretGuessRound(room);
   room.currentAiCrazyPrompt = null;
   room.aiCrazyPromptSelectedThisRound = false;
@@ -1771,6 +1834,9 @@ function resetRoundFields(room) {
   room.relayIndex = 0;
   room.turnDurations = [];
   room.gradualReveal = null;
+  room.gradualPendingStrokes = [];
+  room.gradualPublishedStrokes = [];
+  room.gradualBatchSeq = 0;
   room.seenWordIds = new Set();
   room.strokes = [];
   room.constraint = null;
@@ -1968,6 +2034,11 @@ function startRound(room) {
     room.seenWordIds = new Set([drawer.id]);
     room.drawPhase = "drawing";
     room.gradualReveal = createGradualRevealPlan();
+    room.gradualReveal.startedAt = Date.now();
+    room.gradualPendingStrokes = [];
+    room.gradualPublishedStrokes = [];
+    room.gradualBatchSeq = 0;
+    scheduleGradualStrokeBatch(room);
     scheduleTimedDrawing(room, GRADUAL_DURATION_MS);
     emitRoundStart(room, { clear: true, fanfare: true });
     return;
@@ -1990,14 +2061,14 @@ function startRound(room) {
   emitRoundStart(room, { clear: true, fanfare: Boolean(room.constraint) });
 }
 
-/** だんだん見えるの公開前は、描き手本人以外に線を見せない */
+/** だんだん見えるの描画中は、観客へ公開済みのまとまりだけを返す。 */
 function strokesVisibleTo(room, playerId) {
   if (
     room.roundType === "gradual" &&
     room.drawPhase === "drawing" &&
     room.drawerId !== playerId
   ) {
-    return [];
+    return room.gradualPublishedStrokes;
   }
   return room.strokes;
 }
@@ -2012,6 +2083,7 @@ function syncPlayerState(socket, room, playerId) {
     io.to(socket.id).emit("roundStart", buildRoundPayload(room, playerId));
     io.to(socket.id).emit("strokeHistory", {
       roundId: room.roundSeq,
+      batchSeq: room.gradualBatchSeq,
       strokes: strokesVisibleTo(room, playerId),
       gradualReveal: buildGradualRevealPublicState(room),
     });
@@ -2066,6 +2138,7 @@ function removePlayer(room, playerId) {
 
   if (room.players.size === 0) {
     clearTurnTimer(room);
+    clearGradualRevealTimer(room);
     clearAiSecretGuessTimer(room);
     room.aiCrazyPromptToken += 1;
     clearCommunityAwardsTimer(room);
@@ -2365,7 +2438,11 @@ function createEmptyRoom(code, hostId) {
     turnDurations: [],
     turnEndsAt: null,
     turnTimer: null,
+    gradualRevealTimer: null,
     gradualReveal: null,
+    gradualPendingStrokes: [],
+    gradualPublishedStrokes: [],
+    gradualBatchSeq: 0,
     seenWordIds: new Set(),
     roundsSinceSpecial: 0,
     lastWasSpecial: false,
@@ -2654,7 +2731,12 @@ io.on("connection", (socket) => {
     if (type !== "start" && type !== "move" && type !== "end") return;
 
     /** @type {Record<string, unknown>} */
-    const event = { type, playerId };
+    const event = {
+      type,
+      playerId,
+      roundId: room.roundSeq,
+      at: Date.now(),
+    };
     if (type !== "end") {
       const x = safeNumber(data.x);
       const y = safeNumber(data.y);
@@ -2679,8 +2761,14 @@ io.on("connection", (socket) => {
     if (type === "move") {
       scheduleAiSecretGuessCapture(room);
     }
-    // だんだん見える: 公開までは自分の画面だけに描く（配信しない）
-    if (room.roundType === "gradual" && room.drawPhase === "drawing") return;
+    // だんだん見える: 1秒/2秒ごとの専用タイマーで同時公開する。
+    if (room.roundType === "gradual" && room.drawPhase === "drawing") {
+      // 異常な連打でも、公開待ち配列を毎回コピーしてCPUを圧迫しない。
+      if (room.gradualPendingStrokes.length < MAX_STROKES) {
+        room.gradualPendingStrokes.push(event);
+      }
+      return;
+    }
     socket.to(code).emit("stroke", event);
   });
 
@@ -2798,6 +2886,7 @@ io.on("connection", (socket) => {
     reply(cb, {
       ok: true,
       roundId: ctx.room.roundSeq,
+      batchSeq: ctx.room.gradualBatchSeq,
       strokes: strokesVisibleTo(ctx.room, ctx.playerId),
       gradualReveal: buildGradualRevealPublicState(ctx.room),
     });
@@ -3023,7 +3112,7 @@ io.on("connection", (socket) => {
     reply(cb, { ok: true });
   });
 
-  // だんだん見える: 描き手の「できた！」で公開スタート
+  // だんだん見える: 描き手の「できた！」で残りを全部公開
   onSocket(socket, "finishGradualDrawing", (data, cb) => {
     if (typeof data === "function") {
       cb = data;
@@ -3033,7 +3122,10 @@ io.on("connection", (socket) => {
     if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
     const { room, playerId } = ctx;
     const clientRoundId = data?.roundId;
-    if (Number.isInteger(clientRoundId) && clientRoundId !== room.roundSeq) {
+    if (!Number.isInteger(clientRoundId)) {
+      return reply(cb, { ok: false, error: "ラウンド情報が古くなりました" });
+    }
+    if (clientRoundId !== room.roundSeq) {
       return reply(cb, { ok: true, stale: true });
     }
     if (
