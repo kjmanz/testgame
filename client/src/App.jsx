@@ -23,6 +23,9 @@ const AWARD_REVEAL_MS = 5000;
 const COMMUNITY_AWARD_OPENING_MS = 1700;
 const COMMUNITY_AWARD_DRUMROLL_MS = 2100;
 const COMMUNITY_AWARD_REVEAL_MS = 5600;
+/** AIのひみつ予想: APIの都合でゲームを待たせず、結果だけ短く見せる */
+const AI_SECRET_GUESS_ACK_TIMEOUT_MS = 6000;
+const AI_SECRET_GUESS_REVEAL_MS = 7000;
 const EMPTY_AI_STATE = {
   enabled: false,
   gameSeq: 0,
@@ -162,6 +165,13 @@ export default function App() {
   const wakeLockRef = useRef(null);
   const canvasApiRef = useRef(null);
   const playerIdRef = useRef("");
+  /** Socket listener から最新ラウンドだけを判定するための箱 */
+  const roundIdRef = useRef(null);
+  /** 閉じた結果が roundUpdate で再び開かないようにする */
+  const dismissedSecretGuessRoundRef = useRef(null);
+  /** 再接続・ギャラリー表示中でも未処理の画像依頼を失わないための箱 */
+  const pendingSecretGuessCaptureRef = useRef(null);
+  const trySecretGuessCaptureRef = useRef(() => {});
   /** 何か描かれたか（線ごとに再描画しないための箱） */
   const hasDrawingRef = useRef(false);
   /** サーバー時刻 - 端末時刻（タイマー表示のずれ補正用） */
@@ -239,6 +249,9 @@ export default function App() {
   const [communityVoteRemainSec, setCommunityVoteRemainSec] = useState(null);
   /** 会場投票の結果発表: opening | drumroll | reveal | finale */
   const [communityCeremony, setCommunityCeremony] = useState(null);
+  const [secretGuessActive, setSecretGuessActive] = useState(false);
+  const [secretGuessPending, setSecretGuessPending] = useState(false);
+  const [secretGuessReveal, setSecretGuessReveal] = useState(null);
 
   const isHost = playerId && playerId === hostId;
   const isAiFinishBusy = aiState.awardsStatus === "generating";
@@ -262,12 +275,42 @@ export default function App() {
     setHasDrawing(value);
   }
 
-  function applyRoundPayload(data, { forcePlay = true } = {}) {
+  function applyRoundPayload(
+    data,
+    { forcePlay = true, isNewRound = forcePlay } = {}
+  ) {
     setError("");
     if (forcePlay) {
       setScreen("play");
     } else {
       setScreen((prev) => (prev === "gallery" ? "gallery" : "play"));
+    }
+    const payloadRoundId = data.roundId ?? null;
+    if (isNewRound) {
+      roundIdRef.current = payloadRoundId;
+      dismissedSecretGuessRoundRef.current = null;
+      pendingSecretGuessCaptureRef.current = null;
+      setSecretGuessActive(!!data.aiSecretGuessActive);
+      setSecretGuessPending(!!data.aiSecretGuessPending);
+      setSecretGuessReveal(data.aiSecretGuessReveal || null);
+    } else {
+      if (
+        Object.prototype.hasOwnProperty.call(data, "aiSecretGuessActive")
+      ) {
+        setSecretGuessActive(!!data.aiSecretGuessActive);
+      }
+      if (
+        Object.prototype.hasOwnProperty.call(data, "aiSecretGuessPending")
+      ) {
+        setSecretGuessPending(!!data.aiSecretGuessPending);
+      }
+      if (
+        data.aiSecretGuessReveal &&
+        String(dismissedSecretGuessRoundRef.current ?? "") !==
+          String(payloadRoundId ?? "")
+      ) {
+        setSecretGuessReveal(data.aiSecretGuessReveal);
+      }
     }
     setRoundType(data.roundType || "normal");
     setDrawPhase(data.drawPhase || "drawing");
@@ -292,7 +335,7 @@ export default function App() {
     setPassing(false);
     setConstraint(data.constraint || null);
     setStrokesUsed(data.constraintStrokesUsed ?? 0);
-    setRoundId(data.roundId ?? null);
+    setRoundId(payloadRoundId);
     setRoundNumber(data.roundNumber ?? 0);
     setTotalRounds(data.totalRounds ?? 0);
     setAdvancing(false);
@@ -324,7 +367,13 @@ export default function App() {
     setConstraint(null);
     setStrokesUsed(0);
     markDrawing(false);
+    roundIdRef.current = null;
+    dismissedSecretGuessRoundRef.current = null;
+    pendingSecretGuessCaptureRef.current = null;
     setRoundId(null);
+    setSecretGuessActive(false);
+    setSecretGuessPending(false);
+    setSecretGuessReveal(null);
     setAdvancing(false);
   }
 
@@ -371,6 +420,26 @@ export default function App() {
     const t = setTimeout(() => setFanfare(null), 2200);
     return () => clearTimeout(t);
   }, [fanfare]);
+
+  useEffect(() => {
+    if (!secretGuessReveal) return;
+    const revealedRoundId = secretGuessReveal.roundId ?? roundIdRef.current;
+    function dismissReveal() {
+      dismissedSecretGuessRoundRef.current = revealedRoundId;
+      setSecretGuessReveal(null);
+    }
+    function onKeyDown(event) {
+      if (event.key === "Escape") dismissReveal();
+    }
+    const timer = setTimeout(() => {
+      dismissReveal();
+    }, AI_SECRET_GUESS_REVEAL_MS);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [secretGuessReveal]);
 
   // 今日のハイライト: 1枚ずつめくって、最後まで来たら閉じる
   useEffect(() => {
@@ -563,7 +632,81 @@ export default function App() {
 
   useEffect(() => {
     const socket = createSocket();
+    const secretGuessCapturesInFlight = new Set();
+    const secretGuessCaptureTimers = new Set();
     socketRef.current = socket;
+
+    function scheduleSecretGuessCaptureAttempt(delayMs = 50) {
+      const timer = setTimeout(() => {
+        secretGuessCaptureTimers.delete(timer);
+        trySecretGuessCaptureRef.current();
+      }, delayMs);
+      secretGuessCaptureTimers.add(timer);
+    }
+
+    trySecretGuessCaptureRef.current = () => {
+      const pending = pendingSecretGuessCaptureRef.current;
+      if (!pending) return;
+      const { roundId: requestedRoundId, token } = pending;
+      if (
+        String(requestedRoundId) !== String(roundIdRef.current ?? "")
+      ) {
+        pendingSecretGuessCaptureRef.current = null;
+        return;
+      }
+      if (pending.waitForHistory) return;
+
+      const captureKey = `${requestedRoundId}:${token}`;
+      if (secretGuessCapturesInFlight.has(captureKey)) return;
+
+      let imageDataUrl;
+      try {
+        imageDataUrl = canvasApiRef.current?.exportImage?.({
+          maxSize: 448,
+          quality: 0.6,
+        });
+      } catch {
+        imageDataUrl = null;
+      }
+
+      // 再接続直後やギャラリー表示中はキャンバスがまだない。依頼は保持し、
+      // play画面と履歴が戻ったタイミングで下のeffectから再試行する。
+      if (
+        typeof imageDataUrl !== "string" ||
+        !imageDataUrl.startsWith("data:image/")
+      ) {
+        return;
+      }
+
+      secretGuessCapturesInFlight.add(captureKey);
+      pending.sendAttempts = (pending.sendAttempts || 0) + 1;
+      socket
+        .timeout(AI_SECRET_GUESS_ACK_TIMEOUT_MS)
+        .emit(
+          "submitAiSecretGuessImage",
+          { roundId: requestedRoundId, token, imageDataUrl },
+          (timeoutError, response) => {
+            secretGuessCapturesInFlight.delete(captureKey);
+            const current = pendingSecretGuessCaptureRef.current;
+            if (
+              !current ||
+              current.roundId !== requestedRoundId ||
+              current.token !== token
+            ) {
+              return;
+            }
+            if (!timeoutError || response?.stale) {
+              pendingSecretGuessCaptureRef.current = null;
+              return;
+            }
+            // ACKだけ失われた場合もサーバー側が重複をstaleで弾くため、
+            // 同じtokenで最大1回だけ安全に再送する。
+            if (pending.sendAttempts < 2) {
+              scheduleSecretGuessCaptureAttempt(250);
+            }
+          }
+        );
+    };
 
     socket.on("lobbyUpdate", (data) => {
       setRoomCode(data.code);
@@ -580,11 +723,35 @@ export default function App() {
     });
 
     socket.on("roundStart", (data) => {
-      applyRoundPayload(data, { forcePlay: true });
+      applyRoundPayload(data, { forcePlay: true, isNewRound: true });
     });
 
     socket.on("roundUpdate", (data) => {
-      applyRoundPayload(data, { forcePlay: false });
+      applyRoundPayload(data, { forcePlay: false, isNewRound: false });
+    });
+
+    socket.on("aiSecretGuessCaptureRequest", (data) => {
+      const requestedRoundId = data?.roundId;
+      const token = data?.token;
+      if (
+        requestedRoundId == null ||
+        !token ||
+        String(requestedRoundId) !== String(roundIdRef.current ?? "")
+      ) {
+        return;
+      }
+
+      const captureKey = `${requestedRoundId}:${token}`;
+      if (secretGuessCapturesInFlight.has(captureKey)) return;
+      pendingSecretGuessCaptureRef.current = {
+        roundId: requestedRoundId,
+        token,
+        sendAttempts: 0,
+        waitForHistory: !canvasApiRef.current,
+      };
+      // roundStart / strokeHistory と同時に再送された場合、Reactの描画を
+      // 1拍待ってから取得する。
+      scheduleSecretGuessCaptureAttempt();
     });
 
     socket.on("clearCanvas", () => {
@@ -658,6 +825,37 @@ export default function App() {
     socket.on("answerReveal", (data) => {
       if (!data?.word) return;
       setToast(`✅ こたえは「${data.word}」！`);
+    });
+
+    socket.on("aiSecretGuessPending", (data) => {
+      if (
+        data?.roundId == null ||
+        String(data.roundId) !== String(roundIdRef.current ?? "")
+      ) {
+        return;
+      }
+      const pending = pendingSecretGuessCaptureRef.current;
+      if (String(pending?.roundId ?? "") === String(data.roundId)) {
+        pendingSecretGuessCaptureRef.current = null;
+      }
+      setSecretGuessPending(true);
+    });
+
+    socket.on("aiSecretGuessReveal", (data) => {
+      if (
+        data?.roundId == null ||
+        String(data.roundId) !== String(roundIdRef.current ?? "") ||
+        String(dismissedSecretGuessRoundRef.current ?? "") ===
+          String(data.roundId)
+      ) {
+        return;
+      }
+      const pending = pendingSecretGuessCaptureRef.current;
+      if (String(pending?.roundId ?? "") === String(data.roundId)) {
+        pendingSecretGuessCaptureRef.current = null;
+      }
+      setSecretGuessPending(false);
+      setSecretGuessReveal(data);
     });
 
     // お題のパス。黙って絵が消えると当てる側が混乱するので必ず知らせる
@@ -789,6 +987,13 @@ export default function App() {
 
     if (socket.connected) syncClock();
     socket.on("connect", syncClock);
+    socket.on("disconnect", () => {
+      // 再接続時にサーバーが同じ依頼を再送できるよう、通信中の印だけ外す
+      secretGuessCapturesInFlight.clear();
+      pendingSecretGuessCaptureRef.current = null;
+      for (const timer of secretGuessCaptureTimers) clearTimeout(timer);
+      secretGuessCaptureTimers.clear();
+    });
 
     function tryRejoin() {
       // 投票送信中に回線が切れてackが失われても、再接続後は操作を復帰させる。
@@ -844,10 +1049,24 @@ export default function App() {
     socket.on("connect", tryRejoin);
 
     return () => {
+      for (const timer of secretGuessCaptureTimers) clearTimeout(timer);
+      secretGuessCaptureTimers.clear();
+      trySecretGuessCaptureRef.current = () => {};
       socket.off("connect", tryRejoin);
       socket.disconnect();
     };
   }, []);
+
+  // ギャラリーから戻ったときや再接続の履歴が描画されたとき、保持していた
+  // 依頼をキャンバスのcommit後に再試行する。screen/roundIdだけの変化では
+  // 空のキャンバスを早取りしうるため、履歴の反映を合図にする。
+  useEffect(() => {
+    const pending = pendingSecretGuessCaptureRef.current;
+    if (!pending) return;
+    pending.waitForHistory = false;
+    const timer = setTimeout(() => trySecretGuessCaptureRef.current(), 50);
+    return () => clearTimeout(timer);
+  }, [historySeed]);
 
   const emitStroke = useMemo(
     () => (data) => {
@@ -1552,6 +1771,106 @@ export default function App() {
     );
   }
 
+  function dismissAiSecretGuess() {
+    dismissedSecretGuessRoundRef.current =
+      secretGuessReveal?.roundId ?? roundIdRef.current;
+    setSecretGuessReveal(null);
+  }
+
+  function renderAiSecretGuessReveal() {
+    if (!secretGuessReveal) return null;
+    const isResult = secretGuessReveal.kind === "result";
+    const isCorrect = isResult && !!secretGuessReveal.isCorrect;
+    const correctWord = secretGuessReveal.correctWord || word || "？？？";
+    const fallbackIcon =
+      secretGuessReveal.kind === "too_fast" ? "⚡" : "🌀";
+
+    return (
+      <div
+        className={`ai-secret-reveal${
+          isResult ? (isCorrect ? " is-correct" : " is-missed") : " is-fallback"
+        }`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="ai-secret-title"
+        aria-describedby="ai-secret-description"
+      >
+        <div className="ai-secret-reveal-card">
+          <button
+            type="button"
+            className="ai-secret-close"
+            onClick={dismissAiSecretGuess}
+            aria-label="AIのひみつ予想を閉じる"
+            autoFocus
+          >
+            × とじる
+          </button>
+
+          <div className="ai-secret-robot" aria-hidden="true">
+            {isResult ? "🤖" : fallbackIcon}
+          </div>
+          <div className="ai-secret-eyebrow">答え発表まで秘密でした</div>
+          <h2 id="ai-secret-title">🤖 AIのひみつ予想</h2>
+
+          {isResult ? (
+            <>
+              <dl className="ai-secret-guesses">
+                <div className="ai-secret-guess best">
+                  <dt>本命</dt>
+                  <dd>「{secretGuessReveal.bestGuess || "？？？"}」</dd>
+                </div>
+                <div className="ai-secret-guess second">
+                  <dt>対抗</dt>
+                  <dd>「{secretGuessReveal.secondGuess || "？？？"}」</dd>
+                </div>
+                <div className="ai-secret-guess wild">
+                  <dt>大穴</dt>
+                  <dd>「{secretGuessReveal.wildGuess || "？？？"}」</dd>
+                </div>
+              </dl>
+              <div className="ai-secret-answer">
+                <span>本当のこたえ</span>
+                <strong>「{correctWord}」</strong>
+              </div>
+              <p
+                className="ai-secret-verdict"
+                id="ai-secret-description"
+                aria-live="polite"
+              >
+                {isCorrect ? "🎯 AIも正解！" : "🤖 AI、完全に迷子！"}
+              </p>
+              {secretGuessReveal.comment && (
+                <div className="ai-secret-comment">
+                  <span>AIのひとこと</span>
+                  <p>{secretGuessReveal.comment}</p>
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              <div className="ai-secret-answer">
+                <span>本当のこたえ</span>
+                <strong>「{correctWord}」</strong>
+              </div>
+              <p
+                className="ai-secret-fallback-message"
+                id="ai-secret-description"
+                aria-live="polite"
+              >
+                {secretGuessReveal.message ||
+                  "AI、考え込みすぎて今回は答えが出ませんでした！"}
+              </p>
+            </>
+          )}
+
+          <div className="ai-secret-auto-progress" aria-hidden="true">
+            <span />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   function renderRoundProgress() {
     if (!roundNumber || !totalRounds) return null;
     const isLast = roundNumber >= totalRounds;
@@ -1861,6 +2180,9 @@ export default function App() {
           {constraint && (
             <span className="mode-pill constraint-pill">しばり</span>
           )}
+          {secretGuessActive && (
+            <span className="mode-pill ai-secret-pill">🤖 AIひみつ予想</span>
+          )}
         </div>
         {drawPhase === "reveal" ? (
           <div className="info-block info-answer">
@@ -1883,6 +2205,20 @@ export default function App() {
             <div className="info-label">いま描いている人</div>
             <div className="drawer-value">{drawerName}</div>
             <p className="hint">絵を見て、当てよう！</p>
+          </div>
+        )}
+        {secretGuessActive && drawPhase === "drawing" && (
+          <div className="ai-secret-note" role="note">
+            <span aria-hidden="true">🤫</span>
+            <p>
+              AIが途中の絵をこっそり見ます。予想は答え発表まで秘密！
+            </p>
+          </div>
+        )}
+        {secretGuessPending && drawPhase === "reveal" && (
+          <div className="ai-secret-pending" role="status" aria-live="polite">
+            <span aria-hidden="true">🤖</span>
+            <span>AIはまだ考え中…</span>
           </div>
         )}
         {renderConstraint()}
@@ -1946,6 +2282,8 @@ export default function App() {
         gallery={gallery}
         onClose={() => setCommunityCeremony(null)}
       />
+
+      {renderAiSecretGuessReveal()}
 
       {fanfare && (
         <div className={`fanfare fanfare-${fanfare.roundType}`} role="status">

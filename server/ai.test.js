@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  OPENAI_TEXT_MODEL,
   createAwards,
+  createSecretGuess,
   extractResponseText,
   normalizeAwards,
+  normalizeSecretGuess,
   parseImageDataUrl,
   publicAiCapabilities,
 } from "./ai.js";
@@ -198,4 +201,291 @@ test("createAwards needs at least two usable drawings", async () => {
     createAwards([{ id: "a", word: "りんご", imageDataUrl: tinyJpeg }]),
     /Not enough drawings/,
   );
+});
+
+function completedSecretGuessResponse(overrides = {}) {
+  return {
+    status: "completed",
+    output: [
+      {
+        type: "message",
+        content: [
+          {
+            type: "output_text",
+            text: JSON.stringify({
+              bestGuess: "ねこ",
+              secondGuess: "いぬ",
+              wildGuess: "宇宙ポテト",
+              comment: "丸い線が、元気よく空へ飛び出しています！",
+              ...overrides,
+            }),
+          },
+        ],
+      },
+    ],
+  };
+}
+
+test("createSecretGuess sends one private low-detail structured request", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.OPENAI_API_KEY;
+  const requests = [];
+  const candidateWords = [
+    "ねこ",
+    "いぬ",
+    "うさぎ",
+    "くま",
+    "パンダ",
+    "ライオン",
+    "きりん",
+    "ぞう",
+    "さる",
+    "ぺんぎん",
+    "いるか",
+    "くじら",
+    "サメ",
+    "たこ",
+    "いか",
+    "かに",
+    "エビ",
+    "かえる",
+  ];
+  process.env.OPENAI_API_KEY = "secret-api-key-must-not-enter-body";
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return new Response(JSON.stringify(completedSecretGuessResponse()), {
+      status: 200,
+      headers: { "x-request-id": "req_secret_guess" },
+    });
+  };
+
+  try {
+    const result = await createSecretGuess(tinyJpeg, candidateWords, {
+      safetyIdentifier: "safe-secret-player",
+      isCurrent: () => true,
+      // 呼び出し側が誤って渡しても、個人・部屋情報はAPI本文へ含めない。
+      playerName: "秘密の太郎",
+      playerId: "player-private-id",
+      roomCode: "ROOM42",
+      correctWord: "ねこ",
+    });
+
+    assert.deepEqual(result, {
+      bestGuess: "ねこ",
+      secondGuess: "いぬ",
+      wildGuess: "宇宙ポテト",
+      comment: "丸い線が、元気よく空へ飛び出しています！",
+    });
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url, "https://api.openai.com/v1/responses");
+
+    const body = JSON.parse(requests[0].options.body);
+    assert.equal(body.model, OPENAI_TEXT_MODEL);
+    assert.equal(body.store, false);
+    assert.equal(body.reasoning.effort, "none");
+    assert.equal(body.text.verbosity, "low");
+    assert.equal(body.text.format.type, "json_schema");
+    assert.equal(body.text.format.strict, true);
+    assert.equal(body.max_output_tokens, 180);
+    assert.equal(body.safety_identifier, "safe-secret-player");
+    assert.deepEqual(
+      body.text.format.schema.properties.bestGuess.enum,
+      candidateWords,
+    );
+    assert.deepEqual(
+      body.text.format.schema.properties.secondGuess.enum,
+      candidateWords,
+    );
+    assert.deepEqual(body.text.format.schema.required, [
+      "bestGuess",
+      "secondGuess",
+      "wildGuess",
+      "comment",
+    ]);
+    assert.equal(body.text.format.schema.additionalProperties, false);
+
+    const images = body.input[0].content.filter(
+      (part) => part.type === "input_image",
+    );
+    assert.equal(images.length, 1);
+    const [image] = images;
+    assert.deepEqual(image, {
+      type: "input_image",
+      image_url: tinyJpeg,
+      detail: "low",
+    });
+
+    const serializedInput = JSON.stringify({
+      instructions: body.instructions,
+      input: body.input,
+    });
+    assert.equal(candidateWords.every((word) => serializedInput.includes(word)), true);
+    assert.equal(serializedInput.includes("correctWord"), false);
+    assert.equal(serializedInput.includes("正解:"), false);
+    assert.equal(serializedInput.includes("秘密の太郎"), false);
+    assert.equal(serializedInput.includes("player-private-id"), false);
+    assert.equal(serializedInput.includes("ROOM42"), false);
+    assert.equal(serializedInput.includes("secret-api-key-must-not-enter-body"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = originalKey;
+  }
+});
+
+test("createSecretGuess rejects an invalid image before calling OpenAI", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.OPENAI_API_KEY;
+  let calls = 0;
+  process.env.OPENAI_API_KEY = "test-key";
+  globalThis.fetch = async () => {
+    calls += 1;
+    throw new Error("must not be called");
+  };
+
+  try {
+    await assert.rejects(
+      createSecretGuess("not-an-image", ["ねこ", "いぬ"]),
+      /Invalid drawing image/,
+    );
+    assert.equal(calls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = originalKey;
+  }
+});
+
+test("normalizeSecretGuess rejects duplicate, unknown, and empty output", () => {
+  const candidates = ["ねこ", "いぬ", "うさぎ"];
+  assert.throws(
+    () =>
+      normalizeSecretGuess(
+        {
+          bestGuess: "ねこ",
+          secondGuess: "ねこ",
+          wildGuess: "宇宙船",
+          comment: "丸が見えます",
+        },
+        candidates,
+      ),
+    /incomplete/,
+  );
+  assert.throws(
+    () =>
+      normalizeSecretGuess(
+        {
+          bestGuess: "候補外",
+          secondGuess: "いぬ",
+          wildGuess: "宇宙船",
+          comment: "丸が見えます",
+        },
+        candidates,
+      ),
+    /incomplete/,
+  );
+  assert.throws(
+    () =>
+      normalizeSecretGuess(
+        {
+          bestGuess: "ねこ",
+          secondGuess: "いぬ",
+          wildGuess: "宇宙船",
+          comment: "\u0000\n\t",
+        },
+        candidates,
+      ),
+    /incomplete/,
+  );
+});
+
+test("normalizeSecretGuess rejects non-string and unexpected fields", () => {
+  const candidates = ["ねこ", "いぬ", "うさぎ"];
+  const valid = {
+    bestGuess: "ねこ",
+    secondGuess: "いぬ",
+    wildGuess: "宇宙船",
+    comment: "丸い線が見えます",
+  };
+
+  for (const field of Object.keys(valid)) {
+    assert.throws(
+      () => normalizeSecretGuess({ ...valid, [field]: {} }, candidates),
+      /incomplete/,
+    );
+  }
+  assert.throws(
+    () => normalizeSecretGuess({ ...valid, answer: "ねこ" }, candidates),
+    /unexpected fields/,
+  );
+});
+
+test("extractResponseText gives refusal priority over mixed output text", () => {
+  assert.throws(
+    () =>
+      extractResponseText({
+        status: "completed",
+        output: [
+          {
+            type: "message",
+            content: [
+              { type: "output_text", text: '{"looks":"valid"}' },
+              { type: "refusal", refusal: "no" },
+            ],
+          },
+        ],
+      }),
+    /refused/,
+  );
+});
+
+test("createSecretGuess rejects refusal, broken JSON, and incomplete responses", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = "test-key";
+  const bodies = [
+    {
+      status: "completed",
+      output: [
+        {
+          type: "message",
+          content: [{ type: "refusal", refusal: "no" }],
+        },
+      ],
+    },
+    {
+      status: "completed",
+      output: [
+        {
+          type: "message",
+          content: [{ type: "output_text", text: "{broken" }],
+        },
+      ],
+    },
+    { status: "incomplete", output: [] },
+  ];
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify(bodies.shift()), {
+      status: 200,
+      headers: { "x-request-id": "req_bad_secret_guess" },
+    });
+
+  try {
+    await assert.rejects(
+      createSecretGuess(tinyJpeg, ["ねこ", "いぬ"]),
+      /refused/,
+    );
+    await assert.rejects(
+      createSecretGuess(tinyJpeg, ["ねこ", "いぬ"]),
+      /Unexpected token|JSON/,
+    );
+    await assert.rejects(
+      createSecretGuess(tinyJpeg, ["ねこ", "いぬ"]),
+      /not completed/,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = originalKey;
+  }
 });

@@ -10,6 +10,7 @@
     "dev:liar": "node --watch dev-liar.js",
     "dev:gradual": "node --watch dev-gradual.js",
     "dev:constraint": "node --watch dev-constraint.js",
+    "dev:ai-secret": "node --watch dev-ai-secret.js",
     "start": "node index.js",
     "test": "node --test"
   },

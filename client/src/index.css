@@ -1279,6 +1279,17 @@ input:focus {
   color: #8a4b06;
 }
 
+.fanfare-ai-secret .fanfare-text {
+  background:
+    radial-gradient(circle at 90% 15%, rgba(255, 201, 60, 0.72), transparent 28%),
+    linear-gradient(135deg, #e8e2ff, #dff7ff);
+  color: #43308c;
+  border-color: #31225e;
+  box-shadow:
+    6px 8px 0 rgba(43, 36, 28, 0.24),
+    0 0 32px rgba(124, 82, 190, 0.34);
+}
+
 .fanfare-constraint-sub {
   display: flex;
   flex-direction: column;
@@ -1288,6 +1299,291 @@ input:focus {
 
 .fanfare-constraint-sub span {
   font-size: 0.92rem;
+}
+
+/* —— AIのひみつ予想 —— */
+.ai-secret-pill {
+  color: #fff;
+  background: linear-gradient(105deg, #6750b7, #3e86c8);
+  border-color: #30245b;
+  letter-spacing: 0.01em;
+  animation: ai-secret-pill-pulse 1.8s ease-in-out infinite;
+}
+
+.ai-secret-note,
+.ai-secret-pending {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.55rem 0.65rem;
+  border: 2px dashed #6750b7;
+  border-radius: 13px;
+  color: #43308c;
+  background: linear-gradient(115deg, rgba(232, 226, 255, 0.9), rgba(223, 247, 255, 0.88));
+  font-size: 0.78rem;
+  font-weight: 900;
+  line-height: 1.45;
+}
+
+.ai-secret-note > span,
+.ai-secret-pending > span:first-child {
+  flex: 0 0 auto;
+  font-size: 1.25rem;
+}
+
+.ai-secret-note p {
+  margin: 0;
+}
+
+.ai-secret-pending {
+  justify-content: center;
+  border-style: solid;
+  background: #f1edff;
+}
+
+.ai-secret-pending > span:first-child {
+  display: inline-block;
+  animation: ai-secret-thinking 1.15s ease-in-out infinite;
+}
+
+.ai-secret-reveal {
+  position: fixed;
+  inset: 0;
+  z-index: 115;
+  display: grid;
+  place-items: center;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0.75rem;
+  background:
+    radial-gradient(circle at 18% 10%, rgba(255, 201, 60, 0.32), transparent 25%),
+    radial-gradient(circle at 84% 88%, rgba(77, 143, 217, 0.36), transparent 31%),
+    rgba(32, 24, 59, 0.91);
+  animation: ai-secret-backdrop-in 0.22s ease both;
+}
+
+.ai-secret-reveal-card {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.65rem;
+  width: min(100%, 540px);
+  max-height: calc(100vh - 1.5rem);
+  max-height: calc(100dvh - 1.5rem);
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 2.8rem 1.15rem 1rem;
+  border: 4px solid #31225e;
+  border-radius: 25px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.58), transparent 24%),
+    repeating-linear-gradient(0deg, transparent 0 27px, rgba(77, 143, 217, 0.07) 27px 28px),
+    #fff8e8;
+  color: var(--ink);
+  text-align: center;
+  box-shadow:
+    0 0 0 4px rgba(255, 255, 255, 0.18),
+    0 22px 60px rgba(14, 8, 34, 0.52);
+  animation: ai-secret-card-in 0.48s cubic-bezier(0.18, 0.85, 0.25, 1.15) both;
+}
+
+.ai-secret-reveal-card::before,
+.ai-secret-reveal-card::after {
+  position: absolute;
+  z-index: -1;
+  content: "";
+  width: 82px;
+  height: 82px;
+  border-radius: 50%;
+  opacity: 0.16;
+}
+
+.ai-secret-reveal-card::before {
+  top: -25px;
+  left: -22px;
+  background: var(--paint-pink);
+}
+
+.ai-secret-reveal-card::after {
+  right: -25px;
+  bottom: -26px;
+  background: var(--paint-teal);
+}
+
+.ai-secret-close {
+  position: absolute;
+  top: 0.65rem;
+  right: 0.65rem;
+  width: auto;
+  padding: 0.38rem 0.62rem;
+  border: 2px solid #514478;
+  background: rgba(255, 255, 255, 0.86);
+  color: #43308c;
+  font-size: 0.72rem;
+  box-shadow: none;
+}
+
+.ai-secret-close:focus-visible {
+  outline: 4px solid var(--paint-yellow);
+  outline-offset: 2px;
+}
+
+.ai-secret-robot {
+  font-size: clamp(3.2rem, 14vw, 5rem);
+  line-height: 1;
+  filter: drop-shadow(0 7px 6px rgba(49, 34, 94, 0.22));
+  animation: ai-secret-robot-float 1.4s ease-in-out infinite;
+}
+
+.ai-secret-eyebrow {
+  color: #6750b7;
+  font-size: 0.7rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+}
+
+.ai-secret-reveal h2 {
+  margin: 0;
+  color: #43308c;
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: clamp(1.45rem, 6.5vw, 2rem);
+  line-height: 1.2;
+  text-wrap: balance;
+}
+
+.ai-secret-guesses {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.48rem;
+  width: 100%;
+  margin: 0;
+}
+
+.ai-secret-guess {
+  min-width: 0;
+  padding: 0.52rem 0.35rem 0.58rem;
+  border: 2px solid rgba(49, 34, 94, 0.7);
+  border-radius: 13px;
+  background: rgba(255, 255, 255, 0.8);
+  box-shadow: 2px 3px 0 rgba(49, 34, 94, 0.13);
+}
+
+.ai-secret-guess.best {
+  background: #fff2bd;
+}
+
+.ai-secret-guess.second {
+  background: #e8f6ff;
+}
+
+.ai-secret-guess.wild {
+  background: #ffe7f2;
+}
+
+.ai-secret-guess dt {
+  color: #655b74;
+  font-size: 0.68rem;
+  font-weight: 900;
+}
+
+.ai-secret-guess dd {
+  margin: 0.24rem 0 0;
+  color: #30245b;
+  font-size: clamp(0.78rem, 3.5vw, 1rem);
+  font-weight: 900;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.ai-secret-answer {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 0.45rem;
+  width: 100%;
+  padding: 0.5rem 0.7rem;
+  border: 3px solid var(--ink);
+  border-radius: 13px;
+  background: linear-gradient(transparent 58%, rgba(255, 201, 60, 0.5) 58%), #fffef8;
+}
+
+.ai-secret-answer span {
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 900;
+}
+
+.ai-secret-answer strong {
+  color: #bd3f25;
+  font-size: clamp(1.08rem, 5vw, 1.45rem);
+  overflow-wrap: anywhere;
+}
+
+.ai-secret-verdict,
+.ai-secret-fallback-message {
+  margin: 0;
+  padding: 0.36rem 0.7rem;
+  border-radius: 999px;
+  color: #5b2b79;
+  background: #f0e5ff;
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: clamp(1.1rem, 5.2vw, 1.45rem);
+  font-weight: 900;
+  line-height: 1.35;
+}
+
+.ai-secret-reveal.is-correct .ai-secret-verdict {
+  color: #14665c;
+  background: #d9fff4;
+}
+
+.ai-secret-fallback-message {
+  border-radius: 14px;
+  color: #43308c;
+  font-size: clamp(0.94rem, 4.2vw, 1.16rem);
+}
+
+.ai-secret-comment {
+  width: 100%;
+  padding: 0.5rem 0.7rem 0.58rem;
+  border: 2px dashed #6750b7;
+  border-radius: 13px;
+  background: rgba(239, 234, 255, 0.72);
+  text-align: left;
+}
+
+.ai-secret-comment span {
+  display: inline-block;
+  color: #6750b7;
+  font-size: 0.65rem;
+  font-weight: 900;
+}
+
+.ai-secret-comment p {
+  margin: 0.16rem 0 0;
+  font-size: 0.82rem;
+  font-weight: 800;
+  line-height: 1.48;
+  overflow-wrap: anywhere;
+}
+
+.ai-secret-auto-progress {
+  width: min(72%, 320px);
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(103, 80, 183, 0.18);
+}
+
+.ai-secret-auto-progress span {
+  display: block;
+  width: 100%;
+  height: 100%;
+  transform-origin: left;
+  background: linear-gradient(90deg, #6750b7, #4d8fd9, #ff7eb6);
+  animation: ai-secret-timer 7s linear both;
 }
 
 /* —— 今日のハイライト —— */
@@ -2918,7 +3214,86 @@ input:focus {
   }
 }
 
+@keyframes ai-secret-pill-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 rgba(103, 80, 183, 0);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(103, 80, 183, 0.16);
+  }
+}
+
+@keyframes ai-secret-thinking {
+  0%,
+  100% {
+    transform: translateY(0) rotate(-4deg);
+  }
+  50% {
+    transform: translateY(-3px) rotate(4deg);
+  }
+}
+
+@keyframes ai-secret-backdrop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes ai-secret-card-in {
+  from { opacity: 0; transform: translateY(20px) scale(0.92) rotate(-1deg); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes ai-secret-robot-float {
+  0%,
+  100% {
+    transform: translateY(0) rotate(-3deg);
+  }
+  50% {
+    transform: translateY(-6px) rotate(3deg);
+  }
+}
+
+@keyframes ai-secret-timer {
+  from { transform: scaleX(1); }
+  to { transform: scaleX(0); }
+}
+
 @media (max-width: 600px) {
+  .ai-secret-reveal {
+    padding: 0.3rem;
+  }
+
+  .ai-secret-reveal-card {
+    max-height: calc(100vh - 0.6rem);
+    max-height: calc(100dvh - 0.6rem);
+    gap: 0.48rem;
+    padding: 2.65rem 0.7rem 0.75rem;
+    border-width: 3px;
+    border-radius: 20px;
+  }
+
+  .ai-secret-robot {
+    font-size: clamp(2.8rem, 13vw, 4rem);
+  }
+
+  .ai-secret-guesses {
+    gap: 0.3rem;
+  }
+
+  .ai-secret-guess {
+    padding-inline: 0.2rem;
+    border-width: 2px;
+  }
+
+  .ai-secret-answer {
+    padding: 0.42rem 0.4rem;
+  }
+
+  .ai-secret-comment {
+    padding-block: 0.42rem 0.48rem;
+  }
+
   .community-vote-overlay {
     padding: 0.28rem;
   }
@@ -3083,6 +3458,23 @@ input:focus {
     padding: 0.16rem 0.4rem;
   }
 
+  .ai-secret-pill {
+    letter-spacing: -0.03em;
+  }
+
+  .ai-secret-note {
+    padding: 0.45rem 0.5rem;
+    font-size: 0.72rem;
+  }
+
+  .ai-secret-reveal-card {
+    padding-inline: 0.48rem;
+  }
+
+  .ai-secret-guess dd {
+    font-size: 0.72rem;
+  }
+
   .gallery-grid {
     grid-template-columns: 1fr;
   }
@@ -3119,6 +3511,15 @@ input:focus {
   .award-auto-progress span,
   .award-confetti span,
   .award-finale-icons {
+    animation: none;
+  }
+
+  .ai-secret-pill,
+  .ai-secret-pending > span:first-child,
+  .ai-secret-reveal,
+  .ai-secret-reveal-card,
+  .ai-secret-robot,
+  .ai-secret-auto-progress span {
     animation: none;
   }
 

@@ -14,6 +14,7 @@ import { Server } from "socket.io";
 import {
   aiErrorLogDetails,
   createAwards,
+  createSecretGuess,
   isAiConfigured,
   parseImageDataUrl,
   publicAiCapabilities,
@@ -24,6 +25,11 @@ import {
 } from "./community-awards.js";
 import { findConstraint, randomConstraint } from "./constraints.js";
 import { hasVisibleDrawing } from "./drawing.js";
+import {
+  buildSecretGuessCandidates,
+  buildSecretGuessReveal,
+  secretGuessFallbackKind,
+} from "./secret-guess.js";
 import { randomWord } from "./words.js";
 
 const PORT = process.env.PORT || 3001;
@@ -70,6 +76,31 @@ const REPLAY_COOLDOWN_MS = 2_000;
 const HIGHLIGHT_COOLDOWN_MS = 3_000;
 const EXTENSION_ROUNDS = 3;
 const COMMUNITY_AWARDS_VOTING_MS = 45_000;
+const AI_SECRET_GUESS_CAPTURE_DELAY_MS = 7_000;
+const AI_SECRET_GUESS_MIN_GAP = 4;
+const AI_SECRET_GUESS_FORCE_GAP = 8;
+const AI_SECRET_GUESS_CHANCE = 0.25;
+const MAX_AI_SECRET_GUESS_DATA_URL_LEN = 400_000;
+const AI_SECRET_GUESS_ENABLED =
+  String(process.env.AI_SECRET_GUESS_ENABLED || "true")
+    .trim()
+    .toLowerCase() !== "false";
+const FORCE_AI_SECRET_GUESS = process.env.FORCE_AI_SECRET_GUESS === "1";
+const aiSecretGuessMaxText = String(
+  process.env.AI_SECRET_GUESS_MAX_PER_GAME ?? "",
+).trim();
+const parsedAiSecretGuessMax = aiSecretGuessMaxText
+  ? Number(aiSecretGuessMaxText)
+  : 2;
+const AI_SECRET_GUESS_MAX_PER_GAME = Math.min(
+  5,
+  Math.max(
+    0,
+    Number.isFinite(parsedAiSecretGuessMax)
+      ? Math.trunc(parsedAiSecretGuessMax)
+      : 2,
+  ),
+);
 const MAX_GALLERY_DATA_URL_LEN = 400_000;
 const MAX_TOTAL_GALLERY_DATA_URL_LEN = 80_000_000;
 const MAX_STROKES = 20_000;
@@ -78,6 +109,10 @@ const AI_RATE_WINDOW_MS = 60 * 60 * 1000;
 const AI_RATE_LIMITS = {
   room: Math.max(1, Number(process.env.ROOM_CREATE_RATE_LIMIT) || 10),
   awards: Math.max(1, Number(process.env.AI_AWARDS_RATE_LIMIT) || 12),
+  secretGuess: Math.max(
+    1,
+    Number(process.env.AI_SECRET_GUESS_RATE_LIMIT) || 30,
+  ),
 };
 const AI_GLOBAL_RATE_LIMITS = {
   room: Math.max(
@@ -87,6 +122,10 @@ const AI_GLOBAL_RATE_LIMITS = {
   awards: Math.max(
     1,
     Number(process.env.AI_GLOBAL_AWARDS_RATE_LIMIT) || 40,
+  ),
+  secretGuess: Math.max(
+    1,
+    Number(process.env.AI_GLOBAL_SECRET_GUESS_RATE_LIMIT) || 120,
   ),
 };
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -217,6 +256,20 @@ const io = new Server(httpServer, {
  *  communityAwardsTimer: ReturnType<typeof setTimeout> | null,
  *  communityAwardsResults: null | { awards: object[] },
  *  communityAwardsToken: number,
+ *  aiSecretGuessStatus: 'idle' | 'armed' | 'countdown' | 'requested' | 'generating' | 'ready' | 'revealed' | 'skipped' | 'error',
+ *  aiSecretGuessGameSeq: number | null,
+ *  aiSecretGuessRoundSeq: number | null,
+ *  aiSecretGuessDrawerId: string | null,
+ *  aiSecretGuessToken: string,
+ *  aiSecretGuessTimer: ReturnType<typeof setTimeout> | null,
+ *  aiSecretGuessCaptureAt: number | null,
+ *  aiSecretGuessResult: object | null,
+ *  aiSecretGuessReveal: object | null,
+ *  aiSecretGuessImageAccepted: boolean,
+ *  aiSecretGuessApiAttempted: boolean,
+ *  aiSecretGuessAnswerRevealed: boolean,
+ *  aiSecretGuessCount: number,
+ *  aiSecretGuessLastRoundNumber: number | null,
  * }} Room
  */
 
@@ -643,6 +696,248 @@ function logAiFailure(kind, error) {
   console.error(`[ai] ${kind} failed`, aiErrorLogDetails(error));
 }
 
+function clearAiSecretGuessTimer(room) {
+  if (room.aiSecretGuessTimer) {
+    clearTimeout(room.aiSecretGuessTimer);
+    room.aiSecretGuessTimer = null;
+  }
+  room.aiSecretGuessCaptureAt = null;
+}
+
+/** ラウンド固有のタイマー・結果・非同期処理をすべて無効化する。 */
+function resetAiSecretGuessRound(room) {
+  clearAiSecretGuessTimer(room);
+  room.aiSecretGuessToken = randomUUID();
+  room.aiSecretGuessStatus = "idle";
+  room.aiSecretGuessGameSeq = null;
+  room.aiSecretGuessRoundSeq = null;
+  room.aiSecretGuessDrawerId = null;
+  room.aiSecretGuessResult = null;
+  room.aiSecretGuessReveal = null;
+  room.aiSecretGuessImageAccepted = false;
+  room.aiSecretGuessApiAttempted = false;
+  room.aiSecretGuessAnswerRevealed = false;
+}
+
+/** 発生回数と間隔は、新しいゲームを始めるときだけリセットする。 */
+function resetAiSecretGuessForNewGame(room) {
+  resetAiSecretGuessRound(room);
+  room.aiSecretGuessCount = 0;
+  room.aiSecretGuessLastRoundNumber = null;
+}
+
+function isCurrentAiSecretGuessRound(room) {
+  return (
+    room.aiSecretGuessStatus !== "idle" &&
+    room.aiSecretGuessGameSeq === room.gameSeq &&
+    room.aiSecretGuessRoundSeq === room.roundSeq
+  );
+}
+
+function buildAiSecretGuessPublicState(room) {
+  const active = isCurrentAiSecretGuessRound(room);
+  return {
+    aiSecretGuessActive: active,
+    aiSecretGuessPending:
+      active &&
+      room.aiSecretGuessAnswerRevealed &&
+      room.aiSecretGuessStatus === "generating",
+    aiSecretGuessReveal:
+      active && room.aiSecretGuessStatus === "revealed"
+        ? room.aiSecretGuessReveal
+        : null,
+  };
+}
+
+function shouldArmAiSecretGuess(room) {
+  if (
+    !isAiConfigured() ||
+    !AI_SECRET_GUESS_ENABLED ||
+    room.roundType !== "normal" ||
+    room.constraint
+  ) {
+    return false;
+  }
+  if (FORCE_AI_SECRET_GUESS) return true;
+  if (room.aiSecretGuessCount >= AI_SECRET_GUESS_MAX_PER_GAME) return false;
+  if (room.completedRounds < 2) return false;
+
+  // 初回は2問完了後から抽選し、8問完了時には未登場でも必ず出す。
+  if (room.aiSecretGuessLastRoundNumber === null) {
+    return (
+      room.completedRounds >= AI_SECRET_GUESS_FORCE_GAP ||
+      Math.random() < AI_SECRET_GUESS_CHANCE
+    );
+  }
+
+  // 対象ラウンド自体は「空いた問題」に含めない。
+  const gap =
+    room.completedRounds - room.aiSecretGuessLastRoundNumber;
+  if (gap < AI_SECRET_GUESS_MIN_GAP) return false;
+  return (
+    gap >= AI_SECRET_GUESS_FORCE_GAP ||
+    Math.random() < AI_SECRET_GUESS_CHANCE
+  );
+}
+
+function armAiSecretGuessForRound(room) {
+  if (!shouldArmAiSecretGuess(room)) return false;
+  clearAiSecretGuessTimer(room);
+  room.aiSecretGuessStatus = "armed";
+  room.aiSecretGuessGameSeq = room.gameSeq;
+  room.aiSecretGuessRoundSeq = room.roundSeq;
+  room.aiSecretGuessDrawerId = room.drawerId;
+  room.aiSecretGuessToken = randomUUID();
+  room.aiSecretGuessResult = null;
+  room.aiSecretGuessReveal = null;
+  room.aiSecretGuessImageAccepted = false;
+  room.aiSecretGuessApiAttempted = false;
+  room.aiSecretGuessAnswerRevealed = false;
+  room.aiSecretGuessCount += 1;
+  room.aiSecretGuessLastRoundNumber = room.completedRounds + 1;
+  return true;
+}
+
+function requestAiSecretGuessCapture(room) {
+  const player = room.players.get(room.aiSecretGuessDrawerId);
+  if (!player?.socketId) return;
+  io.to(player.socketId).emit("aiSecretGuessCaptureRequest", {
+    roundId: room.roundSeq,
+    token: room.aiSecretGuessToken,
+  });
+}
+
+function scheduleAiSecretGuessCapture(room) {
+  if (
+    room.aiSecretGuessStatus !== "armed" ||
+    !isCurrentAiSecretGuessRound(room) ||
+    !hasVisibleDrawing(room.strokes)
+  ) {
+    return;
+  }
+
+  const expectedGameSeq = room.gameSeq;
+  const expectedRoundSeq = room.roundSeq;
+  const expectedToken = room.aiSecretGuessToken;
+  const expectedDrawerId = room.drawerId;
+  room.aiSecretGuessStatus = "countdown";
+  room.aiSecretGuessCaptureAt =
+    Date.now() + AI_SECRET_GUESS_CAPTURE_DELAY_MS;
+  room.aiSecretGuessTimer = setTimeout(() => {
+    room.aiSecretGuessTimer = null;
+    room.aiSecretGuessCaptureAt = null;
+    const current = rooms.get(room.code);
+    if (
+      current !== room ||
+      current.phase !== "playing" ||
+      current.drawPhase !== "drawing" ||
+      current.roundType !== "normal" ||
+      current.constraint ||
+      current.gameSeq !== expectedGameSeq ||
+      current.roundSeq !== expectedRoundSeq ||
+      current.aiSecretGuessToken !== expectedToken ||
+      current.aiSecretGuessStatus !== "countdown" ||
+      current.drawerId !== expectedDrawerId ||
+      !hasVisibleDrawing(current.strokes)
+    ) {
+      return;
+    }
+    current.aiSecretGuessStatus = "requested";
+    requestAiSecretGuessCapture(current);
+  }, AI_SECRET_GUESS_CAPTURE_DELAY_MS);
+}
+
+function rearmAiSecretGuessAfterPass(room, previousStatus) {
+  if (!isCurrentAiSecretGuessRound(room)) return;
+  clearAiSecretGuessTimer(room);
+  room.aiSecretGuessToken = randomUUID();
+  room.aiSecretGuessResult = null;
+  room.aiSecretGuessReveal = null;
+  room.aiSecretGuessImageAccepted = false;
+  room.aiSecretGuessAnswerRevealed = false;
+  room.aiSecretGuessDrawerId = room.drawerId;
+
+  if (
+    !room.aiSecretGuessApiAttempted &&
+    (previousStatus === "armed" ||
+      previousStatus === "countdown" ||
+      previousStatus === "requested")
+  ) {
+    room.aiSecretGuessStatus = "armed";
+    return;
+  }
+
+  // すでにAPIを消費していたら、パス後のお題では2回目を呼ばない。
+  room.aiSecretGuessStatus = "skipped";
+}
+
+function publishAiSecretGuessResult(room) {
+  if (
+    !isCurrentAiSecretGuessRound(room) ||
+    room.aiSecretGuessStatus !== "ready" ||
+    !room.aiSecretGuessResult ||
+    room.drawPhase !== "reveal"
+  ) {
+    return false;
+  }
+  const payload = buildSecretGuessReveal({
+    roundId: room.roundSeq,
+    correctWord: room.word,
+    result: room.aiSecretGuessResult,
+  });
+  room.aiSecretGuessStatus = "revealed";
+  room.aiSecretGuessReveal = payload;
+  io.to(room.code).emit("aiSecretGuessReveal", payload);
+  return true;
+}
+
+function publishAiSecretGuessFallback(room, kind) {
+  if (
+    !isCurrentAiSecretGuessRound(room) ||
+    room.aiSecretGuessStatus === "revealed"
+  ) {
+    return false;
+  }
+  const payload = {
+    roundId: room.roundSeq,
+    kind,
+    correctWord: room.word,
+    message:
+      kind === "too_fast"
+        ? "みんなが速すぎて、AIは予想する前に正解発表！"
+        : "AI、考え込みすぎて今回は答えが出ませんでした！",
+  };
+  clearAiSecretGuessTimer(room);
+  room.aiSecretGuessToken = randomUUID();
+  room.aiSecretGuessStatus = "revealed";
+  room.aiSecretGuessResult = null;
+  room.aiSecretGuessReveal = payload;
+  io.to(room.code).emit("aiSecretGuessReveal", payload);
+  return true;
+}
+
+/** answerReveal と roundUpdate を配った後にだけ呼ぶ。 */
+function revealAiSecretGuessAfterAnswer(room) {
+  if (!isCurrentAiSecretGuessRound(room)) return;
+  if (room.aiSecretGuessStatus === "revealed") return;
+  room.aiSecretGuessAnswerRevealed = true;
+
+  if (room.aiSecretGuessStatus === "ready") {
+    publishAiSecretGuessResult(room);
+    return;
+  }
+  if (room.aiSecretGuessStatus === "generating") {
+    io.to(room.code).emit("aiSecretGuessPending", {
+      roundId: room.roundSeq,
+    });
+    return;
+  }
+  publishAiSecretGuessFallback(
+    room,
+    secretGuessFallbackKind(room.aiSecretGuessStatus),
+  );
+}
+
 function bindSocket(socket, room, player) {
   if (player.disconnectTimer) {
     clearTimeout(player.disconnectTimer);
@@ -1004,6 +1299,7 @@ function buildRoundPayload(room, playerId) {
       room.roundType === "relay" ? room.relayIndex : null,
     relayTotal:
       room.roundType === "relay" ? room.drawerIds.length : null,
+    ...buildAiSecretGuessPublicState(room),
   };
 
   if (room.roundType === "coop") {
@@ -1035,10 +1331,15 @@ function emitRoundStart(room, { clear = false, fanfare = false } = {}) {
     io.to(room.code).emit("clearCanvas");
   }
 
-  if (fanfare) {
+  const aiSecretGuessActive =
+    isCurrentAiSecretGuessRound(room) &&
+    room.aiSecretGuessStatus === "armed";
+  if (fanfare || aiSecretGuessActive) {
     const constraint = room.constraint;
     const message = constraint
       ? "🎲 しばりルーレット！"
+      : aiSecretGuessActive
+        ? "🤖 AIがこっそり予想します！"
       : room.roundType === "relay"
         ? "⚡ リレー！"
         : room.roundType === "coop"
@@ -1054,7 +1355,11 @@ function emitRoundStart(room, { clear = false, fanfare = false } = {}) {
           ? playerNames(room, room.drawerIds)
           : [];
       io.to(room.code).emit("roundFanfare", {
-        roundType: constraint ? "constraint" : room.roundType,
+        roundType: constraint
+          ? "constraint"
+          : aiSecretGuessActive
+            ? "ai-secret"
+            : room.roundType,
         message,
         names,
         constraint: constraint || null,
@@ -1159,6 +1464,7 @@ function scheduleTimedDrawing(room, ms) {
 
 function resetRoundFields(room) {
   clearTurnTimer(room);
+  resetAiSecretGuessRound(room);
   room.roundType = "normal";
   room.drawPhase = "drawing";
   room.drawerId = null;
@@ -1220,11 +1526,13 @@ function pickWord(room) {
 function passWord(room) {
   const drawerId = room.drawerId;
   const drawerName = room.players.get(drawerId)?.name || "";
+  const previousAiSecretGuessStatus = room.aiSecretGuessStatus;
   room.passesUsed += 1;
   room.word = pickWord(room);
   room.strokes = [];
   room.strokeCounts = new Map();
   room.seenWordIds = new Set([drawerId]);
+  rearmAiSecretGuessAfterPass(room, previousAiSecretGuessStatus);
 
   // 黙って絵が消えると当てる側が混乱するので、全員に知らせる
   io.to(room.code).emit("wordPassed", {
@@ -1283,6 +1591,7 @@ function startRound(room) {
       room.drawerId = drawer.id;
       room.drawerIds = [drawer.id];
       room.seenWordIds = new Set([drawer.id]);
+      armAiSecretGuessForRound(room);
       emitRoundStart(room, { clear: true, fanfare: false });
       return;
     }
@@ -1363,6 +1672,7 @@ function startRound(room) {
   if (room.constraint?.kind === "time") {
     scheduleTimedDrawing(room, room.constraint.value * 1000);
   }
+  armAiSecretGuessForRound(room);
   emitRoundStart(room, { clear: true, fanfare: Boolean(room.constraint) });
 }
 
@@ -1388,6 +1698,13 @@ function syncPlayerState(socket, room, playerId) {
     io.to(socket.id).emit("strokeHistory", {
       strokes: strokesVisibleTo(room, playerId),
     });
+    if (
+      playerId === room.aiSecretGuessDrawerId &&
+      room.aiSecretGuessStatus === "requested" &&
+      room.drawPhase === "drawing"
+    ) {
+      requestAiSecretGuessCapture(room);
+    }
   } else if (room.phase === "finished") {
     io.to(socket.id).emit("gameFinished", buildFinishedPayload(room));
   } else {
@@ -1432,6 +1749,7 @@ function removePlayer(room, playerId) {
 
   if (room.players.size === 0) {
     clearTurnTimer(room);
+    clearAiSecretGuessTimer(room);
     clearCommunityAwardsTimer(room);
     rooms.delete(room.code);
     return;
@@ -1752,6 +2070,20 @@ function createEmptyRoom(code, hostId) {
     communityAwardsTimer: null,
     communityAwardsResults: null,
     communityAwardsToken: 0,
+    aiSecretGuessStatus: "idle",
+    aiSecretGuessGameSeq: null,
+    aiSecretGuessRoundSeq: null,
+    aiSecretGuessDrawerId: null,
+    aiSecretGuessToken: randomUUID(),
+    aiSecretGuessTimer: null,
+    aiSecretGuessCaptureAt: null,
+    aiSecretGuessResult: null,
+    aiSecretGuessReveal: null,
+    aiSecretGuessImageAccepted: false,
+    aiSecretGuessApiAttempted: false,
+    aiSecretGuessAnswerRevealed: false,
+    aiSecretGuessCount: 0,
+    aiSecretGuessLastRoundNumber: null,
   };
 }
 
@@ -1956,6 +2288,7 @@ io.on("connection", (socket) => {
     room.roundsSinceConstraint = 0;
     room.gameSeq += 1;
     resetAiForNewGame(room);
+    resetAiSecretGuessForNewGame(room);
     resetCommunityAwards(room);
     room.totalRounds = chooseTotalRounds(activeCount);
     room.completedRounds = 0;
@@ -1999,9 +2332,120 @@ io.on("connection", (socket) => {
     if (room.strokes.length > MAX_STROKES) {
       room.strokes = room.strokes.slice(-MAX_STROKES);
     }
+    if (type === "move") {
+      scheduleAiSecretGuessCapture(room);
+    }
     // だんだん見える: 公開までは自分の画面だけに描く（配信しない）
     if (room.roundType === "gradual" && room.drawPhase === "drawing") return;
     socket.to(code).emit("stroke", event);
+  });
+
+  onSocket(socket, "submitAiSecretGuessImage", (data, cb) => {
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: true, stale: true });
+    const { room, playerId } = ctx;
+    const imageDataUrl =
+      typeof data?.imageDataUrl === "string" ? data.imageDataUrl : "";
+
+    // 古い・重複・偽装された提出は、ゲーム画面へエラーを出さず冪等に捨てる。
+    if (
+      room.phase !== "playing" ||
+      room.roundType !== "normal" ||
+      room.constraint ||
+      room.drawPhase !== "drawing" ||
+      !Number.isInteger(data?.roundId) ||
+      data.roundId !== room.roundSeq ||
+      data.roundId !== room.aiSecretGuessRoundSeq ||
+      safeString(data?.token) !== room.aiSecretGuessToken ||
+      room.aiSecretGuessGameSeq !== room.gameSeq ||
+      room.aiSecretGuessDrawerId !== playerId ||
+      room.drawerId !== playerId ||
+      room.aiSecretGuessStatus !== "requested" ||
+      room.aiSecretGuessImageAccepted ||
+      room.aiSecretGuessAnswerRevealed ||
+      !hasVisibleDrawing(room.strokes) ||
+      !imageDataUrl ||
+      imageDataUrl.length > MAX_AI_SECRET_GUESS_DATA_URL_LEN
+    ) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    if (!parseImageDataUrl(imageDataUrl)) {
+      return reply(cb, { ok: true, stale: true });
+    }
+
+    const gameSeq = room.gameSeq;
+    const roundSeq = room.roundSeq;
+    const token = room.aiSecretGuessToken;
+    const drawerId = room.drawerId;
+    const word = room.word;
+    const candidateWords = buildSecretGuessCandidates(word);
+    const safetyIdentifier = aiSafetyIdentifier(playerId);
+    room.aiSecretGuessImageAccepted = true;
+    room.aiSecretGuessApiAttempted = true;
+    room.aiSecretGuessStatus = "generating";
+
+    // 画像を一度受理した時点でACKし、AI待ちでゲーム操作を止めない。
+    reply(cb, { ok: true });
+
+    if (!consumeAiQuota(socket, "secretGuess")) {
+      room.aiSecretGuessStatus = "skipped";
+      return;
+    }
+    if (candidateWords.length < 2) {
+      room.aiSecretGuessStatus = "error";
+      return;
+    }
+
+    const isCurrent = () => {
+      const current = rooms.get(room.code);
+      return (
+        current === room &&
+        current.phase === "playing" &&
+        current.gameSeq === gameSeq &&
+        current.roundSeq === roundSeq &&
+        current.drawerId === drawerId &&
+        current.word === word &&
+        current.aiSecretGuessToken === token &&
+        current.aiSecretGuessStatus === "generating"
+      );
+    };
+
+    void createSecretGuess(imageDataUrl, candidateWords, {
+      safetyIdentifier,
+      isCurrent,
+    })
+      .then((result) => {
+        if (!isCurrent()) return;
+        room.aiSecretGuessResult = result;
+        room.aiSecretGuessStatus = "ready";
+        if (
+          room.aiSecretGuessAnswerRevealed &&
+          room.drawPhase === "reveal"
+        ) {
+          publishAiSecretGuessResult(room);
+        }
+      })
+      .catch((error) => {
+        const current = rooms.get(room.code);
+        if (
+          current !== room ||
+          current.gameSeq !== gameSeq ||
+          current.roundSeq !== roundSeq ||
+          current.aiSecretGuessToken !== token ||
+          current.aiSecretGuessStatus !== "generating"
+        ) {
+          return;
+        }
+        logAiFailure("secret guess", error);
+        current.aiSecretGuessStatus = "error";
+        current.aiSecretGuessResult = null;
+        if (
+          current.aiSecretGuessAnswerRevealed &&
+          current.drawPhase === "reveal"
+        ) {
+          publishAiSecretGuessFallback(current, "unavailable");
+        }
+      });
   });
 
   onSocket(socket, "requestStrokeHistory", (cb) => {
@@ -2115,6 +2559,7 @@ io.on("connection", (socket) => {
     room.drawPhase = "reveal";
     io.to(code).emit("answerReveal", { word: room.word });
     emitRoundSync(room);
+    revealAiSecretGuessAfterAnswer(room);
     reply(cb, { ok: true });
   });
 
