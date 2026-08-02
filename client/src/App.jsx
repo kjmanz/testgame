@@ -26,6 +26,15 @@ const COMMUNITY_AWARD_REVEAL_MS = 5600;
 /** AIのひみつ予想: APIの都合でゲームを待たせず、結果だけ短く見せる */
 const AI_SECRET_GUESS_ACK_TIMEOUT_MS = 6000;
 const AI_SECRET_GUESS_REVEAL_MS = 7000;
+/** 正解の余韻は残しつつ、次のお題へ進む操作を長く邪魔しない長さ */
+const ANSWER_CELEBRATION_MS = 3600;
+const ANSWER_CONFETTI_COUNT = 18;
+const ANSWER_CELEBRATION_CHEERS = [
+  "画伯と名探偵、どちらもお見事！",
+  "その答えにたどり着いたみんな、かなり鋭い！",
+  "伝わった！ これは立派な名画です。",
+  "正解！ キャンバスもにっこりしています。",
+];
 const EMPTY_AI_STATE = {
   enabled: false,
   gameSeq: 0,
@@ -176,6 +185,12 @@ export default function App() {
   const roundIdRef = useRef(null);
   /** 閉じた結果が roundUpdate で再び開かないようにする */
   const dismissedSecretGuessRoundRef = useRef(null);
+  /** 正解演出のあとにAI予想を順番に見せるための待ち行列 */
+  const answerCelebrationRef = useRef(null);
+  const dismissedAnswerRoundRef = useRef(null);
+  const answerCloseButtonRef = useRef(null);
+  const answerPreviousFocusRef = useRef(null);
+  const queuedSecretGuessRevealRef = useRef(null);
   /** 再接続・ギャラリー表示中でも未処理の画像依頼を失わないための箱 */
   const pendingSecretGuessCaptureRef = useRef(null);
   const trySecretGuessCaptureRef = useRef(() => {});
@@ -200,6 +215,7 @@ export default function App() {
   const [word, setWord] = useState(null);
   const [clearToken, setClearToken] = useState(0);
   const [toast, setToast] = useState("");
+  const [answerCelebration, setAnswerCelebration] = useState(null);
   const [fanfare, setFanfare] = useState(null);
   const [restoring, setRestoring] = useState(() => {
     const session = loadSession();
@@ -222,6 +238,7 @@ export default function App() {
   const [liarName, setLiarName] = useState("");
   const [canFinishGradual, setCanFinishGradual] = useState(false);
   const [canRevealAnswer, setCanRevealAnswer] = useState(false);
+  const [revealingAnswer, setRevealingAnswer] = useState(false);
   const [canPassWord, setCanPassWord] = useState(false);
   const [passesLeft, setPassesLeft] = useState(0);
   const [passing, setPassing] = useState(false);
@@ -296,13 +313,29 @@ export default function App() {
       setScreen((prev) => (prev === "gallery" ? "gallery" : "play"));
     }
     const payloadRoundId = data.roundId ?? null;
+    const shouldShowAnswerCelebration = Boolean(
+      data.drawPhase === "reveal" &&
+        data.roundType === "normal" &&
+        data.word &&
+        String(dismissedAnswerRoundRef.current ?? "") !==
+          String(payloadRoundId ?? "")
+    );
     if (isNewRound) {
       roundIdRef.current = payloadRoundId;
+      answerCelebrationRef.current = null;
+      dismissedAnswerRoundRef.current = null;
+      queuedSecretGuessRevealRef.current = null;
+      setAnswerCelebration(null);
       dismissedSecretGuessRoundRef.current = null;
       pendingSecretGuessCaptureRef.current = null;
       setSecretGuessActive(!!data.aiSecretGuessActive);
       setSecretGuessPending(!!data.aiSecretGuessPending);
-      setSecretGuessReveal(data.aiSecretGuessReveal || null);
+      if (shouldShowAnswerCelebration && data.aiSecretGuessReveal) {
+        queuedSecretGuessRevealRef.current = data.aiSecretGuessReveal;
+        setSecretGuessReveal(null);
+      } else {
+        setSecretGuessReveal(data.aiSecretGuessReveal || null);
+      }
       setAiCrazyPromptState({
         ...EMPTY_AI_CRAZY_PROMPT_STATE,
         ...(data.aiCrazyPrompt || {}),
@@ -323,7 +356,14 @@ export default function App() {
         String(dismissedSecretGuessRoundRef.current ?? "") !==
           String(payloadRoundId ?? "")
       ) {
-        setSecretGuessReveal(data.aiSecretGuessReveal);
+        if (
+          shouldShowAnswerCelebration ||
+          answerCelebrationRef.current
+        ) {
+          queuedSecretGuessRevealRef.current = data.aiSecretGuessReveal;
+        } else {
+          setSecretGuessReveal(data.aiSecretGuessReveal);
+        }
       }
     }
     if (!isNewRound && data.aiCrazyPrompt) {
@@ -350,6 +390,9 @@ export default function App() {
     setLiarName(data.liarName || "");
     setCanFinishGradual(!!data.canFinishGradual);
     setCanRevealAnswer(!!data.canRevealAnswer);
+    if (isNewRound || data.drawPhase === "reveal") {
+      setRevealingAnswer(false);
+    }
     setCanPassWord(!!data.canPassWord);
     setPassesLeft(data.passesLeft ?? 0);
     setPassing(false);
@@ -360,6 +403,19 @@ export default function App() {
     setTotalRounds(data.totalRounds ?? 0);
     setAdvancing(false);
     setFinishBusy(false);
+    if (
+      shouldShowAnswerCelebration &&
+      !answerCelebrationRef.current
+    ) {
+      showAnswerCelebration({
+        roundId: payloadRoundId,
+        word: data.word,
+        drawerName: data.drawerName || "",
+        aiCrazyPrompt: data.aiCrazyPrompt?.active
+          ? data.aiCrazyPrompt
+          : null,
+      });
+    }
   }
 
   function resetPlayState() {
@@ -381,6 +437,7 @@ export default function App() {
     setLiarName("");
     setCanFinishGradual(false);
     setCanRevealAnswer(false);
+    setRevealingAnswer(false);
     setCanPassWord(false);
     setPassesLeft(0);
     setPassing(false);
@@ -389,13 +446,53 @@ export default function App() {
     markDrawing(false);
     roundIdRef.current = null;
     dismissedSecretGuessRoundRef.current = null;
+    answerCelebrationRef.current = null;
+    dismissedAnswerRoundRef.current = null;
+    answerPreviousFocusRef.current = null;
+    queuedSecretGuessRevealRef.current = null;
     pendingSecretGuessCaptureRef.current = null;
     setRoundId(null);
     setSecretGuessActive(false);
     setSecretGuessPending(false);
     setSecretGuessReveal(null);
+    setAnswerCelebration(null);
     setAiCrazyPromptState(EMPTY_AI_CRAZY_PROMPT_STATE);
     setAdvancing(false);
+  }
+
+  function showAnswerCelebration(value) {
+    if (!answerCelebrationRef.current) {
+      answerPreviousFocusRef.current = document.activeElement;
+    }
+    answerCelebrationRef.current = value;
+    setAnswerCelebration(value);
+  }
+
+  function dismissAnswerCelebration() {
+    const previousFocus = answerPreviousFocusRef.current;
+    dismissedAnswerRoundRef.current =
+      answerCelebrationRef.current?.roundId ?? roundIdRef.current;
+    answerCelebrationRef.current = null;
+    answerPreviousFocusRef.current = null;
+    setAnswerCelebration(null);
+    const queuedReveal = queuedSecretGuessRevealRef.current;
+    if (queuedReveal) {
+      queuedSecretGuessRevealRef.current = null;
+      setSecretGuessReveal(queuedReveal);
+    }
+    if (!queuedReveal) {
+      window.requestAnimationFrame(() => {
+        if (
+          previousFocus?.isConnected &&
+          !previousFocus.disabled &&
+          typeof previousFocus.focus === "function"
+        ) {
+          previousFocus.focus();
+          return;
+        }
+        document.querySelector(".actions button:not(:disabled)")?.focus();
+      });
+    }
   }
 
   function resetGameProgress() {
@@ -441,6 +538,32 @@ export default function App() {
     const t = setTimeout(() => setFanfare(null), 2200);
     return () => clearTimeout(t);
   }, [fanfare]);
+
+  useEffect(() => {
+    if (!answerCelebration) return;
+    const celebrationRoundId = answerCelebration.roundId;
+    function onKeyDown(event) {
+      if (event.key === "Escape") {
+        dismissAnswerCelebration();
+      } else if (event.key === "Tab") {
+        event.preventDefault();
+        answerCloseButtonRef.current?.focus();
+      }
+    }
+    const timer = setTimeout(() => {
+      if (
+        String(answerCelebrationRef.current?.roundId ?? "") ===
+        String(celebrationRoundId ?? "")
+      ) {
+        dismissAnswerCelebration();
+      }
+    }, ANSWER_CELEBRATION_MS);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [answerCelebration]);
 
   useEffect(() => {
     if (!secretGuessReveal) return;
@@ -744,7 +867,10 @@ export default function App() {
     });
 
     socket.on("roundStart", (data) => {
-      applyRoundPayload(data, { forcePlay: true, isNewRound: true });
+      const isNewRound =
+        String(data?.roundId ?? "") !==
+        String(roundIdRef.current ?? "");
+      applyRoundPayload(data, { forcePlay: true, isNewRound });
     });
 
     socket.on("roundUpdate", (data) => {
@@ -828,23 +954,23 @@ export default function App() {
 
     socket.on("roundFanfare", (data) => {
       setFanfare(data);
-      if (data?.message) setToast(data.message);
-      if (data?.roundType === "coop" && data.names?.length) {
-        setToast(`🤝 ${data.names.join("・")}が協力！`);
-      }
-      if (data?.roundType === "liar" && data.names?.length) {
-        setToast(`🕵️ ${data.names.join("・")}のだれかがうそつき…！`);
-      }
-      if (data?.constraint) {
-        setToast(
-          `${data.constraint.emoji} ${data.constraint.label}：${data.constraint.rule}`
-        );
-      }
     });
 
-    // ふつうのラウンドの答え発表。画面は止めず、トーストで知らせる
+    // ふつうのラウンドの答え発表。短いお祝いカードで全員へ同時に見せる。
     socket.on("answerReveal", (data) => {
       if (!data?.word) return;
+      if (
+        data.roundId != null &&
+        String(data.roundId) !== String(roundIdRef.current ?? "")
+      ) {
+        return;
+      }
+      if (
+        String(dismissedAnswerRoundRef.current ?? "") ===
+        String(data.roundId ?? roundIdRef.current ?? "")
+      ) {
+        return;
+      }
       if (data.aiCrazyPrompt) {
         setAiCrazyPromptState({
           ...EMPTY_AI_CRAZY_PROMPT_STATE,
@@ -855,11 +981,14 @@ export default function App() {
           promptLabel: "AIむちゃぶりお題",
         });
       }
-      setToast(
-        data.aiCrazyPrompt?.fullPrompt
-          ? `✅ 主役は「${data.word}」！ AIのお題は「${data.aiCrazyPrompt.fullPrompt}」`
-          : `✅ こたえは「${data.word}」！`
-      );
+      setToast("");
+      setRevealingAnswer(false);
+      showAnswerCelebration({
+        roundId: data.roundId ?? roundIdRef.current,
+        word: data.word,
+        drawerName: data.drawerName || "",
+        aiCrazyPrompt: data.aiCrazyPrompt || null,
+      });
     });
 
     socket.on("aiSecretGuessPending", (data) => {
@@ -890,7 +1019,11 @@ export default function App() {
         pendingSecretGuessCaptureRef.current = null;
       }
       setSecretGuessPending(false);
-      setSecretGuessReveal(data);
+      if (answerCelebrationRef.current) {
+        queuedSecretGuessRevealRef.current = data;
+      } else {
+        setSecretGuessReveal(data);
+      }
     });
 
     // お題のパス。黙って絵が消えると当てる側が混乱するので必ず知らせる
@@ -1398,10 +1531,43 @@ export default function App() {
   }
 
   function revealAnswer() {
+    if (revealingAnswer) return;
+    const socket = socketRef.current;
+    if (!socket) {
+      setError("通信がつながっていません。少し待ってもう一度どうぞ");
+      return;
+    }
+    const requestedRoundId = roundId;
     setError("");
-    socketRef.current?.emit("revealAnswer", (res) => {
-      if (!res?.ok) setError(res?.error || "せいかい発表できません");
-    });
+    setRevealingAnswer(true);
+    socket
+      .timeout(8000)
+      .emit(
+        "revealAnswer",
+        { roundId: requestedRoundId },
+        (timeoutError, res) => {
+          if (timeoutError) {
+            setRevealingAnswer(false);
+            const answerWasAlreadyHandled =
+              String(answerCelebrationRef.current?.roundId ?? "") ===
+                String(requestedRoundId ?? "") ||
+              String(dismissedAnswerRoundRef.current ?? "") ===
+                String(requestedRoundId ?? "") ||
+              String(roundIdRef.current ?? "") !==
+                String(requestedRoundId ?? "");
+            if (!answerWasAlreadyHandled) {
+              setError("通信が混み合っています。もう一度押してね");
+            }
+            return;
+          }
+          if (!res?.ok) {
+            setRevealingAnswer(false);
+            setError(res?.error || "せいかい発表できません");
+          } else if (res.stale) {
+            setRevealingAnswer(false);
+          }
+        }
+      );
   }
 
   /** お題がわからないとき。ラウンドは進まず、お題だけ引き直す */
@@ -1694,6 +1860,7 @@ export default function App() {
       >
         <div className="award-show-shell">
           <button
+            ref={answerCloseButtonRef}
             type="button"
             className="award-show-close"
             onClick={() => setAwardCeremony(null)}
@@ -1808,6 +1975,98 @@ export default function App() {
             )}
           </div>
         </div>
+      </div>
+    );
+  }
+
+  function renderAnswerCelebration() {
+    if (!answerCelebration) return null;
+    const crazyPrompt = answerCelebration.aiCrazyPrompt?.fullPrompt
+      ? answerCelebration.aiCrazyPrompt
+      : null;
+    const mainAnswer =
+      crazyPrompt?.mainAnswer || answerCelebration.word || "？？？";
+    const cheerIndex =
+      Math.abs(Number(answerCelebration.roundId) || 0) %
+      ANSWER_CELEBRATION_CHEERS.length;
+    const cheer = crazyPrompt
+      ? "AIの無茶ぶりを見抜くとは…人類、やりますね！"
+      : ANSWER_CELEBRATION_CHEERS[cheerIndex];
+
+    return (
+      <div
+        className={`answer-celebration${crazyPrompt ? " is-ai-crazy" : ""}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="answer-celebration-title"
+        aria-describedby="answer-celebration-description"
+        onMouseDown={(event) => {
+          if (event.target === event.currentTarget) {
+            dismissAnswerCelebration();
+          }
+        }}
+      >
+        <div className="answer-celebration-confetti" aria-hidden="true">
+          {Array.from({ length: ANSWER_CONFETTI_COUNT }, (_, index) => (
+            <span
+              key={index}
+              style={{
+                "--confetti-x": `${5 + ((index * 37) % 90)}%`,
+                "--confetti-delay": `${(index % 6) * 0.06}s`,
+                "--confetti-drift": `${((index % 5) - 2) * 20}px`,
+                "--confetti-spin": `${420 + (index % 4) * 90}deg`,
+              }}
+            />
+          ))}
+        </div>
+
+        <section className="answer-celebration-card">
+          <button
+            type="button"
+            className="answer-celebration-close"
+            onClick={dismissAnswerCelebration}
+            aria-label="正解発表を閉じる"
+            autoFocus
+          >
+            ×
+          </button>
+
+          <div className="answer-celebration-seal" aria-hidden="true">
+            <span>✓</span>
+          </div>
+          <div className="answer-celebration-kicker">ピンポーン！</div>
+          <h2 id="answer-celebration-title">せいかい！</h2>
+          <div className="answer-celebration-label">
+            {crazyPrompt ? "正解の主役" : "こたえ"}
+          </div>
+          <div className="answer-celebration-word">「{mainAnswer}」</div>
+
+          {crazyPrompt && (
+            <div className="answer-celebration-crazy">
+              <span>🤖 AIむちゃぶりお題</span>
+              <strong>{crazyPrompt.fullPrompt}</strong>
+            </div>
+          )}
+
+          <p className="answer-celebration-credit">
+            {answerCelebration.drawerName ? (
+              <>
+                <strong>{answerCelebration.drawerName}</strong> が描きました
+              </>
+            ) : (
+              "みんなで見事に当てました"
+            )}
+          </p>
+          <p
+            className="answer-celebration-cheer"
+            id="answer-celebration-description"
+          >
+            {cheer}
+          </p>
+          <div className="answer-celebration-progress" aria-hidden="true">
+            <span />
+          </div>
+        </section>
       </div>
     );
   }
@@ -2265,7 +2524,10 @@ export default function App() {
             <div className="ai-crazy-full">
               <strong>今回はAIが考えた変なお題！</strong>
             </div>
-            <p className="ai-crazy-sub">まずは主役を当てよう！</p>
+            <p className="ai-crazy-sub">
+              {drawerName ? `${drawerName}が描いています。` : ""}
+              まずは主役を当てよう！
+            </p>
           </div>
         ) : word ? (
           <>
@@ -2359,6 +2621,8 @@ export default function App() {
         gallery={gallery}
         onClose={() => setCommunityCeremony(null)}
       />
+
+      {renderAnswerCelebration()}
 
       {renderAiSecretGuessReveal()}
 
@@ -3119,8 +3383,13 @@ export default function App() {
               </button>
             )}
             {canRevealAnswer && (
-              <button type="button" onClick={revealAnswer}>
-                ✅ せいかい！
+              <button
+                type="button"
+                onClick={revealAnswer}
+                disabled={revealingAnswer}
+                aria-busy={revealingAnswer}
+              >
+                {revealingAnswer ? "発表の準備中…" : "✅ せいかい！"}
               </button>
             )}
             {canPassWord && (

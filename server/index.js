@@ -2735,10 +2735,18 @@ io.on("connection", (socket) => {
   });
 
   // ふつうのラウンド: 描き手の「せいかい！」で答えを全員に出す
-  onSocket(socket, "revealAnswer", (cb) => {
+  onSocket(socket, "revealAnswer", (data, cb) => {
+    if (typeof data === "function") {
+      cb = data;
+      data = {};
+    }
     const ctx = getContext(socket);
     if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
     const { code, room, playerId } = ctx;
+    const clientRoundId = data?.roundId;
+    if (Number.isInteger(clientRoundId) && clientRoundId !== room.roundSeq) {
+      return reply(cb, { ok: true, stale: true });
+    }
     // 連打や同時押しでもエラーにしない
     if (
       room.phase === "playing" &&
@@ -2754,7 +2762,9 @@ io.on("connection", (socket) => {
     clearTurnTimer(room);
     room.drawPhase = "reveal";
     io.to(code).emit("answerReveal", {
+      roundId: room.roundSeq,
       word: room.word,
+      drawerName: room.players.get(room.drawerId)?.name || "",
       aiCrazyPrompt: room.currentAiCrazyPrompt
         ? { ...room.currentAiCrazyPrompt }
         : null,
