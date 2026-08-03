@@ -12,6 +12,7 @@ import {
   isCeremonyPlaybackInProgress,
   normalizeCeremonyPlayback,
 } from "../../shared/ceremony-playback.js";
+import { gradualRevealProgress } from "../../shared/gradual-reveal-progress.js";
 
 const SESSION_KEY = "oekaki-session";
 /** ブラウザを閉じても3時間は同じ部屋に戻れる */
@@ -113,8 +114,7 @@ function normalizeGradualReveal(value) {
   };
 }
 
-function gradualRevealCoverStyle(step, steps) {
-  const progress = Math.max(0, Math.min(1, step / Math.max(1, steps)));
+function gradualRevealCoverStyle(progress) {
   return {
     "--gradual-reveal": `${progress * 100}%`,
     "--gradual-cover": `${(1 - progress) * 100}%`,
@@ -250,6 +250,8 @@ export default function App() {
   const roundIdRef = useRef(null);
   /** だんだん公開の再送・再接続で同じ線を重ね描きしないための連番 */
   const gradualBatchSeqRef = useRef(0);
+  /** マスク式のだんだん公開をReact再描画なしで毎フレーム動かす幕 */
+  const gradualCoverRef = useRef(null);
   /** 閉じた結果が roundUpdate で再び開かないようにする */
   const dismissedSecretGuessRoundRef = useRef(null);
   /** 正解演出のあとにAI予想を順番に見せるための待ち行列 */
@@ -846,7 +848,7 @@ export default function App() {
     return () => clearInterval(id);
   }, [turnEndsAt]);
 
-  // だんだん見える: 描画開始と同時に、全端末で同じ段階を進める。
+  // だんだん見える: 段階表示と「描いた順」の公開位置を全端末でそろえる。
   useEffect(() => {
     const startedAt = gradualRevealState?.startedAt;
     const completedAt = gradualRevealState?.completedAt;
@@ -892,6 +894,57 @@ export default function App() {
     };
   }, [
     roundType,
+    gradualRevealState?.startedAt,
+    gradualRevealState?.completedAt,
+    gradualRevealState?.stepMs,
+    gradualRevealState?.steps,
+  ]);
+
+  // 上下・左右・円形の幕は、サーバー補正時刻から求めた連続値で動かす。
+  // CSS変数を直接更新し、Reactツリーを毎フレーム再描画しない。
+  useEffect(() => {
+    const startedAt = gradualRevealState?.startedAt;
+    const completedAt = gradualRevealState?.completedAt;
+    const pattern = gradualRevealState?.pattern;
+    const stepMs = gradualRevealState?.stepMs;
+    const steps = gradualRevealState?.steps;
+    if (
+      roundType !== "gradual" ||
+      pattern === "line-order" ||
+      !startedAt ||
+      !stepMs ||
+      !steps ||
+      completedAt
+    ) {
+      return undefined;
+    }
+
+    let frameId = null;
+    const tick = () => {
+      const progress = gradualRevealProgress(
+        gradualRevealState,
+        Date.now() + serverOffsetRef.current
+      );
+      const cover = gradualCoverRef.current;
+      if (cover) {
+        cover.style.setProperty("--gradual-reveal", `${progress * 100}%`);
+        cover.style.setProperty(
+          "--gradual-cover",
+          `${(1 - progress) * 100}%`
+        );
+      }
+      if (progress < 1) {
+        frameId = window.requestAnimationFrame(tick);
+      }
+    };
+
+    tick();
+    return () => {
+      if (frameId !== null) window.cancelAnimationFrame(frameId);
+    };
+  }, [
+    roundType,
+    gradualRevealState?.pattern,
     gradualRevealState?.startedAt,
     gradualRevealState?.completedAt,
     gradualRevealState?.stepMs,
@@ -2918,6 +2971,8 @@ export default function App() {
           gradualRevealState?.pattern || "line-order"
         ];
       const revealFinished = Boolean(gradualRevealState?.completedAt);
+      const isLineOrderReveal =
+        gradualRevealState?.pattern === "line-order";
       const revealMaskOpened =
         gradualRevealState?.startedAt &&
         gradualRevealStep >= gradualRevealState.steps;
@@ -2940,9 +2995,13 @@ export default function App() {
               <span>
                 {revealFinished
                   ? "ぜんぶ見えた！"
-                  : revealMaskOpened
-                    ? `${gradualRevealState.stepMs / 1000}秒ごと・ライブ公開中`
-                    : `${gradualRevealState.stepMs / 1000}秒ごと・公開 ${gradualRevealStep}/${gradualRevealState.steps}`}
+                  : isLineOrderReveal
+                    ? revealMaskOpened
+                      ? `${gradualRevealState.stepMs / 1000}秒ごと・ライブ公開中`
+                      : `${gradualRevealState.stepMs / 1000}秒ごと・公開 ${gradualRevealStep}/${gradualRevealState.steps}`
+                    : revealMaskOpened
+                      ? "ぜんぶ見える状態でライブ公開中"
+                      : `${(gradualRevealState.stepMs * gradualRevealState.steps) / 1000}秒かけて、なめらか公開中`}
               </span>
             </div>
           )}
@@ -3923,10 +3982,13 @@ export default function App() {
                 gradualRevealState.pattern !== "line-order" &&
                 gradualRevealStep < gradualRevealState.steps && (
                   <div
+                    ref={gradualCoverRef}
                     className={`canvas-gradual-cover is-${gradualRevealState.pattern}`}
                     style={gradualRevealCoverStyle(
-                      gradualRevealStep,
-                      gradualRevealState.steps
+                      gradualRevealProgress(
+                        gradualRevealState,
+                        Date.now() + serverOffsetRef.current
+                      )
                     )}
                     aria-hidden="true"
                   />
@@ -3943,7 +4005,9 @@ export default function App() {
                     }{" "}
                     {gradualRevealStep >= gradualRevealState.steps
                       ? "ライブ公開中"
-                      : `公開 ${gradualRevealStep}/${gradualRevealState.steps}`}
+                      : gradualRevealState.pattern === "line-order"
+                        ? `公開 ${gradualRevealStep}/${gradualRevealState.steps}`
+                        : "なめらか公開中"}
                   </div>
                 )}
               {replaying && roundType !== "gradual" && (

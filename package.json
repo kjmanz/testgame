@@ -17,7 +17,7 @@
     "dev:ai-crazy-prompt": "concurrently -n server,client -c blue,green \"npm run dev:ai-crazy-prompt -w draw-guess-server\" \"npm run dev -w draw-guess-client\"",
     "build": "npm run check:server && npm test && npm run build -w draw-guess-client",
     "check": "npm run check:server && npm test && npm run build -w draw-guess-client",
-    "check:server": "node --check server/index.js && node --check server/ai.js && node --check server/constraints.js && node --check server/secret-guess.js && node --check server/ai-crazy-prompt.js && node --check server/gradual-reveal.js && node --check shared/ceremony-playback.js && node --check server/dev-ai-secret.js && node --check server/dev-ai-crazy-prompt.js",
+    "check:server": "node --check server/index.js && node --check server/ai.js && node --check server/constraints.js && node --check server/secret-guess.js && node --check server/ai-crazy-prompt.js && node --check server/gradual-reveal.js && node --check shared/gradual-reveal-progress.js && node --check shared/ceremony-playback.js && node --check server/dev-ai-secret.js && node --check server/dev-ai-crazy-prompt.js",
     "test": "npm run test -w draw-guess-server",
     "start": "npm run start -w draw-guess-server",
     "install:all": "npm install"

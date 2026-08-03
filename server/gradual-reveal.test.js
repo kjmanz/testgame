@@ -6,6 +6,7 @@ import {
   gradualRevealDuration,
   isGradualRevealComplete,
 } from "./gradual-reveal.js";
+import { gradualRevealProgress } from "../shared/gradual-reveal-progress.js";
 
 function sequenceRandom(values) {
   let index = 0;
@@ -61,4 +62,36 @@ test("描画終了時刻が入るまで公開完了にしない", () => {
   assert.equal(isGradualRevealComplete(plan), false);
   plan.completedAt = 12_345;
   assert.equal(isGradualRevealComplete(plan), true);
+});
+
+test("だんだん公開率は経過時間に沿って0から1まで連続して進む", () => {
+  const plan = {
+    pattern: "center-out",
+    stepMs: 1_000,
+    steps: 8,
+    startedAt: 10_000,
+    completedAt: null,
+  };
+
+  assert.equal(gradualRevealProgress(plan, 9_000), 0);
+  assert.equal(gradualRevealProgress(plan, 10_000), 0);
+  assert.equal(gradualRevealProgress(plan, 12_000), 0.25);
+  assert.equal(gradualRevealProgress(plan, 13_333), 0.416625);
+  assert.equal(gradualRevealProgress(plan, 18_000), 1);
+  assert.equal(gradualRevealProgress(plan, 99_000), 1);
+});
+
+test("壊れた公開計画の進行率は安全に0へ戻す", () => {
+  assert.equal(gradualRevealProgress(null, 10_000), 0);
+  assert.equal(
+    gradualRevealProgress({ startedAt: 10_000, stepMs: 0, steps: 8 }, 11_000),
+    0
+  );
+  assert.equal(
+    gradualRevealProgress(
+      { startedAt: 10_000, stepMs: 1_000, steps: 8 },
+      Number.NaN
+    ),
+    0
+  );
 });

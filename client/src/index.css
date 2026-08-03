@@ -949,7 +949,7 @@ input:focus {
   color: #8a4b06;
 }
 
-/* だんだん見える: 描画中の絵の上の幕を、全端末で同じ段階まで開く */
+/* だんだん見える: 描画中の絵の上の幕を、サーバー時刻に沿って連続的に開く */
 @property --gradual-reveal {
   syntax: "<percentage>";
   inherits: false;
@@ -975,10 +975,7 @@ input:focus {
     ),
     #f0f7ff;
   will-change: clip-path, -webkit-mask-image, mask-image;
-  transition:
-    clip-path 0.42s cubic-bezier(0.2, 0.8, 0.25, 1),
-    --gradual-reveal 0.42s cubic-bezier(0.2, 0.8, 0.25, 1),
-    --gradual-cover 0.42s cubic-bezier(0.2, 0.8, 0.25, 1);
+  transition: none;
 }
 
 .canvas-gradual-cover.is-top-down {
@@ -1001,12 +998,12 @@ input:focus {
   -webkit-mask-image: radial-gradient(
     circle farthest-corner at 50% 50%,
     transparent 0 var(--gradual-reveal),
-    #000 calc(var(--gradual-reveal) + 1%) 100%
+    #000 calc(var(--gradual-reveal) + 2.5%) 100%
   );
   mask-image: radial-gradient(
     circle farthest-corner at 50% 50%,
     transparent 0 var(--gradual-reveal),
-    #000 calc(var(--gradual-reveal) + 1%) 100%
+    #000 calc(var(--gradual-reveal) + 2.5%) 100%
   );
   -webkit-mask-repeat: no-repeat;
   mask-repeat: no-repeat;
@@ -1018,12 +1015,12 @@ input:focus {
   -webkit-mask-image: radial-gradient(
     circle farthest-corner at 50% 50%,
     #000 0 var(--gradual-cover),
-    transparent calc(var(--gradual-cover) + 1%) 100%
+    transparent calc(var(--gradual-cover) + 2.5%) 100%
   );
   mask-image: radial-gradient(
     circle farthest-corner at 50% 50%,
     #000 0 var(--gradual-cover),
-    transparent calc(var(--gradual-cover) + 1%) 100%
+    transparent calc(var(--gradual-cover) + 2.5%) 100%
   );
   -webkit-mask-repeat: no-repeat;
   mask-repeat: no-repeat;
