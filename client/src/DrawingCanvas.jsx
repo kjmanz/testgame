@@ -5,6 +5,9 @@ const MAX_HISTORY = 20000;
 const REPLAY_MS_PER_EVENT = 9;
 const REPLAY_MIN_MS = 1400;
 const REPLAY_MAX_MS = 5000;
+const PLAYER_FLASH_MS = 1600;
+const PLAYER_FLASH_COLOR = "#ff2d7a";
+const PLAYER_FLASH_DIM_COLOR = "rgba(43, 36, 28, 0.16)";
 
 /**
  * 正規化座標 (0-1) で線を送受信するキャンバス。
@@ -21,6 +24,7 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     strokeUsedSeed = 0,
     onStrokeUsed,
     onReplayChange,
+    localPlayerId = "",
   },
   ref
 ) {
@@ -35,16 +39,20 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
   const strokeUsedRef = useRef(0);
   const replayingRef = useRef(false);
   const replayRafRef = useRef(0);
+  const flashingPlayerRef = useRef("");
+  const flashTimerRef = useRef(0);
   // 最新の値をハンドラから読むための箱（再購読を避ける）
   const penWidthRef = useRef(penWidth);
   const strokeLimitRef = useRef(strokeLimit);
   const onStrokeUsedRef = useRef(onStrokeUsed);
   const onReplayChangeRef = useRef(onReplayChange);
+  const localPlayerIdRef = useRef(localPlayerId);
 
   penWidthRef.current = penWidth;
   strokeLimitRef.current = strokeLimit;
   onStrokeUsedRef.current = onStrokeUsed;
   onReplayChangeRef.current = onReplayChange;
+  localPlayerIdRef.current = localPlayerId;
 
   useImperativeHandle(ref, () => ({
     /**
@@ -52,9 +60,11 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
      * @param {{ maxSize?: number, quality?: number }} [opts]
      */
     exportImage({ maxSize = 640, quality = 0.72 } = {}) {
-      // 再生の途中で保存されないよう、完成した絵に戻してから写す
-      if (replayingRef.current) {
-        stopReplay();
+      // 再生や描き手の強調を画像に焼き込まないよう、完成した絵に戻してから写す
+      const needsRestore = replayingRef.current || !!flashingPlayerRef.current;
+      stopReplay();
+      stopPlayerFlash({ redraw: false });
+      if (needsRestore) {
         redrawFromHistory();
       }
       const canvas = canvasRef.current;
@@ -84,6 +94,14 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     /** 描いた順に早送り再生する。再生できたら true */
     playReplay() {
       return startReplay();
+    },
+    /**
+     * 指定した描き手の線を一時的に強調する。強調できたら true。
+     * @param {string} playerId
+     * @param {number} [durationMs]
+     */
+    flashPlayer(playerId, durationMs = PLAYER_FLASH_MS) {
+      return startPlayerFlash(playerId, durationMs);
     },
   }));
 
@@ -116,9 +134,28 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     ctx.stroke();
   }
 
+  function eventPlayerKey(ev) {
+    return ev.playerId || "local";
+  }
+
+  function displayStrokeStyle(playerKey, color, width) {
+    const target = flashingPlayerRef.current;
+    if (!target) return { color, width };
+
+    const isLocalTarget =
+      playerKey === "local" && localPlayerIdRef.current === target;
+    if (playerKey === target || isLocalTarget) {
+      return {
+        color: PLAYER_FLASH_COLOR,
+        width: Math.max((width || 4) + 2, (width || 4) * 1.45),
+      };
+    }
+    return { color: PLAYER_FLASH_DIM_COLOR, width };
+  }
+
   /** 履歴イベントを1つ描く（描き手ごとの最終点を lastMap で持ち回る） */
   function applyHistoryEvent(ev, lastMap) {
-    const key = ev.playerId || "local";
+    const key = eventPlayerKey(ev);
     if (ev.type === "start") {
       lastMap.set(key, { x: ev.x, y: ev.y });
     } else if (ev.type === "end") {
@@ -126,7 +163,8 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     } else if (ev.type === "move") {
       const last = lastMap.get(key);
       if (last) {
-        strokeSegment(last, { x: ev.x, y: ev.y }, ev.color, ev.width);
+        const style = displayStrokeStyle(key, ev.color, ev.width);
+        strokeSegment(last, { x: ev.x, y: ev.y }, style.color, style.width);
       }
       lastMap.set(key, { x: ev.x, y: ev.y });
     }
@@ -151,10 +189,54 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     }
 
     // 描きかけの線が途切れないように現在位置を引き継ぐ
+    const localKey = localPlayerIdRef.current || "local";
     remoteLastMapRef.current = new Map(
-      [...lastMap].filter(([key]) => key !== "local")
+      [...lastMap].filter(([key]) => key !== "local" && key !== localKey)
     );
-    lastRef.current = lastMap.get("local") || null;
+    lastRef.current = lastMap.get(localKey) || lastMap.get("local") || null;
+  }
+
+  function stopPlayerFlash({ redraw = true } = {}) {
+    if (flashTimerRef.current) {
+      clearTimeout(flashTimerRef.current);
+      flashTimerRef.current = 0;
+    }
+    if (!flashingPlayerRef.current) return false;
+
+    flashingPlayerRef.current = "";
+    if (redraw) redrawFromHistory();
+    return true;
+  }
+
+  function startPlayerFlash(playerId, durationMs = PLAYER_FLASH_MS) {
+    const target = String(playerId || "");
+    if (!target) return false;
+
+    const hasTargetStroke = historyRef.current.some(
+      (ev) =>
+        ev.type === "move" &&
+        (eventPlayerKey(ev) === target ||
+          (eventPlayerKey(ev) === "local" &&
+            localPlayerIdRef.current === target))
+    );
+    if (!hasTargetStroke) return false;
+
+    stopReplay();
+    stopPlayerFlash({ redraw: false });
+    flashingPlayerRef.current = target;
+    redrawFromHistory();
+
+    const parsedDuration = Number(durationMs);
+    const duration = Number.isFinite(parsedDuration)
+      ? Math.max(0, parsedDuration)
+      : PLAYER_FLASH_MS;
+    flashTimerRef.current = setTimeout(() => {
+      flashTimerRef.current = 0;
+      if (flashingPlayerRef.current !== target) return;
+      flashingPlayerRef.current = "";
+      redrawFromHistory();
+    }, duration);
+    return true;
   }
 
   function stopReplay() {
@@ -170,8 +252,12 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
 
   /** 履歴を先頭から早送りで描き直す。終わったら本来の状態に戻す */
   function startReplay() {
+    const wasFlashing = stopPlayerFlash({ redraw: false });
     const events = historyRef.current.slice();
-    if (events.length < 2) return false;
+    if (events.length < 2) {
+      if (wasFlashing) redrawFromHistory();
+      return false;
+    }
 
     stopReplay();
     if (!clearSurface()) return false;
@@ -224,6 +310,7 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
   }
 
   function clearBoard() {
+    stopPlayerFlash({ redraw: false });
     stopReplay();
     historyRef.current = [];
     drawingRef.current = false;
@@ -243,6 +330,7 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     ro.observe(canvas.parentElement || canvas);
     return () => {
       ro.disconnect();
+      stopPlayerFlash({ redraw: false });
       stopReplay();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -327,7 +415,8 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     if (data.type === "move") {
       const last = remoteLastMapRef.current.get(key);
       if (last) {
-        strokeSegment(last, { x: data.x, y: data.y }, data.color, data.width);
+        const style = displayStrokeStyle(key, data.color, data.width);
+        strokeSegment(last, { x: data.x, y: data.y }, style.color, style.width);
       }
       remoteLastMapRef.current.set(key, { x: data.x, y: data.y });
     }
@@ -372,7 +461,6 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     if (!pos) return;
     const last = lastRef.current;
     if (last) {
-      strokeSegment(last, pos, "#1a1a1a", penWidthRef.current);
       const ev = {
         type: "move",
         x: pos.x,
@@ -380,6 +468,9 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
         width: penWidthRef.current,
         color: "#1a1a1a",
       };
+      const localKey = localPlayerIdRef.current || "local";
+      const style = displayStrokeStyle(localKey, ev.color, ev.width);
+      strokeSegment(last, pos, style.color, style.width);
       pushHistory(ev);
       onStroke?.(ev);
     }
@@ -399,8 +490,9 @@ const DrawingCanvas = forwardRef(function DrawingCanvas(
     }
     e.preventDefault();
     if (drawingRef.current) {
-      pushHistory({ type: "end" });
-      onStroke?.({ type: "end" });
+      const ev = { type: "end" };
+      pushHistory(ev);
+      onStroke?.(ev);
     }
     drawingRef.current = false;
     lastRef.current = null;

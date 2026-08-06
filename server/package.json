@@ -10,6 +10,7 @@
     "dev:liar": "node --watch dev-liar.js",
     "dev:peephole": "node --watch dev-peephole.js",
     "dev:gradual": "node --watch dev-gradual.js",
+    "dev:parts": "node --watch dev-parts.js",
     "dev:constraint": "node --watch dev-constraint.js",
     "start": "node index.js",
     "test": "node --test"

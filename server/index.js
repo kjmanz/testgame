@@ -19,11 +19,19 @@ import {
   publicAiCapabilities,
 } from "./ai.js";
 import { findConstraint, randomConstraint } from "./constraints.js";
-import { hasVisibleDrawing } from "./drawing.js";
+import {
+  hasVisibleDrawing,
+  visibleStrokesForPlayer,
+} from "./drawing.js";
 import {
   createHighlightState,
   isHighlightActive,
 } from "./highlight.js";
+import {
+  createPartsRound,
+  PARTS_MAX_PLAYERS,
+  PARTS_MIN_PLAYERS,
+} from "./parts.js";
 import {
   canPlayerNextRound,
   canPlayerSeeWord,
@@ -52,6 +60,20 @@ const LIAR_DURATION_MS = 40_000;
 const PEEPHOLE_MIN_PLAYERS = 2;
 /** のぞき穴が動いている間に、描いて当てる時間。 */
 const PEEPHOLE_DURATION_MS = 20_000;
+const PARTS_MAX_ROUNDS_PER_GAME = 2;
+const PARTS_MAX_EVENTS_PER_PLAYER = 600;
+const PARTS_MAX_TOTAL_EVENTS = 6_000;
+const PARTS_ASSEMBLY_LEAD_MS = 650;
+const PARTS_ASSEMBLY_STAGE_MS = 900;
+const PARTS_ASSEMBLY_FINAL_HOLD_MS = 900;
+const PARTS_HIGHLIGHT_COOLDOWN_MS = 900;
+const PARTS_RECENT_PROMPTS_MAX = 4;
+const PARTS_STAGE_LABELS = [
+  "輪郭パーツ、到着！",
+  "手足パーツ、到着！",
+  "顔パーツ、到着！",
+  "仕上げパーツ、到着！",
+];
 const GALLERY_MAX = 60;
 const EVENT_MIN_GAP = 3;
 const EVENT_FORCE_GAP = 6;
@@ -146,7 +168,7 @@ const io = new Server(httpServer, {
  *  imageDataUrl: string,
  *  word: string,
  *  drawerNames: string[],
- *  roundType: 'normal' | 'relay' | 'coop' | 'liar' | 'gradual',
+ *  roundType: 'normal' | 'relay' | 'coop' | 'liar' | 'gradual' | 'parts',
  *  constraintLabel: string,
  *  createdAt: number,
  *  gameSeq: number,
@@ -159,13 +181,23 @@ const io = new Server(httpServer, {
  *  hostId: string,
  *  players: Map<string, Player>,
  *  phase: 'lobby' | 'playing' | 'finished',
- *  roundType: 'normal' | 'relay' | 'coop' | 'liar' | 'gradual',
- *  drawPhase: 'drawing' | 'guessing' | 'reveal',
+ *  roundType: 'normal' | 'relay' | 'coop' | 'liar' | 'gradual' | 'parts',
+ *  drawPhase: 'briefing' | 'drawing' | 'ready' | 'assembling' | 'guessing' | 'reveal',
  *  drawerId: string | null,
  *  drawerIds: string[],
  *  word: string | null,
  *  liarId: string | null,
  *  liarName: string,
+ *  partsAssignments: Map<string, import('./parts.js').PartAssignment>,
+ *  partsVariant: 'normal' | 'secret' | 'mystery',
+ *  partsPromptId: string,
+ *  partsPromptDescription: string,
+ *  partsDurationSec: number,
+ *  partsStage: number,
+ *  partsVisibleIds: Set<string>,
+ *  partsRoundCount: number,
+ *  recentPartsPrompts: string[],
+ *  lastPartsHighlightAt: number,
  *  drawerStreak: { id: string, count: number } | null,
  *  relayIndex: number,
  *  turnDurations: number[],
@@ -618,6 +650,7 @@ function chooseRoundType(room, playerCount = activePlayers(room).length) {
     forced === "coop" ||
     forced === "liar" ||
     forced === "gradual" ||
+    forced === "parts" ||
     forced === "normal"
   ) {
     const n = playerCount;
@@ -625,6 +658,12 @@ function chooseRoundType(room, playerCount = activePlayers(room).length) {
     if (forced === "coop" && n < COOP_MIN_PLAYERS) return "normal";
     if (forced === "liar" && n < LIAR_MIN_PLAYERS) return "normal";
     if (forced === "gradual" && n < PEEPHOLE_MIN_PLAYERS) return "normal";
+    if (
+      forced === "parts" &&
+      (n < PARTS_MIN_PLAYERS || n > PARTS_MAX_PLAYERS)
+    ) {
+      return "normal";
+    }
     return forced;
   }
 
@@ -634,6 +673,16 @@ function chooseRoundType(room, playerCount = activePlayers(room).length) {
   if (n >= COOP_MIN_PLAYERS) eligible.push("coop");
   if (n >= LIAR_MIN_PLAYERS) eligible.push("liar");
   if (n >= PEEPHOLE_MIN_PLAYERS) eligible.push("gradual");
+  const partsEligible =
+    n >= PARTS_MIN_PLAYERS &&
+    n <= PARTS_MAX_PLAYERS &&
+    room.partsRoundCount < PARTS_MAX_ROUNDS_PER_GAME &&
+    room.completedRounds < room.totalRounds - 1 &&
+    Boolean(room.players.get(room.hostId)?.socketId);
+  if (partsEligible) {
+    // 全員参加ハプニングは、ほかの特殊ラウンドより少しだけ当たりやすくする。
+    eligible.push("parts", "parts");
+  }
 
   if (eligible.length === 0 || room.lastWasSpecial) {
     return "normal";
@@ -647,6 +696,13 @@ function chooseRoundType(room, playerCount = activePlayers(room).length) {
   if (!roll) return "normal";
 
   return eligible[Math.floor(Math.random() * eligible.length)];
+}
+
+function choosePartsVariant() {
+  const roll = Math.random();
+  if (roll < 0.55) return "normal";
+  if (roll < 0.9) return "secret";
+  return "mystery";
 }
 
 /**
@@ -714,6 +770,9 @@ function allowConstrainedStroke(room, playerId, type) {
 
 function canPlayerDraw(room, playerId) {
   if (room.phase !== "playing" || room.drawPhase !== "drawing") return false;
+  if (room.roundType === "parts") {
+    return room.partsAssignments.has(playerId);
+  }
   if (room.roundType === "coop" || room.roundType === "liar") {
     return room.drawerIds.includes(playerId);
   }
@@ -725,6 +784,33 @@ function canPassRound(room, playerId) {
   if (room.phase !== "playing" || room.roundType !== "normal") return false;
   if (room.drawPhase === "reveal") return false;
   return room.drawerId === playerId;
+}
+
+function partsControllerId(room) {
+  const host = room.players.get(room.hostId);
+  if (host?.socketId) return host.id;
+  return (
+    room.drawerIds.find((id) => room.players.get(id)?.socketId) ||
+    activePlayers(room)[0]?.id ||
+    room.hostId
+  );
+}
+
+function canControlParts(room, playerId) {
+  return room.roundType === "parts" && partsControllerId(room) === playerId;
+}
+
+function canAdvanceRound(room, playerId) {
+  if (room.roundType === "parts") {
+    return room.drawPhase === "reveal" && canControlParts(room, playerId);
+  }
+  return canPlayerNextRound(room, playerId);
+}
+
+function playerHasVisibleDrawing(room, playerId) {
+  return hasVisibleDrawing(
+    room.strokes.filter((stroke) => stroke?.playerId === playerId),
+  );
 }
 
 function currentHighlight(room, now = Date.now()) {
@@ -784,10 +870,12 @@ function buildRoundPayload(room, playerId) {
     word: seesWord ? room.word : null,
     canDraw: canPlayerDraw(room, playerId),
     canSeeWord: seesWord,
-    canNextRound: canPlayerNextRound(room, playerId),
+    canNextRound: canAdvanceRound(room, playerId),
     turnEndsAt: room.turnEndsAt,
     turnDurationSec:
-      room.roundType === "relay" && room.drawPhase === "drawing"
+      room.roundType === "parts" && room.drawPhase === "drawing"
+        ? room.partsDurationSec
+        : room.roundType === "relay" && room.drawPhase === "drawing"
         ? room.turnDurations[room.relayIndex] ?? null
         : room.roundType === "coop" && room.drawPhase === "drawing"
           ? Math.round(COOP_DURATION_MS / 1000)
@@ -831,6 +919,35 @@ function buildRoundPayload(room, playerId) {
     payload.canPassRound = canPassRound(room, playerId);
   }
 
+  if (room.roundType === "parts") {
+    const assignment = room.partsAssignments.get(playerId) || null;
+    const hasOwnDrawing = playerHasVisibleDrawing(room, playerId);
+    payload.partAssignment = assignment;
+    payload.partsVariant = room.partsVariant;
+    payload.partsStage = room.partsStage;
+    payload.partsStageLabel =
+      room.partsStage >= 0
+        ? PARTS_STAGE_LABELS[room.partsStage] || "合体中…"
+        : "";
+    payload.partsCredits =
+      room.drawPhase === "reveal"
+        ? [...room.partsAssignments.values()].map((part) => ({
+            playerId: part.playerId,
+            playerName: part.playerName,
+            label: part.label,
+            secretInstruction: part.secretInstruction,
+            wasWordHidden: part.isWordHidden,
+            hasDrawing: playerHasVisibleDrawing(room, part.playerId),
+          }))
+        : [];
+    payload.canStartParts =
+      room.drawPhase === "briefing" && canControlParts(room, playerId);
+    payload.canAssembleParts =
+      room.drawPhase === "ready" && canControlParts(room, playerId);
+    payload.canHighlightPart =
+      room.drawPhase === "reveal" && Boolean(assignment) && hasOwnDrawing;
+  }
+
   return payload;
 }
 
@@ -851,6 +968,8 @@ function emitRoundStart(room, { clear = false, fanfare = false } = {}) {
             ? "🕵️ うそつきお絵かき！"
             : room.roundType === "gradual"
               ? "🔍 のぞき穴お絵かき！"
+              : room.roundType === "parts"
+                ? "🚨 緊急ミッション発生！"
               : null;
     if (message) {
       const names =
@@ -861,6 +980,10 @@ function emitRoundStart(room, { clear = false, fanfare = false } = {}) {
         roundType: constraint ? "constraint" : room.roundType,
         message,
         names,
+        subtitle:
+          room.roundType === "parts"
+            ? "全員のパーツを強制合体します"
+            : "",
         constraint: constraint || null,
       });
     }
@@ -957,6 +1080,110 @@ function scheduleTimedDrawing(room, ms) {
   }, ms);
 }
 
+function finishPartsDrawing(room) {
+  if (
+    !rooms.has(room.code) ||
+    room.roundType !== "parts" ||
+    room.drawPhase !== "drawing"
+  ) {
+    return false;
+  }
+  clearTurnTimer(room);
+  room.drawPhase = "ready";
+  emitRoundSync(room);
+  return true;
+}
+
+function beginPartsDrawing(room) {
+  if (room.roundType !== "parts" || room.drawPhase !== "briefing") {
+    return false;
+  }
+  clearTurnTimer(room);
+  room.strokes = [];
+  room.strokeCounts = new Map();
+  room.blockedDrawers = new Set();
+  room.partsVisibleIds = new Set();
+  room.partsStage = -1;
+  room.drawPhase = "drawing";
+  const durationMs = Math.max(1, room.partsDurationSec) * 1000;
+  room.turnEndsAt = Date.now() + durationMs;
+  room.turnTimer = setTimeout(() => {
+    room.turnTimer = null;
+    room.turnEndsAt = null;
+    finishPartsDrawing(room);
+  }, durationMs);
+  io.to(room.code).emit("clearCanvas");
+  emitRoundSync(room);
+  return true;
+}
+
+function schedulePartsAssemblyStage(room, stage, delayMs) {
+  room.turnTimer = setTimeout(() => {
+    room.turnTimer = null;
+    if (
+      !rooms.has(room.code) ||
+      room.roundType !== "parts" ||
+      room.drawPhase !== "assembling"
+    ) {
+      return;
+    }
+
+    if (stage >= PARTS_STAGE_LABELS.length) {
+      room.drawPhase = "reveal";
+      for (const player of room.players.values()) {
+        if (!player.socketId) continue;
+        io.to(player.socketId).emit("strokeHistory", {
+          strokes: room.strokes,
+        });
+      }
+      emitRoundSync(room);
+      io.to(room.code).emit("partsComplete", {
+        roundId: room.roundSeq,
+        word: room.word,
+      });
+      return;
+    }
+
+    const stageIds = [...room.partsAssignments.values()]
+      .filter((assignment) => assignment.stage === stage)
+      .map((assignment) => assignment.playerId);
+    for (const id of stageIds) room.partsVisibleIds.add(id);
+    room.partsStage = stage;
+    const stageIdSet = new Set(stageIds);
+    const strokes = room.strokes.filter((stroke) =>
+      stageIdSet.has(stroke?.playerId),
+    );
+    emitRoundSync(room);
+    io.to(room.code).emit("partsLayer", {
+      roundId: room.roundSeq,
+      stage,
+      label: PARTS_STAGE_LABELS[stage],
+      strokes,
+    });
+
+    const nextDelay =
+      stage === PARTS_STAGE_LABELS.length - 1
+        ? PARTS_ASSEMBLY_FINAL_HOLD_MS
+        : PARTS_ASSEMBLY_STAGE_MS;
+    schedulePartsAssemblyStage(room, stage + 1, nextDelay);
+  }, delayMs);
+}
+
+function beginPartsAssembly(room) {
+  if (room.roundType !== "parts" || room.drawPhase !== "ready") {
+    return false;
+  }
+  clearTurnTimer(room);
+  room.drawPhase = "assembling";
+  room.partsStage = -1;
+  room.partsVisibleIds = new Set();
+  room.lastPartsHighlightAt = 0;
+  io.to(room.code).emit("clearCanvas");
+  emitRoundSync(room);
+  schedulePartsAssemblyStage(room, 0, PARTS_ASSEMBLY_LEAD_MS);
+  return true;
+}
+
 function resetRoundFields(room) {
   clearTurnTimer(room);
   room.roundType = "normal";
@@ -973,6 +1200,13 @@ function resetRoundFields(room) {
   room.blockedDrawers = new Set();
   room.liarId = null;
   room.liarName = "";
+  room.partsAssignments = new Map();
+  room.partsVariant = "normal";
+  room.partsPromptId = "";
+  room.partsPromptDescription = "";
+  room.partsDurationSec = 0;
+  room.partsStage = -1;
+  room.partsVisibleIds = new Set();
 }
 
 function resetGameProgress(room) {
@@ -981,6 +1215,7 @@ function resetGameProgress(room) {
   room.drawCounts = new Map();
   room.lastCompletedRoundSeq = null;
   room.highlight = null;
+  room.partsRoundCount = 0;
 }
 
 function buildFinishedPayload(room) {
@@ -1019,8 +1254,50 @@ function startRound(room) {
   room.roundSeq += 1;
   room.phase = "playing";
   room.roundType = roundType;
-  room.word = pickWord(room);
+  room.word = roundType === "parts" ? null : pickWord(room);
   applyConstraint(room, roundType);
+
+  if (roundType === "parts") {
+    const partsRound = createPartsRound(players, {
+      variant: choosePartsVariant(),
+      excludePromptIds: new Set(room.recentPartsPrompts),
+    });
+    room.lastWasSpecial = true;
+    room.roundsSinceSpecial = 0;
+    room.partsRoundCount += 1;
+    room.partsVariant = partsRound.variant;
+    room.partsPromptId = partsRound.prompt.id;
+    room.partsPromptDescription = partsRound.prompt.description;
+    room.partsDurationSec = partsRound.durationSec;
+    room.partsAssignments = new Map(
+      partsRound.assignments.map((assignment) => [
+        assignment.playerId,
+        assignment,
+      ]),
+    );
+    room.drawerIds = partsRound.assignments.map(
+      (assignment) => assignment.playerId,
+    );
+    room.drawerId = null;
+    room.seenWordIds = new Set(
+      room.drawerIds.filter(
+        (playerId) => playerId !== partsRound.hiddenWordPlayerId,
+      ),
+    );
+    room.word = partsRound.prompt.word;
+    room.drawPhase = "briefing";
+    room.partsStage = -1;
+    room.partsVisibleIds = new Set();
+    room.drawerStreak = null;
+    room.recentPartsPrompts.push(partsRound.prompt.id);
+    if (room.recentPartsPrompts.length > PARTS_RECENT_PROMPTS_MAX) {
+      room.recentPartsPrompts = room.recentPartsPrompts.slice(
+        -PARTS_RECENT_PROMPTS_MAX,
+      );
+    }
+    emitRoundStart(room, { clear: true, fanfare: true });
+    return;
+  }
 
   if (roundType === "relay") {
     room.lastWasSpecial = true;
@@ -1139,9 +1416,14 @@ function startRound(room) {
   emitRoundStart(room, { clear: true, fanfare: Boolean(room.constraint) });
 }
 
-/** 再接続した人にも、現在までの線を復元する。見える範囲は画面側で制御する。 */
-function strokesVisibleTo(room) {
-  return room.strokes;
+/** 再接続した人にも、現在までの線を復元する。パーツラウンドは公開段階を守る。 */
+function strokesVisibleTo(room, playerId) {
+  return visibleStrokesForPlayer(room.strokes, {
+    roundType: room.roundType,
+    drawPhase: room.drawPhase,
+    playerId,
+    visiblePlayerIds: room.partsVisibleIds,
+  });
 }
 
 function syncPlayerState(socket, room, playerId) {
@@ -1151,7 +1433,7 @@ function syncPlayerState(socket, room, playerId) {
   if (room.phase === "playing" && room.word) {
     io.to(socket.id).emit("roundStart", buildRoundPayload(room, playerId));
     io.to(socket.id).emit("strokeHistory", {
-      strokes: strokesVisibleTo(room),
+      strokes: strokesVisibleTo(room, playerId),
     });
   } else if (room.phase === "finished") {
     io.to(socket.id).emit("gameFinished", buildFinishedPayload(room));
@@ -1203,7 +1485,7 @@ function removePlayer(room, playerId) {
   }
 
   if (wasHost) {
-    const nextHost = [...room.players.values()][0];
+    const nextHost = activePlayers(room)[0] || [...room.players.values()][0];
     room.hostId = nextHost.id;
     nextHost.isHost = true;
     io.to(room.code).emit("hostChanged", { name: nextHost.name });
@@ -1243,6 +1525,12 @@ function removePlayer(room, playerId) {
   emitLobby(room);
 
   if (room.phase === "playing" && wasInRound) {
+    if (room.roundType === "parts") {
+      // すでに届いたパーツは残し、ひとり抜けても全員のミッションを止めない。
+      emitRoundSync(room);
+      return;
+    }
+
     if (room.roundType === "relay" && room.drawPhase === "drawing") {
       if (room.drawerId === playerId) {
         skipRelayPlayer(room, playerId);
@@ -1394,7 +1682,7 @@ function addGalleryItem(
     imageDataUrl,
     word: String(word || "").slice(0, 40),
     drawerNames: Array.isArray(drawerNames)
-      ? drawerNames.map((n) => String(n).slice(0, 12)).slice(0, 8)
+      ? drawerNames.map((n) => String(n).slice(0, 12)).slice(0, MAX_PLAYERS)
       : [],
     roundType: roundType || "normal",
     constraintLabel: String(constraintLabel || "").slice(0, 24),
@@ -1413,7 +1701,15 @@ function addGalleryItem(
 function completeCurrentRound(room, { imageDataUrl = "" } = {}) {
   clearTurnTimer(room);
 
-  const drawerNames = playerNames(room, room.drawerIds);
+  const drawerNames =
+    room.roundType === "parts"
+      ? [...room.partsAssignments.values()]
+          .filter((assignment) =>
+            playerHasVisibleDrawing(room, assignment.playerId),
+          )
+          .map((assignment) => assignment.playerName)
+          .filter(Boolean)
+      : playerNames(room, room.drawerIds);
   const word = room.word;
   const roundType = room.roundType;
   const constraint = room.constraint;
@@ -1502,6 +1798,16 @@ function createEmptyRoom(code, hostId) {
     recentWords: [],
     liarId: null,
     liarName: "",
+    partsAssignments: new Map(),
+    partsVariant: "normal",
+    partsPromptId: "",
+    partsPromptDescription: "",
+    partsDurationSec: 0,
+    partsStage: -1,
+    partsVisibleIds: new Set(),
+    partsRoundCount: 0,
+    recentPartsPrompts: [],
+    lastPartsHighlightAt: 0,
     roundSeq: 0,
     totalRounds: 0,
     completedRounds: 0,
@@ -1682,6 +1988,13 @@ io.on("connection", (socket) => {
     });
 
     syncPlayerState(socket, room, player.id);
+    if (
+      room.phase === "playing" &&
+      room.roundType === "parts" &&
+      ["briefing", "ready", "reveal"].includes(room.drawPhase)
+    ) {
+      emitRoundSync(room);
+    }
     if (wasDisconnected) {
       socket.to(roomCode).emit("playerReturned", { name: player.name });
     }
@@ -1720,6 +2033,7 @@ io.on("connection", (socket) => {
     room.completedRounds = 0;
     room.drawCounts = new Map();
     room.lastCompletedRoundSeq = null;
+    room.partsRoundCount = 0;
     startRound(room);
     emitAiState(room);
     reply(cb, { ok: true, totalRounds: room.totalRounds });
@@ -1730,6 +2044,12 @@ io.on("connection", (socket) => {
     if (!ctx) return;
     const { code, room, playerId } = ctx;
     if (!canPlayerDraw(room, playerId)) return;
+    if (
+      room.roundType === "parts" &&
+      (!Number.isInteger(data?.roundId) || data.roundId !== room.roundSeq)
+    ) {
+      return;
+    }
 
     const type = data?.type;
     if (type !== "start" && type !== "move" && type !== "end") return;
@@ -1739,7 +2059,16 @@ io.on("connection", (socket) => {
     if (type !== "end") {
       const x = safeNumber(data.x);
       const y = safeNumber(data.y);
-      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      if (
+        !Number.isFinite(x) ||
+        !Number.isFinite(y) ||
+        x < 0 ||
+        x > 1 ||
+        y < 0 ||
+        y > 1
+      ) {
+        return;
+      }
       event.x = x;
       event.y = y;
       event.color =
@@ -1750,6 +2079,22 @@ io.on("connection", (socket) => {
           : Math.min(40, Math.max(1, safeNumber(data.width) || 4));
     }
 
+    if (room.roundType === "parts") {
+      const eventCount = room.strokeCounts.get(playerId) || 0;
+      const perPlayerLimit = Math.min(
+        PARTS_MAX_EVENTS_PER_PLAYER,
+        Math.max(
+          1,
+          Math.floor(
+            PARTS_MAX_TOTAL_EVENTS /
+              Math.max(1, room.partsAssignments.size),
+          ),
+        ),
+      );
+      if (eventCount >= perPlayerLimit) return;
+      room.strokeCounts.set(playerId, eventCount + 1);
+    }
+
     // 本数しばりを使い切っていたら、ここで捨てる
     if (!allowConstrainedStroke(room, playerId, type)) return;
 
@@ -1757,7 +2102,10 @@ io.on("connection", (socket) => {
     if (room.strokes.length > MAX_STROKES) {
       room.strokes = room.strokes.slice(-MAX_STROKES);
     }
-    socket.to(code).emit("stroke", event);
+    // パーツラウンドは合体するまで、他人の線を絶対に配らない。
+    if (room.roundType !== "parts") {
+      socket.to(code).emit("stroke", event);
+    }
   });
 
   onSocket(socket, "requestStrokeHistory", (cb) => {
@@ -1765,7 +2113,7 @@ io.on("connection", (socket) => {
     if (!ctx) return reply(cb, { ok: false, strokes: [] });
     reply(cb, {
       ok: true,
-      strokes: strokesVisibleTo(ctx.room),
+      strokes: strokesVisibleTo(ctx.room, ctx.playerId),
     });
   });
 
@@ -1784,7 +2132,7 @@ io.on("connection", (socket) => {
     // 流していいのは、こたえを知っている人（＝そのラウンドを次へ進められる人）だけ。
     // 当てっこの最中に全員の画面が白くなると、ただの邪魔になる。
     // リレー・協力・うそつき・のぞき穴では、答えが出るまで false になる。
-    if (!canPlayerNextRound(room, playerId)) {
+    if (!canAdvanceRound(room, playerId)) {
       return reply(cb, { ok: false, error: "こたえが出てからリプレイできます" });
     }
     const now = Date.now();
@@ -1836,6 +2184,101 @@ io.on("connection", (socket) => {
     if (!ctx) return reply(cb, { ok: false, active: false });
     const active = emitHighlightState(ctx.room, socket.id);
     reply(cb, { ok: true, active });
+  });
+
+  onSocket(socket, "startPartsDrawing", (data, cb) => {
+    if (typeof data === "function") {
+      cb = data;
+      data = {};
+    }
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { room, playerId } = ctx;
+    if (!Number.isInteger(data?.roundId)) {
+      return reply(cb, { ok: false, error: "ラウンド情報がありません" });
+    }
+    if (data.roundId !== room.roundSeq) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    if (!canControlParts(room, playerId)) {
+      return reply(cb, { ok: false, error: "進行役だけが開始できます" });
+    }
+    if (
+      room.phase !== "playing" ||
+      room.roundType !== "parts" ||
+      room.drawPhase !== "briefing"
+    ) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    beginPartsDrawing(room);
+    reply(cb, { ok: true });
+  });
+
+  onSocket(socket, "assembleParts", (data, cb) => {
+    if (typeof data === "function") {
+      cb = data;
+      data = {};
+    }
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { room, playerId } = ctx;
+    if (!Number.isInteger(data?.roundId)) {
+      return reply(cb, { ok: false, error: "ラウンド情報がありません" });
+    }
+    if (data.roundId !== room.roundSeq) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    if (!canControlParts(room, playerId)) {
+      return reply(cb, { ok: false, error: "進行役だけが合体できます" });
+    }
+    if (
+      room.phase !== "playing" ||
+      room.roundType !== "parts" ||
+      room.drawPhase !== "ready"
+    ) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    beginPartsAssembly(room);
+    reply(cb, { ok: true });
+  });
+
+  onSocket(socket, "highlightMyPart", (data, cb) => {
+    if (typeof data === "function") {
+      cb = data;
+      data = {};
+    }
+    const ctx = getContext(socket);
+    if (!ctx) return reply(cb, { ok: false, error: "部屋がありません" });
+    const { code, room, playerId, player } = ctx;
+    if (!Number.isInteger(data?.roundId)) {
+      return reply(cb, { ok: false, error: "ラウンド情報がありません" });
+    }
+    if (data.roundId !== room.roundSeq) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    const assignment = room.partsAssignments.get(playerId);
+    const hasOwnDrawing = playerHasVisibleDrawing(room, playerId);
+    if (
+      room.phase !== "playing" ||
+      room.roundType !== "parts" ||
+      room.drawPhase !== "reveal" ||
+      !assignment ||
+      !hasOwnDrawing
+    ) {
+      return reply(cb, { ok: false, error: "いまはパーツを光らせられません" });
+    }
+    const now = Date.now();
+    if (now - room.lastPartsHighlightAt < PARTS_HIGHLIGHT_COOLDOWN_MS) {
+      return reply(cb, { ok: true, stale: true });
+    }
+    room.lastPartsHighlightAt = now;
+    io.to(code).emit("partsHighlight", {
+      roundId: room.roundSeq,
+      playerId,
+      name: player.name,
+      label: assignment.label,
+    });
+    reply(cb, { ok: true });
   });
 
   onSocket(socket, "revealLiar", (cb) => {
@@ -1988,7 +2431,7 @@ io.on("connection", (socket) => {
     if (clientRoundId !== room.roundSeq) {
       return reply(cb, { ok: true, stale: true });
     }
-    if (!canPlayerNextRound(room, playerId)) {
+    if (!canAdvanceRound(room, playerId)) {
       return reply(cb, { ok: false, error: "つぎへ進めません" });
     }
 
@@ -2247,6 +2690,14 @@ io.on("connection", (socket) => {
         io.to(code).emit("hostDisconnected", { name: player.name });
       }
       scheduleDisconnect(room, player);
+    }
+
+    if (
+      room.phase === "playing" &&
+      room.roundType === "parts" &&
+      ["briefing", "ready", "reveal"].includes(room.drawPhase)
+    ) {
+      emitRoundSync(room);
     }
 
     // リレー中の今の描き手が切れたらすぐ次へ

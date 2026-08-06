@@ -1,6 +1,6 @@
 /**
  * お題を見せてよいかを返す。
- * のぞき穴ラウンドは答え発表までは描き手だけ、発表後は全員に見せる。
+ * のぞき穴・パーツラウンドは答え発表までは対象者だけ、発表後は全員に見せる。
  */
 export function canPlayerSeeWord(room, playerId) {
   if (room.phase !== "playing" || !room.word) return false;
@@ -12,6 +12,10 @@ export function canPlayerSeeWord(room, playerId) {
     return room.drawerIds.includes(playerId);
   }
   if (room.roundType === "liar") {
+    if (room.drawPhase === "reveal") return true;
+    return room.seenWordIds.has(playerId);
+  }
+  if (room.roundType === "parts") {
     if (room.drawPhase === "reveal") return true;
     return room.seenWordIds.has(playerId);
   }
@@ -37,6 +41,10 @@ export function canPlayerNextRound(room, playerId) {
   if (room.roundType === "liar") {
     if (room.drawPhase !== "reveal") return false;
     return room.drawerIds.includes(playerId) || room.hostId === playerId;
+  }
+  if (room.roundType === "parts") {
+    if (room.drawPhase !== "reveal") return false;
+    return room.hostId === playerId;
   }
   return false;
 }

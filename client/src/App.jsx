@@ -206,7 +206,9 @@ export default function App() {
   const socketRef = useRef(null);
   const wakeLockRef = useRef(null);
   const canvasApiRef = useRef(null);
+  const easelRef = useRef(null);
   const playerIdRef = useRef("");
+  const roundIdRef = useRef(null);
   /** 何か描かれたか（線ごとに再描画しないための箱） */
   const hasDrawingRef = useRef(false);
   /** サーバー時刻 - 端末時刻（タイマー表示のずれ補正用） */
@@ -259,6 +261,14 @@ export default function App() {
   const [canPassRound, setCanPassRound] = useState(false);
   const [constraint, setConstraint] = useState(null);
   const [strokesUsed, setStrokesUsed] = useState(0);
+  const [partAssignment, setPartAssignment] = useState(null);
+  const [partsVariant, setPartsVariant] = useState("normal");
+  const [partsStage, setPartsStage] = useState(-1);
+  const [partsStageLabel, setPartsStageLabel] = useState("");
+  const [partsCredits, setPartsCredits] = useState([]);
+  const [canStartParts, setCanStartParts] = useState(false);
+  const [canAssembleParts, setCanAssembleParts] = useState(false);
+  const [canHighlightPart, setCanHighlightPart] = useState(false);
   const [hasDrawing, setHasDrawing] = useState(false);
   const [replaying, setReplaying] = useState(false);
   const [roundId, setRoundId] = useState(null);
@@ -323,7 +333,17 @@ export default function App() {
     setCanPassRound(!!data.canPassRound);
     setConstraint(data.constraint || null);
     setStrokesUsed(data.constraintStrokesUsed ?? 0);
-    setRoundId(data.roundId ?? null);
+    setPartAssignment(data.partAssignment || null);
+    setPartsVariant(data.partsVariant || "normal");
+    setPartsStage(data.partsStage ?? -1);
+    setPartsStageLabel(data.partsStageLabel || "");
+    setPartsCredits(data.partsCredits || []);
+    setCanStartParts(!!data.canStartParts);
+    setCanAssembleParts(!!data.canAssembleParts);
+    setCanHighlightPart(!!data.canHighlightPart);
+    const nextRoundId = data.roundId ?? null;
+    roundIdRef.current = nextRoundId;
+    setRoundId(nextRoundId);
     setRoundNumber(data.roundNumber ?? 0);
     setTotalRounds(data.totalRounds ?? 0);
     setAdvancing(false);
@@ -352,7 +372,16 @@ export default function App() {
     setCanPassRound(false);
     setConstraint(null);
     setStrokesUsed(0);
+    setPartAssignment(null);
+    setPartsVariant("normal");
+    setPartsStage(-1);
+    setPartsStageLabel("");
+    setPartsCredits([]);
+    setCanStartParts(false);
+    setCanAssembleParts(false);
+    setCanHighlightPart(false);
     markDrawing(false);
+    roundIdRef.current = null;
     setRoundId(null);
     setAdvancing(false);
   }
@@ -382,6 +411,17 @@ export default function App() {
   useEffect(() => {
     playerIdRef.current = playerId;
   }, [playerId]);
+
+  useEffect(() => {
+    if (roundType !== "parts" || drawPhase !== "drawing") return;
+    const frame = requestAnimationFrame(() => {
+      const easel = easelRef.current;
+      if (!easel) return;
+      const top = easel.getBoundingClientRect().top + window.scrollY - 8;
+      window.scrollTo({ top: Math.max(0, top), behavior: "auto" });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [roundType, drawPhase, roundId]);
 
   useEffect(() => {
     if (!toast) return;
@@ -560,6 +600,51 @@ export default function App() {
       if (data?.type === "move") markDrawing(true);
     });
 
+    socket.on("partsLayer", (data) => {
+      if (
+        Number.isInteger(data?.roundId) &&
+        data.roundId !== roundIdRef.current
+      ) {
+        return;
+      }
+      setPartsStage(data?.stage ?? -1);
+      setPartsStageLabel(data?.label || "");
+      const strokes = Array.isArray(data?.strokes) ? data.strokes : [];
+      for (const stroke of strokes) {
+        window.dispatchEvent(
+          new CustomEvent("remote-stroke", { detail: stroke })
+        );
+      }
+      if (strokes.some((stroke) => stroke?.type === "move")) {
+        markDrawing(true);
+      }
+    });
+
+    socket.on("partsHighlight", (data) => {
+      if (
+        Number.isInteger(data?.roundId) &&
+        data.roundId !== roundIdRef.current
+      ) {
+        return;
+      }
+      canvasApiRef.current?.flashPlayer?.(data?.playerId);
+      if (data?.name && data?.label) {
+        setToast(`✨ ${data.label}は ${data.name}作！`);
+      }
+    });
+
+    socket.on("partsComplete", (data) => {
+      if (
+        Number.isInteger(data?.roundId) &&
+        data.roundId !== roundIdRef.current
+      ) {
+        return;
+      }
+      setToast(
+        data?.word ? `✨ 合体完了！「${data.word}」` : "✨ 合体完了！"
+      );
+    });
+
     socket.on("replayStart", () => {
       canvasApiRef.current?.playReplay();
     });
@@ -576,6 +661,9 @@ export default function App() {
       }
       if (data?.roundType === "liar" && data.names?.length) {
         setToast(`🕵️ ${data.names.join("・")}のだれかがうそつき…！`);
+      }
+      if (data?.roundType === "parts") {
+        setToast("🚨 全員参加！パーツを描いて強制合体！");
       }
       if (data?.constraint) {
         setToast(
@@ -772,7 +860,10 @@ export default function App() {
 
   const emitStroke = useMemo(
     () => (data) => {
-      socketRef.current?.emit("stroke", data);
+      socketRef.current?.emit("stroke", {
+        ...data,
+        roundId: roundIdRef.current,
+      });
       if (data?.type === "move") markDrawing(true);
     },
     []
@@ -970,6 +1061,34 @@ export default function App() {
     setError("");
     socketRef.current?.emit("finishGradualDrawing", (res) => {
       if (!res?.ok) setError(res?.error || "全体を見せられません");
+    });
+  }
+
+  function startPartsDrawing() {
+    if (advancing) return;
+    setError("");
+    setAdvancing(true);
+    socketRef.current?.emit("startPartsDrawing", { roundId }, (res) => {
+      setAdvancing(false);
+      if (!res?.ok) setError(res?.error || "ミッションを開始できません");
+    });
+  }
+
+  function assembleParts() {
+    if (advancing) return;
+    setError("");
+    setAdvancing(true);
+    socketRef.current?.emit("assembleParts", { roundId }, (res) => {
+      setAdvancing(false);
+      if (!res?.ok) setError(res?.error || "パーツを合体できません");
+    });
+  }
+
+  function highlightMyPart() {
+    setError("");
+    socketRef.current?.emit("highlightMyPart", { roundId }, (res) => {
+      if (!res?.ok) setError(res?.error || "自分のパーツを光らせられません");
+      else if (res?.stale) setToast("✨ いま別のパーツを光らせています");
     });
   }
 
@@ -1276,6 +1395,170 @@ export default function App() {
   }
 
   function renderPlayHeader() {
+    if (roundType === "parts") {
+      const variantLabel =
+        partsVariant === "mystery"
+          ? "ひとりだけお題なし"
+          : partsVariant === "secret"
+            ? "秘密指令あり"
+            : "全員合体";
+      const secretCredits = partsCredits.filter(
+        (credit) => credit.secretInstruction
+      );
+      const mysteryCredit = partsCredits.find(
+        (credit) => credit.wasWordHidden
+      );
+      const contributingCredits = partsCredits.filter(
+        (credit) => credit.hasDrawing
+      );
+      const missingCredits = partsCredits.filter(
+        (credit) => !credit.hasDrawing
+      );
+      return (
+        <>
+          <div className="meta row-meta">
+            <span>部屋 {roomCode}</span>
+            {renderRoundProgress()}
+            <span className="mode-pill parts-pill">🚨 ハプニング</span>
+          </div>
+
+          {drawPhase === "assembling" ? (
+            <div className="parts-assembly-status" role="status" aria-live="polite">
+              <div className="parts-assembly-kicker">パーツ強制合体中</div>
+              <div className="parts-assembly-title">
+                {partsStageLabel || "輸送ルートを接続中…"}
+              </div>
+              <div className="parts-stage-track" aria-label="合体の進み具合">
+                {[0, 1, 2, 3].map((stage) => (
+                  <span
+                    key={stage}
+                    className={stage <= partsStage ? "is-active" : ""}
+                  />
+                ))}
+              </div>
+            </div>
+          ) : drawPhase === "reveal" ? (
+            <>
+              <div className="parts-complete" role="status">
+                <div className="parts-complete-burst" aria-hidden="true">✨</div>
+                <div>
+                  <div className="info-label">合体完了！ お題は</div>
+                  <div className="prompt-value">{word || "？？？"}</div>
+                </div>
+              </div>
+              <p className="hint">
+                {contributingCredits.length
+                  ? `${contributingCredits.length}人のパーツが1枚になりました`
+                  : partsCredits.length
+                    ? "今回はパーツが間に合いませんでした"
+                  : "みんなのパーツが1枚になりました"}
+              </p>
+              {partAssignment && (
+                <div className="parts-my-credit">
+                  あなたは「{partAssignment.label}」を担当
+                </div>
+              )}
+              {(mysteryCredit ||
+                secretCredits.length > 0 ||
+                missingCredits.length > 0) && (
+                <div className="parts-reveal-notes">
+                  {mysteryCredit && (
+                    <div>
+                      🕵️ お題を知らなかったのは
+                      <strong>{mysteryCredit.playerName}</strong>！
+                    </div>
+                  )}
+                  {secretCredits.map((credit) => (
+                    <div key={credit.playerId}>
+                      🤫 {credit.playerName}の「{credit.label}」：
+                      <strong>{credit.secretInstruction}</strong>
+                    </div>
+                  ))}
+                  {missingCredits.length > 0 && (
+                    <div>
+                      ⏳ 未提出パーツ：
+                      <strong>
+                        {missingCredits
+                          .map(
+                            (credit) =>
+                              `${credit.label}（${credit.playerName}）`
+                          )
+                          .join("・")}
+                      </strong>
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              <div className="parts-mission-row">
+                <span className="parts-variant">{variantLabel}</span>
+                {word ? (
+                  <span className="parts-word">お題：{word}</span>
+                ) : (
+                  <span className="parts-word is-mystery">
+                    お題は知らされていません
+                  </span>
+                )}
+              </div>
+
+              {partAssignment ? (
+                <div className="info-block parts-assignment">
+                  <div className="info-label">あなたの担当パーツ</div>
+                  <div className="parts-assignment-value">
+                    {partAssignment.label}
+                  </div>
+                  <p className="hint">{partAssignment.hint}</p>
+                </div>
+              ) : (
+                <div className="info-block parts-assignment">
+                  <div className="parts-assignment-value">見届け役</div>
+                  <p className="hint">途中参加のため、今回は合体を見守ってね</p>
+                </div>
+              )}
+
+              {partAssignment?.secretInstruction && (
+                <div className="parts-secret">
+                  <span>🤫 秘密指令</span>
+                  {partAssignment.secretInstruction}
+                </div>
+              )}
+
+              {drawPhase === "briefing" && (
+                <p className="hint">ガイドの場所を確認して、開始の合図を待とう！</p>
+              )}
+              {drawPhase === "drawing" && (
+                <p className="hint">ほかの人の絵は合体するまで見えません</p>
+              )}
+              {drawPhase === "ready" && (
+                <div className="parts-ready" role="status">
+                  📦 パーツ送信完了！ ホストの合体待ち…
+                </div>
+              )}
+            </>
+          )}
+
+          {remainSec != null && drawPhase === "drawing" && (
+            <div className="timer-bar" aria-live="polite">
+              <div className="timer-label">のこり {remainSec}びょう</div>
+              <div className="timer-track">
+                <div
+                  className="timer-fill parts"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      (remainSec / Math.max(1, turnDurationSec || 8)) * 100
+                    )}%`,
+                  }}
+                />
+              </div>
+            </div>
+          )}
+        </>
+      );
+    }
+
     if (roundType === "relay") {
       return (
         <>
@@ -1628,6 +1911,11 @@ export default function App() {
             <div className="fanfare-text">{fanfare.message}</div>
             {fanfare.roundType === "coop" && fanfare.names?.length > 0 && (
               <div className="fanfare-sub">{fanfare.names.join("・")}</div>
+            )}
+            {fanfare.roundType === "parts" && (
+              <div className="fanfare-sub">
+                {fanfare.subtitle || "バラバラ合体お絵かき！"}
+              </div>
             )}
             {fanfare.constraint && (
               <div className="fanfare-sub fanfare-constraint-sub">
@@ -2146,6 +2434,7 @@ export default function App() {
           </div>
 
           <div
+            ref={easelRef}
             className={`easel ${modeClass}${constraint ? " has-constraint" : ""}`}
           >
             <div className="easel-clip" aria-hidden="true" />
@@ -2174,6 +2463,11 @@ export default function App() {
                 のぞき穴
               </div>
             )}
+            {roundType === "parts" && (
+              <div className="easel-badge parts-badge" aria-hidden="true">
+                全員合体
+              </div>
+            )}
             <div className={`canvas-wrap ${modeClass}`}>
               <DrawingCanvas
                 ref={canvasApiRef}
@@ -2181,6 +2475,7 @@ export default function App() {
                 clearToken={clearToken}
                 onStroke={emitStroke}
                 historySeed={historySeed}
+                localPlayerId={playerId}
                 penWidth={constraint?.kind === "pen" ? constraint.value : 4}
                 strokeLimit={
                   constraint?.kind === "strokes" ? constraint.value : 0
@@ -2189,6 +2484,50 @@ export default function App() {
                 onStrokeUsed={setStrokesUsed}
                 onReplayChange={setReplaying}
               />
+              {roundType === "parts" &&
+                partAssignment?.area &&
+                (drawPhase === "briefing" || drawPhase === "drawing") && (
+                  <div className="parts-guide" aria-hidden="true">
+                    <div
+                      className={`parts-guide-area${
+                        partAssignment.area.width < 0.18 ||
+                        partAssignment.area.height < 0.14
+                          ? " is-small"
+                          : ""
+                      }`}
+                      style={{
+                        left: `${partAssignment.area.x * 100}%`,
+                        top: `${partAssignment.area.y * 100}%`,
+                        width: `${partAssignment.area.width * 100}%`,
+                        height: `${partAssignment.area.height * 100}%`,
+                      }}
+                    >
+                      <span>{partAssignment.label}</span>
+                    </div>
+                    {(partAssignment.anchors || []).map((anchor, index) => (
+                      <span
+                        key={`${anchor.x}-${anchor.y}-${index}`}
+                        className="parts-anchor"
+                        style={{
+                          left: `${anchor.x * 100}%`,
+                          top: `${anchor.y * 100}%`,
+                        }}
+                      />
+                    ))}
+                  </div>
+                )}
+              {roundType === "parts" && drawPhase === "briefing" && (
+                <div className="parts-canvas-note" aria-hidden="true">
+                  <span>担当エリアを確認！</span>
+                  ホストの開始合図で描こう
+                </div>
+              )}
+              {roundType === "parts" && drawPhase === "ready" && (
+                <div className="parts-canvas-note is-ready" aria-hidden="true">
+                  <span>強制提出！</span>
+                  みんなのパーツを輸送中…
+                </div>
+              )}
               {/* めかくししばり: 描いている本人にだけ絵を隠す（線は下を通る） */}
               {constraint?.kind === "blind" && canDraw && !replaying && (
                 <div className="canvas-blind" aria-hidden="true">
@@ -2228,6 +2567,49 @@ export default function App() {
           </div>
 
           <div className="actions">
+            {canStartParts && (
+              <button
+                type="button"
+                className="parts-action-btn"
+                onClick={startPartsDrawing}
+                disabled={advancing || !!fanfare}
+              >
+                🚨 ミッション開始！
+              </button>
+            )}
+            {roundType === "parts" &&
+              drawPhase === "briefing" &&
+              !canStartParts && (
+                <p className="parts-action-wait" role="status">
+                  進行役が全員の準備を確認しています…
+                </p>
+              )}
+            {canAssembleParts && (
+              <button
+                type="button"
+                className="parts-action-btn assemble"
+                onClick={assembleParts}
+                disabled={advancing}
+              >
+                🧩 全パーツを合体させる！
+              </button>
+            )}
+            {roundType === "parts" &&
+              drawPhase === "ready" &&
+              !canAssembleParts && (
+                <p className="parts-action-wait" role="status">
+                  進行役の「合体！」を待っています…
+                </p>
+              )}
+            {canHighlightPart && (
+              <button
+                type="button"
+                className="quiet parts-highlight-btn"
+                onClick={highlightMyPart}
+              >
+                ✨ 自分のパーツを光らせる
+              </button>
+            )}
             {canReveal && (
               <button type="button" onClick={revealLiar}>
                 こたえあわせ

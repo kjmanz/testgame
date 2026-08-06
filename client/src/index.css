@@ -720,6 +720,14 @@ input:focus {
   color: #fff;
 }
 
+.parts-pill {
+  background: linear-gradient(90deg, #ff5a2e, #ffc93c);
+  color: #3d2100;
+  border-color: #7a2c10;
+  letter-spacing: 0.02em;
+  animation: pulse-urgent 0.9s ease-in-out infinite;
+}
+
 .play-header.mode-relay {
   border-color: #c44a2a;
   background:
@@ -809,6 +817,197 @@ input:focus {
 
 .play-header.mode-liar .info-drawer .info-label {
   color: #6d3fa0;
+}
+
+.play-header.mode-parts {
+  border-color: #8a3214;
+  background:
+    linear-gradient(135deg, rgba(255, 90, 46, 0.2), transparent 42%),
+    repeating-linear-gradient(
+      -45deg,
+      rgba(255, 201, 60, 0.12) 0 10px,
+      transparent 10px 20px
+    ),
+    #fff8dc;
+}
+
+.play-header.mode-parts::before {
+  background: rgba(255, 90, 46, 0.88);
+}
+
+.parts-mission-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+}
+
+.parts-variant,
+.parts-word {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.7rem;
+  padding: 0.22rem 0.55rem;
+  border: 2px solid rgba(43, 36, 28, 0.58);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.74);
+  color: var(--ink);
+  font-size: 0.75rem;
+  font-weight: 900;
+}
+
+.parts-variant {
+  background: #2b241c;
+  color: #fff8dc;
+}
+
+.parts-word.is-mystery {
+  background: #51328a;
+  color: #fff;
+  border-color: #2f1d57;
+}
+
+.parts-assignment {
+  gap: 0.28rem;
+  padding: 0.58rem 0.7rem;
+  border: 2px dashed #cf4b22;
+  background: rgba(255, 255, 255, 0.58);
+}
+
+.parts-assignment-value {
+  color: #a92d12;
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: clamp(1.35rem, 6vw, 1.8rem);
+  line-height: 1.15;
+  text-align: center;
+}
+
+.parts-secret {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  padding: 0.5rem 0.65rem;
+  border: 2px solid #3b2866;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #4b327d, #6f3e83);
+  color: #fff;
+  font-size: 0.82rem;
+  font-weight: 900;
+  text-align: center;
+}
+
+.parts-secret span {
+  color: #ffe47a;
+  white-space: nowrap;
+}
+
+.parts-ready,
+.parts-action-wait {
+  margin: 0;
+  padding: 0.52rem 0.65rem;
+  border: 2px dashed rgba(138, 50, 20, 0.55);
+  border-radius: 12px;
+  background: rgba(255, 201, 60, 0.28);
+  color: #7a2c10;
+  font-size: 0.86rem;
+  font-weight: 900;
+  text-align: center;
+}
+
+.parts-assembly-status {
+  display: grid;
+  gap: 0.38rem;
+  justify-items: center;
+  padding: 0.55rem;
+  border: 2px solid #8a3214;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #fff0ad, #ffd0b8);
+}
+
+.parts-assembly-kicker {
+  color: #9b3516;
+  font-size: 0.72rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+}
+
+.parts-assembly-title {
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: 1.2rem;
+  line-height: 1.15;
+  text-align: center;
+}
+
+.parts-stage-track {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  width: min(100%, 220px);
+  gap: 0.38rem;
+}
+
+.parts-stage-track span {
+  height: 8px;
+  border: 2px solid #8a3214;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.7);
+}
+
+.parts-stage-track span.is-active {
+  background: #ff5a2e;
+  animation: parts-stage-pop 0.35s ease both;
+}
+
+.parts-complete {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.55rem 0.7rem;
+  border: 2px solid #8a3214;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #fff1a8, #ffd1bd);
+}
+
+.parts-complete-burst {
+  font-size: 2.1rem;
+  animation: parts-stage-pop 0.45s ease both;
+}
+
+.parts-complete .prompt-value {
+  padding: 0.15rem 0;
+  border: 0;
+  background: transparent;
+  color: #a92d12;
+}
+
+.parts-my-credit {
+  align-self: center;
+  padding: 0.3rem 0.65rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.68);
+  color: #7a2c10;
+  font-size: 0.78rem;
+  font-weight: 900;
+}
+
+.parts-reveal-notes {
+  display: grid;
+  gap: 0.32rem;
+  padding: 0.5rem 0.62rem;
+  border: 2px dashed #5a397c;
+  border-radius: 12px;
+  background: rgba(81, 50, 138, 0.08);
+  color: #4a2f70;
+  font-size: 0.74rem;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.parts-reveal-notes strong {
+  margin-left: 0.18rem;
+  color: #8f244f;
 }
 
 .play-header.mode-gradual {
@@ -1076,6 +1275,10 @@ input:focus {
   background: linear-gradient(90deg, #2b7de0, #7fc3ff);
 }
 
+.timer-fill.parts {
+  background: linear-gradient(90deg, #ff3d23, #ffc93c);
+}
+
 .easel.mode-relay {
   background: linear-gradient(180deg, #ff9a5c 0%, #ff5a2e 55%, #c43a1a 100%);
   border-color: #8b2208;
@@ -1107,6 +1310,19 @@ input:focus {
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.35),
     6px 10px 0 rgba(29, 95, 184, 0.25);
+}
+
+.easel.mode-parts {
+  background:
+    repeating-linear-gradient(
+      -45deg,
+      #ffbd2f 0 18px,
+      #2b241c 18px 36px
+    );
+  border-color: #2b241c;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.35),
+    6px 10px 0 rgba(138, 50, 20, 0.24);
 }
 
 .easel-badge {
@@ -1143,6 +1359,12 @@ input:focus {
 .peephole-badge {
   background: #eaf4ff;
   color: #17498f;
+  transform: rotate(-5deg);
+}
+
+.parts-badge {
+  background: #fff1a8;
+  color: #8a3214;
   transform: rotate(-5deg);
 }
 
@@ -1240,6 +1462,138 @@ input:focus {
     );
 }
 
+.canvas-wrap.mode-parts {
+  border-color: #6e2a13;
+  box-shadow:
+    inset 0 0 0 8px #fff8dc,
+    0 0 0 2px rgba(255, 90, 46, 0.42);
+  background:
+    radial-gradient(circle at 20% 15%, rgba(255, 201, 60, 0.15), transparent 30%),
+    radial-gradient(circle at 85% 80%, rgba(255, 90, 46, 0.1), transparent 28%),
+    repeating-linear-gradient(
+      0deg,
+      #fbf4e4,
+      #fbf4e4 2px,
+      #f7efd8 2px,
+      #f7efd8 4px
+    );
+}
+
+.parts-guide {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.parts-guide-area {
+  position: absolute;
+  min-width: 44px;
+  min-height: 38px;
+  border: 3px dashed rgba(221, 62, 34, 0.82);
+  border-radius: 18px;
+  background: rgba(255, 201, 60, 0.09);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.58);
+}
+
+.parts-guide-area > span {
+  position: absolute;
+  left: 50%;
+  top: 4px;
+  max-width: calc(100% - 8px);
+  transform: translateX(-50%);
+  padding: 0.15rem 0.42rem;
+  overflow: hidden;
+  border: 2px solid rgba(122, 44, 16, 0.68);
+  border-radius: 999px;
+  background: rgba(255, 248, 220, 0.9);
+  color: #8a3214;
+  font-size: 0.66rem;
+  font-weight: 900;
+  line-height: 1.1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.parts-guide-area.is-small > span {
+  display: none;
+}
+
+.parts-anchor {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  transform: translate(-50%, -50%);
+  border: 3px solid #fff;
+  border-radius: 50%;
+  background: #e93722;
+  box-shadow: 0 0 0 2px #7a2c10;
+  animation: parts-anchor-pulse 0.9s ease-in-out infinite;
+}
+
+.parts-canvas-note {
+  position: absolute;
+  left: 50%;
+  bottom: 8%;
+  z-index: 4;
+  display: grid;
+  justify-items: center;
+  width: max-content;
+  max-width: 80%;
+  transform: translateX(-50%);
+  padding: 0.48rem 0.72rem;
+  border: 3px solid #7a2c10;
+  border-radius: 14px;
+  background: rgba(255, 248, 220, 0.94);
+  color: #6e2a13;
+  font-size: 0.75rem;
+  font-weight: 800;
+  text-align: center;
+  pointer-events: none;
+}
+
+.parts-canvas-note span {
+  font-family: "Yusei Magic", "M PLUS Rounded 1c", sans-serif;
+  font-size: 1.05rem;
+}
+
+.parts-canvas-note.is-ready {
+  top: 50%;
+  bottom: auto;
+  transform: translate(-50%, -50%) rotate(-2deg);
+  background: rgba(43, 36, 28, 0.9);
+  border-color: #ffc93c;
+  color: #fff8dc;
+}
+
+.parts-action-btn {
+  background: linear-gradient(180deg, #ff7b41, #f04b25);
+  border-color: #5f220f;
+  color: #fff;
+}
+
+.parts-action-btn.assemble {
+  background: linear-gradient(180deg, #ffc93c, #ff8b2d);
+  color: #3d2100;
+  animation: pulse-urgent 0.9s ease-in-out infinite;
+}
+
+.parts-highlight-btn {
+  border-color: #c13267;
+  color: #9c2455;
+  background: #fff2f8;
+}
+
+@keyframes parts-anchor-pulse {
+  0%, 100% { transform: translate(-50%, -50%) scale(0.9); }
+  50% { transform: translate(-50%, -50%) scale(1.18); }
+}
+
+@keyframes parts-stage-pop {
+  from { transform: scaleX(0.35); opacity: 0.35; }
+  to { transform: scaleX(1); opacity: 1; }
+}
+
 .fanfare {
   position: fixed;
   inset: 0;
@@ -1295,6 +1649,20 @@ input:focus {
 .fanfare-gradual .fanfare-text {
   background: linear-gradient(135deg, #ddefff, #c9e4ff);
   color: #17498f;
+}
+
+.fanfare-parts {
+  background:
+    repeating-linear-gradient(
+      -45deg,
+      rgba(255, 201, 60, 0.4) 0 22px,
+      rgba(43, 36, 28, 0.44) 22px 44px
+    );
+}
+
+.fanfare-parts .fanfare-text {
+  background: linear-gradient(135deg, #fff2a8, #ffb393);
+  color: #8a3214;
 }
 
 .fanfare-constraint .fanfare-text {
@@ -1838,8 +2206,13 @@ input:focus {
   .card,
   .easel,
   .relay-pill,
+  .parts-pill,
   .constraint-pill,
   .canvas-replay,
+  .parts-anchor,
+  .parts-stage-track span.is-active,
+  .parts-complete-burst,
+  .parts-action-btn.assemble,
   .fanfare,
   .fanfare-text,
   .ai-busy-icon {
